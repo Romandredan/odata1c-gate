@@ -1,0 +1,19 @@
+# Тексты нормализуются к LF в репозитории; в рабочем дереве Windows git
+# развернёт их по core.autocrlf. Документация проекта — UTF-8 без BOM.
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+# Windows-скрипты остаются с CRLF
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Выгрузки $metadata — XML, но крупные и машинные: без diff в обзоре
+*.edmx  text eol=lf -diff
+*.sqlite binary

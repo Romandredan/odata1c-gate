@@ -1,0 +1,54 @@
+# --- Секреты и локальные данные шлюза (SPEC §2.3, §3.4) --------------------
+# bases.yaml содержит пароли 1С открытым текстом и не попадает в репозиторий
+# ни при каких условиях; в git живут только файлы-шаблоны *.example.yaml.
+bases.yaml
+daemon.yaml
+policy.yaml
+recipes.yaml
+!*.example.yaml
+!src/odata1c/templates/**
+
+# env-файлы прежнего сервера 1c-odata-mcp (источник для `odata1c base import`)
+.env
+.env.*
+*.env
+!*.env.example
+
+# Домашний каталог шлюза, если он поднят внутри дерева репозитория (--home .)
+gate.sqlite
+journal.sqlite
+metadata.sqlite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+metadata.edmx
+logs/
+
+# Полные выгрузки $metadata боевых баз: в тестах живут урезанные образцы,
+# многомегабайтные дампы в репозиторий не кладём (SPEC §12).
+tests/fixtures/edmx/*.full.edmx
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Окружение разработчика ------------------------------------------------
+# Служебные файлы, к проекту не относятся (AGENTS.md «Структура репозитория»)
+.remember/
+*.code-workspace
+.claude/settings.local.json
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
