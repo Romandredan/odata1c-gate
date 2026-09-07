@@ -52,3 +52,6 @@ htmlcov/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Рабочие каталоги исполнения планов (superpowers SDD)
+.superpowers/
