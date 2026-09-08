@@ -253,11 +253,37 @@ def test_повторный_вызов_не_считается_создание�
     assert ensure_home(tmp_path / "home").created is False
 
 
-@pytest.mark.skipif(pathlib.Path("/etc").exists(), reason="проверка режима только для POSIX-прав")
+@pytest.mark.skipif(sys.platform == "win32", reason="проверка режима доступа только для POSIX")
 def test_права_каталога_закрыты(tmp_path):
     status = ensure_home(tmp_path / "home")
     assert status.permissions_narrowed is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="разбор вывода icacls только для Windows")
+def test_свежий_каталог_предупреждения_не_даёт(tmp_path):
+    status = ensure_home(tmp_path / "home")
+    assert check_file_permissions(status.path) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="разбор вывода icacls только для Windows")
+def test_широкий_доступ_первой_записью_замечен(tmp_path):
+    """Первая запись списка доступа печатается icacls в одной строке с путём: её нельзя терять."""
+    status = ensure_home(tmp_path / "home")
+    # S-1-1-0 — идентификатор группы «Все», одинаков на любой локали Windows.
+    subprocess.run(["icacls", str(status.path), "/grant", "*S-1-1-0:(F)"],
+                   check=True, capture_output=True)
+    предупреждение = check_file_permissions(status.path)
+    assert предупреждение is not None
+    assert str(status.path) in предупреждение
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="разбор вывода icacls только для Windows")
+def test_несуществующий_путь_не_ломает_проверку(tmp_path):
+    assert check_file_permissions(tmp_path / "нет-такого") is None
 ```
+
+Импорты теста: `import pathlib`, `import subprocess`, `import sys`, `import pytest`, и из модуля —
+`check_file_permissions`, `ensure_home`, `resolve_home`.
 
 - [ ] **Шаг 2: Прогнать и убедиться в падении**
 
