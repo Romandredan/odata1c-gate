@@ -27,8 +27,8 @@ KINDS: dict[str, str] = {
     "Enum": "Перечисление",
 }
 
-# SPEC §4.2: суффиксы виртуальных таблиц. Длинные проверяются раньше коротких,
-# иначе BalanceAndTurnovers опознается как Balance.
+# SPEC §4.2: суффиксы виртуальных таблиц. Порядок от длинных к коротким —
+# страховка на случай, если в будущем суффикс окажется окончанием другого суффикса.
 VIRTUAL_SUFFIXES: tuple[str, ...] = (
     "BalanceAndTurnovers",
     "RecordsWithExtDimensions",
@@ -68,21 +68,25 @@ def parse_entity_name(name: str) -> EntityName:
     if not остаток:
         return EntityName(full=name, kind=kind, russian_kind=russian_kind, base_name=name)
 
+    # Проверяю виртуальные суффиксы
     for suffix in VIRTUAL_SUFFIXES:
         if остаток.endswith("_" + suffix):
             base_name = остаток[: -len(suffix) - 1]
-            return EntityName(
-                full=name,
-                kind=kind,
-                russian_kind=russian_kind,
-                base_name=base_name,
-                parent=f"{kind}_{base_name}",
-                is_virtual=True,
-                virtual_kind=suffix,
-            )
+            if base_name:  # Пропускаю, если base_name пуст (например, `_Balance`)
+                return EntityName(
+                    full=name,
+                    kind=kind,
+                    russian_kind=russian_kind,
+                    base_name=base_name,
+                    parent=f"{kind}_{base_name}",
+                    is_virtual=True,
+                    virtual_kind=suffix,
+                )
 
-    if "_" in остаток:
-        base_name, _, _часть = остаток.partition("_")
+    # Проверяю табличную часть: ищу первый и второй непустые сегменты (пропускаю пустые)
+    сегменты = [s for s in остаток.split("_") if s]
+    if len(сегменты) >= 2:
+        base_name = сегменты[0]
         return EntityName(
             full=name,
             kind=kind,
@@ -92,6 +96,7 @@ def parse_entity_name(name: str) -> EntityName:
             is_tabular_part=True,
         )
 
+    # Просто имя с префиксом, без табличной части
     return EntityName(full=name, kind=kind, russian_kind=russian_kind, base_name=остаток)
 
 

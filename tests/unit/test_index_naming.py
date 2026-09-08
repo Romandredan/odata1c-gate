@@ -59,6 +59,16 @@ def test_имя_без_подчёркивания():
     assert имя.base_name == "Catalog"
 
 
+def test_двойное_подчёркивание_в_имени():
+    """Пустые сегменты пропускаются, базовое имя не пустое, родитель указывает на реальное имя."""
+    имя = parse_entity_name("Document__Заказ__Товары")
+    assert имя.kind == "Document"
+    assert имя.base_name == "Заказ"
+    assert имя.parent == "Document_Заказ"
+    assert имя.is_tabular_part is True
+    assert имя.is_virtual is False
+
+
 @pytest.mark.parametrize(
     ("исходное", "ожидаемое"),
     [
