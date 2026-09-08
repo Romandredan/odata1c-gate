@@ -80,6 +80,18 @@ class Dictionary:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
+        # synchronous=NORMAL при журнале WAL — штатная и безопасная комбинация (документация
+        # SQLite): повреждения базы она не допускает, checkpoint всё равно синхронизируется
+        # полностью. Риск ограничен потерей нескольких последних зафиксированных транзакций при
+        # внезапном отказе ОС или питания (не при обычном сбое процесса — commit остаётся
+        # atomic). Для словаря этот риск приемлем, а не просто дешевле: токены реквизитов (ИНН,
+        # счета, телефоны) вычисляются из значения и секретного ключа, а не читаются из словаря —
+        # потерянная запись сама восстановится при следующей встрече того же значения. Токены
+        # названий и ФИО при потере получат новые порядковые номера — старые перестанут
+        # раскрываться в уже закрытых чатах, но это неудобство истории переписки, а не потеря
+        # данных базы. Против этого — цена полной синхронизации на каждом ответе 1С, которую
+        # иначе платил бы каждый запрос модели (решение координатора, 2026-09-09).
+        self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(СХЕМА)
         self._revision = self._count()
 
@@ -98,12 +110,25 @@ class Dictionary:
             "SELECT token FROM tokens WHERE type = ? AND normalized = ?",
             (type_, нормализованное),
         ).fetchone()
-        токен = (
-            строка["token"]
-            if строка
-            else self._создать(type_, нормализованное, base, entity, field)
-        )
-        self._запомнить_вариант(токен, base, entity, field, raw_value)
+        новое_значение = строка is None
+        # Одна транзакция на всю выдачу токена: запись о токене (_создать) и вариант написания
+        # (_запомнить_вариант) фиксируются вместе одним commit'ом, а не двумя раздельными. Вариант
+        # написания без самой записи о токене бессмыслен, а половинчатое состояние между двумя
+        # отдельными фиксациями — ровно то, от чего уходили штатным управлением транзакциями
+        # (см. комментарий в __init__): при сбое посреди пары commit'ов возможен был токен без
+        # варианта или (при повторном INSERT) конфликт уникальности. При исключении внутри блока
+        # `with` откатывается вся пара разом. Побочный эффект — тот же прирост скорости, что и
+        # у корректности: один fsync на новое значение вместо двух (решение координатора,
+        # 2026-09-09, по итогам замера в задаче 4).
+        with self._connection:
+            токен = (
+                строка["token"]
+                if строка
+                else self._создать(type_, нормализованное, base, entity, field)
+            )
+            self._запомнить_вариант(токен, base, entity, field, raw_value)
+        if новое_значение:
+            self._revision += 1
         return токен
 
     def reveal(
@@ -143,6 +168,7 @@ class Dictionary:
         }
 
     def _создать(self, type_: str, нормализованное: str, base: str, entity: str, field: str) -> str:
+        """Вставки без собственной транзакции — вызывающий (token_for) держит одну на всё."""
         момент = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
         if type_ in НУМЕРУЕМЫЕ:
             номер = self._следующий_номер(type_)
@@ -151,18 +177,16 @@ class Dictionary:
             номер = None
             токен = self._свободный_токен(type_, нормализованное)
 
-        with self._connection:
-            self._connection.execute(
-                "INSERT INTO tokens (token, type, normalized, seq, first_seen_at, first_base,"
-                " first_entity, first_field) VALUES (?,?,?,?,?,?,?,?)",
-                (токен, type_, нормализованное, номер, момент, base, entity, field),
+        self._connection.execute(
+            "INSERT INTO tokens (token, type, normalized, seq, first_seen_at, first_base,"
+            " first_entity, first_field) VALUES (?,?,?,?,?,?,?,?)",
+            (токен, type_, нормализованное, номер, момент, base, entity, field),
+        )
+        if type_ in НУМЕРУЕМЫЕ:
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO name_variants (token, variant_norm) VALUES (?,?)",
+                [(токен, вариант) for вариант in name_variants_of(нормализованное)],
             )
-            if type_ in НУМЕРУЕМЫЕ:
-                self._connection.executemany(
-                    "INSERT OR IGNORE INTO name_variants (token, variant_norm) VALUES (?,?)",
-                    [(токен, вариант) for вариант in name_variants_of(нормализованное)],
-                )
-        self._revision += 1
         return токен
 
     def _свободный_токен(self, type_: str, нормализованное: str) -> str:
@@ -185,19 +209,19 @@ class Dictionary:
     def _запомнить_вариант(
         self, токен: str, base: str, entity: str, field: str, raw_value: str
     ) -> None:
-        with self._connection:
-            self._connection.execute(
-                "INSERT OR IGNORE INTO variants (token, base, entity, field, raw_value, seen_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (
-                    токен,
-                    base,
-                    entity,
-                    field,
-                    raw_value,
-                    datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-                ),
-            )
+        """Вставка без собственной транзакции — вызывающий (token_for) держит одну на всё."""
+        self._connection.execute(
+            "INSERT OR IGNORE INTO variants (token, base, entity, field, raw_value, seen_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (
+                токен,
+                base,
+                entity,
+                field,
+                raw_value,
+                datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+            ),
+        )
 
     def _count(self) -> int:
         return int(
