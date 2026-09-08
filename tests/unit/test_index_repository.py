@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from conftest import обёртка_эдмкс
 
 from odata1c.index.edmx import ParsedEntity, ParsedField, ParsedMetadata, parse_edmx
 from odata1c.index.repository import IndexCorruptError, IndexRepository
@@ -17,7 +18,7 @@ def индекс(tmp_path, edmx_synthetic):
 
 
 def test_записаны_все_сущности(индекс):
-    assert len(индекс.entity_names()) == 8
+    assert len(индекс.entity_names()) == 9
     assert "Catalog_Контрагенты" in индекс.entity_names()
 
 
@@ -84,6 +85,67 @@ def test_точное_совпадение_опережает_совпадени
     репозиторий.close()
 
 
+def test_основа_слова_опережает_подстроку_а_та_триграммы(tmp_path):
+    # Правка по итогам финального ревью M1b (Important, задача 4): в реализации есть четвёртый
+    # уровень ранжирования (вхождение сжатого запроса в сжатое имя), которого нет в SPEC.md
+    # §4.4 — раздел дополнен поправкой 2026-09-08. Раньше проверялось только «точное совпадение
+    # опережает основы слов» (см. тест выше); порядок трёх оставшихся уровней между собой не был
+    # закреплён тестом ни разу.
+    #
+    # Три сущности подобраны так, чтобы каждая проходила ровно через одну ветку _оценить() для
+    # общего запроса "Накладная" (подобрано вычислением, см. отчёт):
+    #   - "Накладные" — общая основа слова с запросом ("накладн"), ветка основ (50 + n);
+    #   - "Ннакладнаяхт" — один регистрозависимый токен без CamelCase-границ: сжатый запрос
+    #     "накладная" входит в сжатое имя подстрокой, но как отдельное слово/основа не совпадает
+    #     (ветка подстроки, 30 + доля длины);
+    #   - "Нкладная" — опечатка (выпала буква "а"): не совпадает ни точно, ни по основе, ни по
+    #     подстроке, только по триграммам (доля общих триграмм 0.312 — выше порога 0.2).
+    #
+    # Убедиться, что тест ловит поломку: поднять оценку ветки подстроки выше ветки основ (или
+    # опустить порог триграмм так, чтобы триграммная сущность обогнала подстроку) — тест падает;
+    # вернуть как было — тест снова проходит (проверено вручную, см. отчёт).
+    основа = _сущность(
+        "Document_Накладные",
+        "Document",
+        "Документ",
+        "Накладные",
+        [ParsedField(name="Ref_Key", edm_type="Edm.Guid", nullable=False, is_key=True)],
+    )
+    подстрока = _сущность(
+        "Document_Ннакладнаяхт",
+        "Document",
+        "Документ",
+        "Ннакладнаяхт",
+        [ParsedField(name="Ref_Key", edm_type="Edm.Guid", nullable=False, is_key=True)],
+    )
+    триграммы = _сущность(
+        "Document_Нкладная",
+        "Document",
+        "Документ",
+        "Нкладная",
+        [ParsedField(name="Ref_Key", edm_type="Edm.Guid", nullable=False, is_key=True)],
+    )
+    репозиторий = IndexRepository(tmp_path / "metadata.sqlite")
+    репозиторий.write(
+        ParsedMetadata(
+            entities=[триграммы, подстрока, основа],  # нарочно не по итоговому порядку
+            actions=[],
+            edmx_sha256="0" * 64,
+        )
+    )
+
+    найдено = репозиторий.find("Накладная")
+    assert [результат.name for результат in найдено] == [
+        "Document_Накладные",
+        "Document_Ннакладнаяхт",
+        "Document_Нкладная",
+    ]
+    assert найдено[0].score == 51.0  # основа слова "накладн"
+    assert найдено[1].score == 30.45  # подстрока: 30 + 9/20
+    assert 0 < найдено[2].score < 30.0  # триграммы, ниже ветки подстроки
+    репозиторий.close()
+
+
 def test_поиск_без_учёта_регистра_и_ё(индекс):
     assert индекс.find("контрагенты")[0].name == "Catalog_Контрагенты"
 
@@ -139,14 +201,33 @@ def test_класс_поля_можно_проставить_и_прочитат
     assert поля["ИНН"]["sensitivity_source"] == "auto"
 
 
+def test_класс_поля_возвращает_true_при_попадании(индекс):
+    assert индекс.set_field_sensitivity("Catalog_Контрагенты", "ИНН", "inn", source="auto") is True
+
+
+def test_класс_поля_промах_по_несуществующей_сущности_не_молчит(индекс):
+    # Правка по итогам финального ревью M1b (Important, задача 6): раньше промах условия
+    # (опечатка в правиле, рассинхронизация имён после обновления индекса) не давал ни ошибки,
+    # ни признака — поле в этом случае осталось бы без класса и ушло бы модели в открытом виде,
+    # хотя «реальные значения защищаемых классов не выходят никогда» — инвариант, а не тест.
+    assert индекс.set_field_sensitivity("Catalog_Нет", "ИНН", "inn", source="auto") is False
+
+
+def test_класс_поля_промах_по_несуществующему_полю_не_молчит(индекс):
+    assert (
+        индекс.set_field_sensitivity("Catalog_Контрагенты", "НетТакогоПоля", "inn", source="auto")
+        is False
+    )
+
+
 def test_контрольная_сумма_сохраняется(индекс, edmx_synthetic):
     assert индекс.meta("edmx_sha256") == parse_edmx(edmx_synthetic).edmx_sha256
-    assert индекс.meta("entity_count") == "8"
+    assert индекс.meta("entity_count") == "9"
 
 
 def test_повторная_запись_не_дублирует(индекс, edmx_synthetic):
     индекс.write(parse_edmx(edmx_synthetic))
-    assert len(индекс.entity_names()) == 8
+    assert len(индекс.entity_names()) == 9
 
 
 def test_повторная_запись_не_копит_мусор_в_полнотекстовой_таблице(индекс, edmx_synthetic):
@@ -159,7 +240,7 @@ def test_повторная_запись_не_копит_мусор_в_полн�
     индекс.write(parse_edmx(edmx_synthetic))
     индекс.write(parse_edmx(edmx_synthetic))
     строк_в_fts = индекс._connection.execute("SELECT COUNT(*) FROM entities_fts").fetchone()[0]
-    assert строк_в_fts == len(индекс.entity_names()) == 8
+    assert строк_в_fts == len(индекс.entity_names()) == 9
 
 
 def test_порог_отсекает_совпадение_только_по_общему_префиксу_вида(индекс):
@@ -202,20 +283,14 @@ def test_повреждённый_файл_индекса_даёт_понятн�
 
 
 def _эдмкс_с_нераспознанным_набором() -> bytes:
-    """Минимальный EDMX с набором, ссылающимся на несуществующий EntityType (см. edmx.py,
-    поле ParsedMetadata.unresolved_entity_sets) — отдельно от synthetic.edmx, чтобы не менять
-    фикстуру, общую с задачами 1 и 3."""
-    return """<?xml version="1.0" encoding="UTF-8"?>
-<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
-  <edmx:DataServices m:DataServiceVersion="3.0"
-                     xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
-    <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
-      <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
-        <EntitySet Name="Catalog_Пропавший" EntityType="StandardODATA.Catalog_Пропавший"/>
-      </EntityContainer>
-    </Schema>
-  </edmx:DataServices>
-</edmx:Edmx>""".encode()
+    """EDMX с набором, ссылающимся на несуществующий EntityType (см. edmx.py, поле
+    ParsedMetadata.unresolved_entity_sets) — отдельно от synthetic.edmx, чтобы не менять
+    фикстуру, общую с задачами 1 и 3. Тело контейнера собирает общая обёртка из conftest.py
+    (см. правку по итогам финального ревью M1b — та же функция использовалась в двух
+    тестовых файлах отдельными копиями)."""
+    return обёртка_эдмкс(
+        '<EntitySet Name="Catalog_Пропавший" EntityType="StandardODATA.Catalog_Пропавший"/>'
+    )
 
 
 def test_нераспознанные_наборы_попадают_в_служебную_таблицу(tmp_path):

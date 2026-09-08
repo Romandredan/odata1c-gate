@@ -90,3 +90,26 @@ def test_reindex_невалидные_метаданные_дают_понятн
     assert "odata_error" in вывод
     assert "подсказка" in вывод.lower()
     assert "traceback" not in вывод.lower()
+
+
+@respx.mock
+def test_reindex_повреждённый_индекс_даёт_понятную_ошибку_а_не_трейсбек(
+    tmp_path, capsys, edmx_synthetic
+):
+    # Правка по итогам финального ревью M1b (Important): reindex открывает прежний индекс перед
+    # перестройкой (_прежнее_состояние), поэтому повреждённый файл индекса раньше выходил
+    # необработанным traceback'ом — IndexCorruptError не была в перечне перехвата main().
+    home = _домашний_с_базой(tmp_path)
+    индекс = home / "bases" / "ut" / "metadata.sqlite"
+    индекс.parent.mkdir(parents=True, exist_ok=True)
+    индекс.write_bytes(b"not a real sqlite database, just random junk bytes")
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_synthetic))
+    _замокать_завершение_сеанса()
+
+    код = main(["reindex", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "index_corrupt" in вывод
+    assert "подсказка" in вывод.lower()
+    assert "traceback" not in вывод.lower()

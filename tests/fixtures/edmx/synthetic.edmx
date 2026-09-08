@@ -81,6 +81,24 @@
         <Property Name="ВНаличииBalance" Type="Edm.Decimal" Nullable="true"/>
       </EntityType>
 
+      <!-- Невиртуальный регистр накопления с ключом из одних измерений (без Recorder среди
+           ключей) — правка по итогам финального ревью M1b (Important, задача 3). Единственный
+           регистр другого вида в образце (_Balance выше) отсекается через is_virtual, поэтому
+           мутация «признак независимого регистра сведений → признак вида, оканчивающегося на
+           „регистр“» не ловилась ни одним тестом. Эта сущность — не типовой факт из реального
+           $metadata (в 1С регистр накопления обычно связан с регистратором), а минимальный
+           случай, ловящий именно такую мутацию: TestИндекс_ошибочно_независимый_регистр в
+           test_index_edmx.py. -->
+      <EntityType Name="AccumulationRegister_ОстаткиНаСчетах">
+        <Key>
+          <PropertyRef Name="Счет_Key"/>
+          <PropertyRef Name="Валюта_Key"/>
+        </Key>
+        <Property Name="Счет_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Валюта_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Сумма" Type="Edm.Decimal" Nullable="true"/>
+      </EntityType>
+
       <EntityType Name="Catalog_БанковскиеСчета">
         <Key><PropertyRef Name="Ref_Key"/></Key>
         <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
@@ -104,6 +122,8 @@
                    EntityType="StandardODATA.InformationRegister_СостоянияЗаказов"/>
         <EntitySet Name="AccumulationRegister_ТоварыНаСкладах_Balance"
                    EntityType="StandardODATA.AccumulationRegister_ТоварыНаСкладах_Balance"/>
+        <EntitySet Name="AccumulationRegister_ОстаткиНаСчетах"
+                   EntityType="StandardODATA.AccumulationRegister_ОстаткиНаСчетах"/>
         <EntitySet Name="Catalog_БанковскиеСчета" EntityType="StandardODATA.Catalog_БанковскиеСчета"/>
         <FunctionImport Name="Document_РеализацияТоваровУслуг_Post"
                         ReturnType="StandardODATA.Document_РеализацияТоваровУслуг"

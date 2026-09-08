@@ -23,6 +23,7 @@ from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
+from odata1c.index.repository import IndexCorruptError
 from odata1c.registry.registry import Registry, SessionScope
 
 ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
@@ -98,11 +99,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
             return cmd_reindex(home, args.name, args.force)
-    except (ConfigError, OdataError, EdmxError) as ошибка:
-        # ConfigError (настройки), OdataError (ответ 1С) и EdmxError (не удалось разобрать
-        # $metadata) — разные классы, но у всех есть code и hint, и str() на всех даёт
-        # человекочитаемое сообщение (Exception.__init__ получает его же); одно место
-        # форматирования вместо трёх копий.
+    except (ConfigError, OdataError, EdmxError, IndexCorruptError) as ошибка:
+        # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать
+        # $metadata) и IndexCorruptError (файл индекса повреждён — reindex открывает прежний
+        # индекс перед перестройкой, см. правку по итогам ревью задачи 5) — разные классы,
+        # но у всех есть code и hint, и str() на всех даёт человекочитаемое сообщение
+        # (Exception.__init__ получает его же); одно место форматирования вместо четырёх копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")

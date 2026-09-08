@@ -83,11 +83,13 @@ class IndexRepository:
             self._connection.execute("DELETE FROM entities")
             self._connection.execute("DELETE FROM entities_fts")
             for сущность in parsed.entities:
+                имя_норм = normalize(сущность.name)
+                основы_имени = " ".join(stems(сущность.base_name))
                 курсор = self._connection.execute(
                     "INSERT INTO entities (name, kind, russian_kind, base_name, parent_entity,"
                     " is_tabular_part, is_virtual, virtual_kind, key_fields_json,"
                     " description_field, has_posted, has_recorder, is_independent_register,"
-                    " indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " norm_name, stems, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         сущность.name,
                         сущность.kind,
@@ -102,6 +104,8 @@ class IndexRepository:
                         int(сущность.has_posted),
                         int(сущность.has_recorder),
                         int(сущность.is_independent_register),
+                        имя_норм,
+                        основы_имени,
                         момент,
                     ),
                 )
@@ -139,7 +143,7 @@ class IndexRepository:
                 )
                 self._connection.execute(
                     "INSERT INTO entities_fts (name, norm_name, stems) VALUES (?,?,?)",
-                    (сущность.name, normalize(сущность.name), " ".join(stems(сущность.base_name))),
+                    (сущность.name, имя_норм, основы_имени),
                 )
             self._set_meta("edmx_sha256", parsed.edmx_sha256)
             self._set_meta("indexed_at", момент)
@@ -159,20 +163,30 @@ class IndexRepository:
                 )
 
     def find(self, query: str, kind: str | None = None, limit: int = 10) -> list[FoundEntity]:
-        """Ранжирование SPEC §4.4: точное совпадение → основы слов → триграммы."""
+        """Ранжирование SPEC §4.4: точное совпадение → основы слов → вхождение подстроки →
+        триграммы.
+
+        Правка по итогам ревью задачи 5 (Important): раньше запрос выбирал все строки основной
+        таблицы без учёта `kind` и заново пересчитывал `normalize()`/`stems()` по имени каждой
+        сущности — притом что write() уже сохраняет оба значения (столбцы `norm_name`, `stems`
+        таблицы `entities`, тот же расчёт продублирован в `entities_fts`). На 30 000 сущностей
+        это давало 1.7 с на запрос. Теперь фильтр по виду уходит в SQL (использует
+        `idx_entities_kind`), а норма и основы имени читаются готовыми — пересчитывается только
+        сам запрос (один раз за вызов). Ранжирование по-прежнему в Python — на перенос в FTS5
+        MATCH это решение не распространяется (SPEC §4.4 не описывает MATCH-ранжирование).
+        """
         нормализованный = normalize(query)
         основы = " ".join(stems(query))
-        строки = self._connection.execute(
-            "SELECT id, name, russian_kind, key_fields_json, base_name, kind FROM entities"
-        ).fetchall()
+        sql = "SELECT id, name, russian_kind, key_fields_json, norm_name, stems FROM entities"
+        параметры: tuple = ()
+        if kind:
+            sql += " WHERE kind = ?"
+            параметры = (kind,)
+        строки = self._connection.execute(sql, параметры).fetchall()
 
         результаты: list[FoundEntity] = []
         for строка in строки:
-            if kind and строка["kind"] != kind:
-                continue
-            имя_норм = normalize(строка["name"])
-            имя_основы = " ".join(stems(строка["base_name"]))
-            оценка = self._оценить(нормализованный, основы, имя_норм, имя_основы)
+            оценка = self._оценить(нормализованный, основы, строка["norm_name"], строка["stems"])
             if оценка <= 0:
                 continue
             результаты.append(
@@ -233,6 +247,20 @@ class IndexRepository:
             for строка in self._connection.execute("SELECT name FROM entities").fetchall()
         }
 
+    def field_sensitivities(self) -> dict[tuple[str, str], str | None]:
+        """(сущность, поле) → проставленный класс защиты (или None, если не проставлен).
+
+        Читает прежнее состояние перед перестройкой индекса (SPEC §4.3 п. 4, задача 5:
+        «новые поля под защитой» — именно новые, а не все на каждый прогон).
+        """
+        return {
+            (строка["entity"], строка["field"]): строка["sensitivity"]
+            for строка in self._connection.execute(
+                "SELECT e.name AS entity, f.name AS field, f.sensitivity AS sensitivity"
+                " FROM fields f JOIN entities e ON e.id = f.entity_id"
+            ).fetchall()
+        }
+
     def field_names(self, entity: str) -> set[str]:
         return {
             строка["name"]
@@ -243,13 +271,22 @@ class IndexRepository:
             ).fetchall()
         }
 
-    def set_field_sensitivity(self, entity: str, field: str, value: str, source: str) -> None:
+    def set_field_sensitivity(self, entity: str, field: str, value: str, source: str) -> bool:
+        """Проставить класс защиты поля. Возвращает True, если строка действительно обновлена.
+
+        Правка по итогам ревью задачи 5 (Important): промах условия (опечатка в правиле,
+        рассинхронизация имён после обновления индекса) раньше не давал ни ошибки, ни признака —
+        притом что это точка подключения гейта: непроставленный класс означает, что поле уйдёт
+        модели в открытом виде, а «реальные значения защищаемых классов не выходят никогда» —
+        инвариант продукта (AGENTS.md), а не рекомендация. Вызывающий обязан проверить результат.
+        """
         with self._connection:
-            self._connection.execute(
+            курсор = self._connection.execute(
                 "UPDATE fields SET sensitivity = ?, sensitivity_source = ?"
                 " WHERE name = ? AND entity_id = (SELECT id FROM entities WHERE name = ?)",
                 (value, source, field, entity),
             )
+            return курсор.rowcount > 0
 
     def meta(self, key: str) -> str | None:
         строка = self._connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()

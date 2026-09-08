@@ -4,6 +4,7 @@ import pathlib
 
 import httpx
 import respx
+from conftest import обёртка_эдмкс
 
 from odata1c.client1c.client import Client1C
 from odata1c.config.models import BaseConfig
@@ -31,7 +32,7 @@ async def test_первый_реиндекс_строит_индекс(tmp_path,
     await client.close()
 
     assert результат.changed is True
-    assert результат.entity_count == 8
+    assert результат.entity_count == 9
     assert index_path(tmp_path, "ut").exists()
     assert "Catalog_Контрагенты" in результат.added_entities
 
@@ -59,7 +60,7 @@ async def test_принудительный_реиндекс_перестраи�
     await client.close()
 
     assert результат.changed is True
-    assert результат.entity_count == 8
+    assert результат.entity_count == 9
 
 
 @respx.mock
@@ -108,6 +109,50 @@ async def test_классификатор_проставляет_классы_п
 
 
 @respx.mock
+async def test_повторная_классификация_без_изменений_не_даёт_новых_полей(tmp_path, edmx_synthetic):
+    # Правка по итогам финального ревью M1b (Important, задача 5): без сверки с прежним
+    # состоянием два прогона подряд при пустой разнице оба возвращали одно и то же поле как
+    # новое — на базе уровня ERP это тысячи полей на каждый запуск, сигнал уничтожен.
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_synthetic))
+
+    def классификатор(сущность, поле, тип):
+        return ("inn", "auto") if поле == "ИНН" else None
+
+    _замокать_завершение_сеанса()
+    client = Client1C(база())
+    await reindex(база(), client, tmp_path, classifier=классификатор)
+    результат = await reindex(база(), client, tmp_path, force=True, classifier=классификатор)
+    await client.close()
+
+    assert результат.new_sensitive_fields == []
+
+
+@respx.mock
+async def test_смена_класса_поля_попадает_в_новые_остальные_нет(tmp_path, edmx_synthetic):
+    # Поле считается новым, если в прежнем индексе у него не было класса защиты или класс был
+    # другим — проверяем именно вторую половину условия.
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_synthetic))
+
+    def классификатор_v1(сущность, поле, тип):
+        return ("inn", "auto") if поле == "ИНН" else None
+
+    def классификатор_v2(сущность, поле, тип):
+        return ("person", "auto") if поле == "ИНН" else None
+
+    _замокать_завершение_сеанса()
+    client = Client1C(база())
+    await reindex(база(), client, tmp_path, classifier=классификатор_v1)
+    результат = await reindex(база(), client, tmp_path, force=True, classifier=классификатор_v2)
+    await client.close()
+
+    новые = {
+        (поле["entity"], поле["field"], поле["sensitivity"])
+        for поле in результат.new_sensitive_fields
+    }
+    assert новые == {("Catalog_Контрагенты", "ИНН", "person")}
+
+
+@respx.mock
 async def test_повреждённый_метаданные_не_ломают_старый_индекс(tmp_path, edmx_synthetic):
     маршрут = respx.get(f"{URL}$metadata")
     маршрут.mock(
@@ -130,25 +175,19 @@ async def test_повреждённый_метаданные_не_ломают_�
     from odata1c.index.repository import IndexRepository
 
     хранилище = IndexRepository(index_path(tmp_path, "ut"))
-    assert len(хранилище.entity_names()) == 8  # старый индекс уцелел
+    assert len(хранилище.entity_names()) == 9  # старый индекс уцелел
     хранилище.close()
 
 
 def _эдмкс_с_нераспознанным_набором() -> bytes:
-    """Минимальный EDMX с набором, ссылающимся на несуществующий EntityType — тот же приём,
-    что в tests/unit/test_index_repository.py, отдельно от synthetic.edmx, чтобы не менять
-    фикстуру, общую с задачами 1 и 3."""
-    return """<?xml version="1.0" encoding="UTF-8"?>
-<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
-  <edmx:DataServices m:DataServiceVersion="3.0"
-                     xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
-    <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
-      <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
-        <EntitySet Name="Catalog_Пропавший" EntityType="StandardODATA.Catalog_Пропавший"/>
-      </EntityContainer>
-    </Schema>
-  </edmx:DataServices>
-</edmx:Edmx>""".encode()
+    """EDMX с набором, ссылающимся на несуществующий EntityType — тот же приём, что в
+    tests/unit/test_index_repository.py, отдельно от synthetic.edmx, чтобы не менять фикстуру,
+    общую с задачами 1 и 3. Тело контейнера собирает общая обёртка из conftest.py (см. правку
+    по итогам финального ревью M1b — та же функция использовалась в двух тестовых файлах
+    отдельными копиями)."""
+    return обёртка_эдмкс(
+        '<EntitySet Name="Catalog_Пропавший" EntityType="StandardODATA.Catalog_Пропавший"/>'
+    )
 
 
 @respx.mock
@@ -233,5 +272,5 @@ async def test_сбой_записи_не_портит_прежний_индек
     assert путь.stat().st_size == размер_до
 
     хранилище = IndexRepository(путь)
-    assert len(хранилище.entity_names()) == 8  # прежний индекс по-прежнему читается
+    assert len(хранилище.entity_names()) == 9  # прежний индекс по-прежнему читается
     хранилище.close()

@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS entities (
     has_posted INTEGER NOT NULL DEFAULT 0,
     has_recorder INTEGER NOT NULL DEFAULT 0,
     is_independent_register INTEGER NOT NULL DEFAULT 0,
+    norm_name TEXT NOT NULL DEFAULT '',
+    stems TEXT NOT NULL DEFAULT '',
     indexed_at TEXT NOT NULL
 );
 
@@ -65,9 +67,21 @@ def connect(path: pathlib.Path) -> sqlite3.Connection:
     файловый дескриптор; не закрыв его перед тем, как передать исключение выше, оставляем
     объект sqlite3.Connection недостижимым, но не закрытым — на сборке мусора интерпретатор
     выдаёт ResourceWarning (в тестах он превращается в ошибку сессии pytest).
+
+    Управление транзакциями — штатное (isolation_level по умолчанию, без ручного autocommit).
+    Правка по итогам ревью задачи 5 (Critical): раньше соединение открывалось с
+    `isolation_level=None` — в этом режиме `with соединение:` по всему хранилищу выглядит как
+    транзакция, но ею не является: каждая вставка фиксируется отдельно, а при включённом WAL
+    каждая фиксация — обращение к диску (500 сущностей — 20 секунд, 40 мс на сущность). Второе
+    следствие — иллюзия отката: `with` при исключении вызывает `rollback()`, но откатывать
+    нечего, каждая строка уже зафиксирована. При штатном управлении первая же DML-команда
+    (`INSERT`/`DELETE`/…) открывает транзакцию неявно, и `with соединение:` в repository.py
+    действительно фиксирует или откатывает её целиком. `PRAGMA journal_mode=WAL` выполняется
+    здесь же, до первой DML — PRAGMA неявную транзакцию не открывает, поэтому режим меняется
+    штатно и до всех последующих вставок.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, isolation_level=None)
+    connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA journal_mode=WAL")

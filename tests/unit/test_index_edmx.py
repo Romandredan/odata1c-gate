@@ -2,6 +2,8 @@
 
 import io
 
+from conftest import обёртка_эдмкс
+
 from odata1c.index.edmx import parse_edmx
 
 
@@ -16,6 +18,7 @@ def test_разобраны_все_наборы_сущностей(edmx_syntheti
         "InformationRegister_КурсыВалют_SliceLast",
         "InformationRegister_СостоянияЗаказов",
         "AccumulationRegister_ТоварыНаСкладах_Balance",
+        "AccumulationRegister_ОстаткиНаСчетах",
         "Catalog_БанковскиеСчета",
     }
 
@@ -100,6 +103,27 @@ def test_виртуальная_таблица_не_независимый_ре�
     assert срез.is_independent_register is False
 
 
+def test_регистр_накопления_не_независимый_регистр_сведений(edmx_synthetic):
+    # Правка по итогам финального ревью M1b (Important, задача 3): единственный регистр
+    # другого вида в прежнем образце (AccumulationRegister_ТоварыНаСкладах_Balance) был
+    # виртуальным и отсекался условием is_virtual — мутация «регистр сведений» →
+    # «вид, оканчивающийся на „регистр“» (kind.endswith("Register")) прошла бы все 171
+    # существующих теста незамеченной. Этот регистр накопления невиртуальный, с ключом
+    # из одних измерений (без Recorder среди ключей) — ровно случай, который такую мутацию
+    # ловит: kind.endswith("Register") даёт True для AccumulationRegister так же, как для
+    # InformationRegister, а признак независимого регистра сведений — только у последнего.
+    #
+    # Проверено вручную: внесение мутации (see edmx.py, _собрать_сущность) —
+    # `регистр_сведений = разобранное_имя.kind.endswith("Register")` вместо
+    # `== "InformationRegister"` — ломает именно этот тест (is_independent_register
+    # ошибочно становится True), при живом coде здесь False.
+    остатки = найти(parse_edmx(edmx_synthetic), "AccumulationRegister_ОстаткиНаСчетах")
+    assert остатки.kind == "AccumulationRegister"
+    assert остатки.is_virtual is False
+    assert остатки.has_recorder is False
+    assert остатки.is_independent_register is False
+
+
 def test_действия_разобраны_с_параметрами(edmx_synthetic):
     разобрано = parse_edmx(edmx_synthetic)
     действия = {действие.name: действие for действие in разобрано.actions}
@@ -127,26 +151,10 @@ def test_битый_xml_даёт_понятную_ошибку():
     assert "metadata" in str(ошибка.value).lower() or "разобрать" in str(ошибка.value).lower()
 
 
-def _обёртка_эдмкс(тело_контейнера: str) -> bytes:
-    """Минимальный валидный EDMX с произвольным содержимым EntityContainer — для сценариев,
-    которые не должны затрагивать общую фикстуру synthetic.edmx."""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
-  <edmx:DataServices m:DataServiceVersion="3.0"
-                     xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
-    <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
-      <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
-        {тело_контейнера}
-      </EntityContainer>
-    </Schema>
-  </edmx:DataServices>
-</edmx:Edmx>""".encode()
-
-
 def test_набор_без_существующего_типа_попадает_в_нераспознанные():
     # Набор ссылается на EntityType, которого в документе нет (испорченная ссылка в описании).
     # Обновление индекса не должно прочитать это как удаление сущности — see SPEC brief задачи.
-    edmx = _обёртка_эдмкс(
+    edmx = обёртка_эдмкс(
         '<EntitySet Name="Catalog_Пропавший" EntityType="StandardODATA.Catalog_Пропавший"/>'
     )
     разобрано = parse_edmx(edmx)
@@ -195,7 +203,7 @@ def test_разбор_контейнера_не_копит_дерево_цели
         f'<EntitySet Name="Catalog_Т{i}" EntityType="StandardODATA.Catalog_Т{i}"/>'
         for i in range(число_наборов)
     )
-    edmx = _обёртка_эдмкс(наборы_xml)
+    edmx = обёртка_эдмкс(наборы_xml)
 
     настоящий_iterparse = edmx_модуль.etree.iterparse
     наибольшее_число_детей = 0
