@@ -61,6 +61,18 @@ class ConfigError(Exception):
         self.hint = hint
 
 
+def _разобрать_yaml(path: pathlib.Path) -> dict:
+    """Прочитать YAML-файл; синтаксическая ошибка — ConfigError с именем файла, а не сырой дамп."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(
+            f"файл {path.name} повреждён и не разбирается как YAML: {exc}",
+            hint=f"проверьте синтаксис файла {path}",
+        ) from exc
+    return data or {}
+
+
 def apply_role(role: str, raw: dict) -> dict:
     """Наложить умолчания роли на запись базы: явные значения выигрывают."""
     if role not in УМОЛЧАНИЯ_РОЛЕЙ:
@@ -97,7 +109,7 @@ def _load_bases(
     предупреждение = check_file_permissions(path)
     if предупреждение:
         warnings.append(предупреждение)
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    data = _разобрать_yaml(path)
     raw_bases = data.get("bases") or {}
     if not isinstance(raw_bases, dict):
         raise ConfigError("в bases.yaml раздел bases должен быть словарём «имя базы: настройки»")
@@ -105,10 +117,15 @@ def _load_bases(
     bases: dict[str, BaseConfig] = {}
     for name, raw in raw_bases.items():
         if raw is None:
+            warnings.append(f"база «{name}»: запись в bases.yaml пуста, база пропущена")
             continue
         role = raw.get("role", "prod")
         try:
-            bases[name] = BaseConfig(name=name, **apply_role(role, raw))
+            resolved = apply_role(role, raw)
+        except ConfigError as exc:
+            raise ConfigError(f"база «{name}»: {exc}", code=exc.code, hint=exc.hint) from exc
+        try:
+            bases[name] = BaseConfig(name=name, **resolved)
         except pydantic.ValidationError as exc:
             raise ConfigError(f"база «{name}» описана неверно: {_кратко(exc)}") from exc
         if bases[name].password == "keyring":
@@ -120,13 +137,19 @@ def _load_daemon(home: pathlib.Path, warnings: list[str]) -> DaemonConfig:
     path = home / "daemon.yaml"
     data = {}
     if path.exists():
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _разобрать_yaml(path)
     try:
         daemon = DaemonConfig(**data)
     except pydantic.ValidationError as exc:
         raise ConfigError(f"daemon.yaml описан неверно: {_кратко(exc)}") from exc
     if not daemon.gate_secret:
         daemon = daemon.model_copy(update={"gate_secret": _создать_секрет(path, data)})
+    # gate_secret — ключ HMAC, которым строятся все токены гейта; после этой точки файл
+    # с ним точно существует (был на диске или только что создан), поэтому права проверяем
+    # здесь одним местом на оба случая.
+    предупреждение = check_file_permissions(path)
+    if предупреждение:
+        warnings.append(предупреждение)
     return daemon
 
 
@@ -135,6 +158,10 @@ def _создать_секрет(path: pathlib.Path, data: dict) -> str:
     secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     data = {**data, "gate_secret": secret}
     path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # На Windows chmod не управляет ACL и здесь ничего не защищает — правами файла управляет
+    # NTFS, а не биты POSIX. Реальная защита от других учётных записей закрывается на уровне
+    # всего домашнего каталога через icacls в odata1c.config.home.ensure_home; этот модуль
+    # только предупреждает (check_file_permissions), если права оказались широкими.
     if os.name != "nt":
         path.chmod(0o600)
     return secret

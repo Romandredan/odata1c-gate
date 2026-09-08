@@ -44,3 +44,10 @@ def test_явное_разрешение_перекрывает_роль():
     config = BaseConfig(name="ut", **apply_role("prod", raw))
     assert config.permissions.independent_register_delete is True
     assert config.permissions.commit_limit == 20  # остальное осталось от роли
+
+
+def test_явное_поле_гейта_перекрывает_роль_остальное_сохраняется():
+    raw = {**МИНИМУМ, "role": "prod", "gate": {"names_for": ["Контрагент"]}}
+    config = BaseConfig(name="ut", **apply_role("prod", raw))
+    assert config.gate.names_for == ["Контрагент"]
+    assert config.gate.mode == "identifiers+names"  # уровень защиты остался от роли

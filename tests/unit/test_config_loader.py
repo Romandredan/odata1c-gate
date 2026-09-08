@@ -79,3 +79,33 @@ def test_отсутствие_файла_баз_не_ошибка_а_пусто�
     config = load_config(tmp_path)
     assert config.bases == {}
     assert config.default is None
+
+
+def test_битый_bases_yaml_даёт_понятную_ошибку_с_именем_файла(tmp_path):
+    битый = "default: ut\nbases:\n  ut: [не_закрыта_скобка\n"
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(записать(tmp_path, битый))
+    assert "bases.yaml" in str(ошибка.value)
+
+
+def test_битый_daemon_yaml_даёт_понятную_ошибку_с_именем_файла(tmp_path):
+    битый_daemon = "port: [не_закрыта_скобка\n"
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(записать(tmp_path, BASES, битый_daemon))
+    assert "daemon.yaml" in str(ошибка.value)
+
+
+def test_неизвестная_роль_называет_базу_и_роль(tmp_path):
+    плохой = BASES.replace("role: prod", "role: qa")
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(записать(tmp_path, плохой))
+    текст = str(ошибка.value).lower()
+    assert "ut" in текст
+    assert "роль" in текст
+
+
+def test_пустая_запись_базы_даёт_предупреждение_и_не_падает(tmp_path):
+    с_пустой_записью = BASES + "  пустая:\n"
+    config = load_config(записать(tmp_path, с_пустой_записью))
+    assert set(config.bases) == {"ut"}
+    assert any("пустая" in предупреждение for предупреждение in config.warnings)
