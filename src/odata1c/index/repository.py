@@ -6,12 +6,27 @@ import dataclasses
 import datetime
 import json
 import pathlib
+import sqlite3
 
 from odata1c.index.edmx import ParsedMetadata
 from odata1c.index.naming import normalize, stems
 from odata1c.index.schema import connect
 
 ПРЕДПРОСМОТР_ПОЛЕЙ = 12
+
+# SPEC §4.4, ветка 3 (вхождение сжатого запроса в сжатое имя): запросы короче порога дают
+# слишком много случайных совпадений на реальных именах (однобуквенный запрос "к" — почти
+# в любом имени сущности; см. тест на короткий запрос) — для них остаются только точное
+# совпадение и совпадение по основам слов.
+МИНИМАЛЬНАЯ_ДЛИНА_ПОДСТРОКИ = 3
+
+# SPEC §4.4, ветка 4 (триграммное сходство): доля общих триграмм ниже порога — случайное
+# пересечение, а не осмысленный кандидат. Порог 0.2 подобран по образцу synthetic.edmx: он
+# отсекает совпадение только по общему префиксу вида объекта (0.161 — «Catalog_Контрагенты»
+# против «Catalog_БанковскиеСчета» по запросу полного имени первой) и случайные пересечения
+# по несвязанным словам (0.024), но пропускает опечатку в одну букву у сущностей сравнимой
+# длины (0.238–0.567 в образце) — см. тесты на пороге.
+ПОРОГ_ТРИГРАММ = 0.2
 
 
 @dataclasses.dataclass(slots=True)
@@ -35,10 +50,25 @@ class EntityDescription:
     is_independent_register: bool
 
 
+class IndexCorruptError(Exception):
+    """Файл индекса — не SQLite-база или повреждён (тот же код/атрибуты, что у OdataError и
+    ConfigError: SPEC §5.2 — code, message, hint)."""
+
+    def __init__(self, path: pathlib.Path, детали: str) -> None:
+        message = f"индекс метаданных повреждён или недоступен: {path}"
+        super().__init__(message)
+        self.code = "index_corrupt"
+        self.message = message
+        self.hint = f"обновите индекс командой odata1c reindex <база> ({детали})"
+
+
 class IndexRepository:
     def __init__(self, path: pathlib.Path) -> None:
         self.path = pathlib.Path(path)
-        self._connection = connect(self.path)
+        try:
+            self._connection = connect(self.path)
+        except sqlite3.DatabaseError as ошибка:
+            raise IndexCorruptError(self.path, str(ошибка)) from ошибка
 
     def close(self) -> None:
         self._connection.close()
@@ -251,9 +281,12 @@ class IndexRepository:
             return 50.0 + совпало_основ
         сжатый_запрос = запрос_норм.replace(" ", "")
         сжатое_имя = имя_норм.replace(" ", "")
-        if сжатый_запрос and сжатый_запрос in сжатое_имя:
+        if len(сжатый_запрос) >= МИНИМАЛЬНАЯ_ДЛИНА_ПОДСТРОКИ and сжатый_запрос in сжатое_имя:
             return 30.0 + len(сжатый_запрос) / max(len(сжатое_имя), 1)
-        return _триграммы(сжатый_запрос, сжатое_имя) * 20.0
+        сходство = _триграммы(сжатый_запрос, сжатое_имя)
+        if сходство < ПОРОГ_ТРИГРАММ:
+            return 0.0
+        return сходство * 20.0
 
 
 def _триграммы(левое: str, правое: str) -> float:

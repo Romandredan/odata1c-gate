@@ -58,11 +58,22 @@ CREATE INDEX IF NOT EXISTS idx_entities_parent ON entities(parent_entity);
 
 
 def connect(path: pathlib.Path) -> sqlite3.Connection:
-    """Соединение в режиме WAL: читающие сессии не блокируют пишущую (SPEC §2.2)."""
+    """Соединение в режиме WAL: читающие сессии не блокируют пишущую (SPEC §2.2).
+
+    Если файл повреждён (не SQLite-база), sqlite3 узнаёт об этом не на sqlite3.connect(), а
+    только на первой операции — здесь на PRAGMA. В этом случае соединение уже открыто и держит
+    файловый дескриптор; не закрыв его перед тем, как передать исключение выше, оставляем
+    объект sqlite3.Connection недостижимым, но не закрытым — на сборке мусора интерпретатор
+    выдаёт ResourceWarning (в тестах он превращается в ошибку сессии pytest).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, isolation_level=None)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.executescript(SCHEMA_SQL)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(SCHEMA_SQL)
+    except sqlite3.DatabaseError:
+        connection.close()
+        raise
     return connection
