@@ -1,4 +1,4 @@
-"""Команды CLI: init, base list, base test."""
+"""Команды CLI: init, base list, base test, base add, base import."""
 
 import pathlib
 
@@ -209,3 +209,108 @@ def test_load_config_домашний_путь_указывает_на_файл(
     with pytest.raises(ConfigError) as ошибка:
         load_config(файл)
     assert str(файл) in str(ошибка.value)
+
+
+def _ввод_для_add(monkeypatch, url="http://localhost/x/odata/standard.odata/", label="Подпись"):
+    """Подставляет ответы на вопросы cmd_base_add через input()/getpass.getpass(), не трогая
+    настоящий терминал; пароль — заведомо не встречающийся больше нигде маркер."""
+    ответы = iter([url, label, "пользователь"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(ответы))
+    monkeypatch.setattr("getpass.getpass", lambda *_: "секретный_пароль_только_для_теста")
+
+
+def test_base_list_после_init_баз_не_описано(tmp_path, capsys):
+    """Регресс: шаблон bases.yaml содержал незакомментированную демонстрационную базу ut —
+    сразу после создания каталога odata1c_bases показывал её как настоящую (SPEC §11.4)."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+
+    код = main(["base", "list", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "баз не описано" in вывод
+    assert "роль" not in вывод  # заголовок таблицы баз печатается, только когда базы есть
+
+
+def test_base_add_дважды_одним_именем_отказывает(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+    код1 = main(["base", "add", "ut", "--home", str(home)])
+    assert код1 == 0
+
+    код2 = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код2 == 1
+    assert "уже описана" in вывод
+    # вторая попытка не должна была даже спросить пароль — дубликат проверяется до ввода.
+    # Считаем только активную запись "  ut:" (без "#"), а не совпадения внутри
+    # закомментированного демонстрационного блока шаблона (там тоже есть "# ut:").
+    текст = (home / "bases.yaml").read_text(encoding="utf-8")
+    assert текст.count("\n  ut:\n") == 1
+
+
+def test_base_add_недопустимое_имя_даёт_ошибку_а_не_трейсбек(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+
+    код = main(["base", "add", "Недопустимое Имя", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+    assert "секретный_пароль_только_для_теста" not in вывод
+
+
+def test_base_add_пароль_не_попадает_в_вывод(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "секретный_пароль_только_для_теста" not in вывод
+    config = load_config(home)
+    assert config.bases["ut"].password == "секретный_пароль_только_для_теста"
+
+
+def test_base_import_базу_ut_переносит_несмотря_на_шаблон(tmp_path, capsys):
+    """Регресс: незакомментированная демонстрационная база ut в шаблоне заставляла перенос
+    базы с тем же именем печатать «уже описана, пропускаю» и терять настоящие учётные данные."""
+    home = tmp_path / "home"
+    env = tmp_path / "1c-odata.env"
+    env.write_text(
+        "ODATA_DB_UT_BASE_URL=http://real.invalid/ut/odata/standard.odata/\n"
+        "ODATA_DB_UT_USERNAME=настоящий_пользователь\n"
+        "ODATA_DB_UT_PASSWORD=настоящий_пароль\n",
+        encoding="utf-8",
+    )
+
+    код = main(["base", "import", str(env), "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "уже описана" not in вывод
+    assert "перенесена база «ut»" in вывод
+    config = load_config(home)
+    assert config.bases["ut"].url == "http://real.invalid/ut/odata/standard.odata/"
+
+
+def test_base_import_переносит_базу_по_умолчанию_из_env(tmp_path):
+    """База по умолчанию в env-файле — не первая в списке; раньше запись всегда обрывалась,
+    потому что шаблон уже содержал активную строку default: ut."""
+    home = tmp_path / "home"
+    env = tmp_path / "1c-odata.env"
+    env.write_text(
+        "ODATA_DEFAULT_DB=buh\n"
+        "ODATA_DB_UT_BASE_URL=http://a.invalid/ut/odata/standard.odata/\n"
+        "ODATA_DB_BUH_BASE_URL=http://b.invalid/buh/odata/standard.odata/\n",
+        encoding="utf-8",
+    )
+
+    main(["base", "import", str(env), "--home", str(home)])
+    config = load_config(home)
+
+    assert config.default == "buh"

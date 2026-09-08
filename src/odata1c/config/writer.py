@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import pathlib
 
+import yaml
+
 ШАБЛОН_ЗАПИСИ = """\
   {name}:
     label: {label}
     url: {url}
     user: {user}
-    password: "{password}"
+    password: {password}
     role: {role}
 
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
@@ -34,6 +36,15 @@ import pathlib
 """
 
 
+def _скаляр(value: str) -> str:
+    """YAML-представление одного значения решает библиотека, а не подстановка в строку-шаблон:
+    кавычка, двоеточие, решётка или апостроф в значении (пароль, подпись, адрес, имя пользователя)
+    иначе ломают разметку файла — и следующее чтение настроек падает с текстом самого значения
+    (например, пароля) внутри сообщения об ошибке YAML."""
+    строка = yaml.safe_dump({"значение": value}, allow_unicode=True, default_flow_style=False)
+    return строка[len("значение: ") :].rstrip("\n")
+
+
 def render_base(name: str, values: dict) -> str:
     write = values.get("write")
     write_line = (
@@ -43,10 +54,10 @@ def render_base(name: str, values: dict) -> str:
     )
     return ШАБЛОН_ЗАПИСИ.format(
         name=name,
-        label=values.get("label", name),
-        url=values["url"],
-        user=values.get("user", ""),
-        password=values.get("password", ""),
+        label=_скаляр(values.get("label", name)),
+        url=_скаляр(values["url"]),
+        user=_скаляр(values.get("user", "")),
+        password=_скаляр(values.get("password", "")),
         role=values.get("role", "prod"),
         write_line=write_line,
     )

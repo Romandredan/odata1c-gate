@@ -1,15 +1,15 @@
 # odata1c: все базы 1С этой машины. Файл закрыт правами текущего пользователя ОС.
 # Пароли хранятся здесь открытым текстом (см. SPEC §3.4) либо `password: keyring`.
 
-default: ut                          # база по умолчанию, если тул вызван без `base`
+# default: ut                          # база по умолчанию, если тул вызван без `base`
 
 bases:
-  ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
-    label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
-    url: https://1c.corp.local/ut/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
-    user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
-    password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС (odata1c base secret ut)
-    role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
+  # ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
+  #   label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
+  #   url: https://1c.corp.local/ut/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
+  #   user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
+  #   password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС (odata1c base secret ut)
+  #   role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
 
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
     # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
@@ -18,7 +18,7 @@ bases:
     # ib_session: true               # держать сеанс 1С (IBSession) между запросами
 
     # --- запись (умолчание роли prod: write: false) ---
-    write: true                      # разрешить пишущие тулы (create/update/mark/action); commit всегда с подтверждением
+  #   write: true                    # разрешить пишущие тулы (create/update/mark/action); commit всегда с подтверждением
     # permissions:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов

@@ -12,6 +12,8 @@ import getpass
 import importlib.resources
 import pathlib
 
+import pydantic
+
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
 from odata1c.config.home import ensure_home, resolve_home
@@ -160,6 +162,11 @@ async def _проверить_соединение(base) -> int:
 
 def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) -> int:
     cmd_init(home)
+    if name in load_config(home).bases:
+        raise ConfigError(
+            f"база «{name}» уже описана в bases.yaml",
+            hint="поправьте существующую запись вручную или выберите другое имя",
+        )
     print(f"добавляю базу «{name}» с ролью {role}")
     url = input("адрес (оканчивается на /odata/standard.odata/): ").strip()
     values = {
@@ -169,13 +176,20 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
         "password": getpass.getpass("пароль 1С (не отображается): "),
         "role": role,
     }
-    BaseConfig(name=name, **values)  # проверка имени и адреса до записи в файл
+    try:
+        BaseConfig(name=name, **values)  # проверка имени и адреса до записи в файл
+    except pydantic.ValidationError as ошибка:
+        raise ConfigError(f"база «{name}» описана неверно: {_кратко(ошибка)}") from ошибка
     append_base(home / "bases.yaml", name, values)
     print(f"база «{name}» дописана в {home / 'bases.yaml'}")
     if recipes:
         _скопировать_рецепты(home, name, recipes)
     print(f"проверить соединение: odata1c base test {name}")
     return 0
+
+
+def _кратко(ошибка: pydantic.ValidationError) -> str:
+    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in ошибка.errors())
 
 
 def cmd_base_import(home: pathlib.Path, path: pathlib.Path) -> int:
@@ -191,6 +205,12 @@ def cmd_base_import(home: pathlib.Path, path: pathlib.Path) -> int:
     добавлено = 0
     for запись in базы:
         имя = запись.pop("name")
+        переименовано_из = запись.pop("renamed_from", None)
+        if переименовано_из:
+            print(
+                f"предупреждение: имя базы «{переименовано_из}» после обрезки до 32 символов "
+                f"совпало с уже перенесённой базой, использую «{имя}»"
+            )
         if имя in существующие:
             print(f"база «{имя}» уже описана, пропускаю")
             continue

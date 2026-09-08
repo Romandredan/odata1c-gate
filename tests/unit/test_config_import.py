@@ -3,6 +3,7 @@
 import yaml
 
 from odata1c.config.importer import parse_env
+from odata1c.config.loader import load_config
 from odata1c.config.writer import append_base
 
 ENV = """
@@ -90,3 +91,69 @@ def test_запись_добавляется_с_комментариями(tmp_p
     текст = path.read_text(encoding="utf-8")
     assert "# --- соединение" in текст
     assert "# concurrency:" in текст
+
+
+def test_пароль_со_спецсимволами_переживает_запись_и_чтение(tmp_path):
+    """Регресс: подстановка значения в строку-шаблон без YAML-экранирования ломает разметку
+    файла на кавычке в пароле (`password: "p@ss"word"` — синтаксическая ошибка), а следующее
+    чтение настроек падает с текстом самого пароля внутри сообщения об ошибке YAML."""
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / "bases.yaml"
+    path.write_text("bases:\n", encoding="utf-8")
+    пароль = "p@ss\"word'with:colon#hash"
+    append_base(
+        path,
+        "ut",
+        {
+            "label": "УТ",
+            "url": "http://x/odata/standard.odata/",
+            "user": "u",
+            "password": пароль,
+            "role": "prod",
+        },
+    )
+    config = load_config(home)
+    assert config.bases["ut"].password == пароль
+
+
+def test_подпись_с_двоеточием_и_решёткой_переживает_запись_и_чтение(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / "bases.yaml"
+    path.write_text("bases:\n", encoding="utf-8")
+    подпись = "УТ: боевая # приоритет"
+    append_base(
+        path,
+        "ut",
+        {
+            "label": подпись,
+            "url": "http://x/odata/standard.odata/",
+            "user": "u",
+            "password": "p",
+            "role": "prod",
+        },
+    )
+    config = load_config(home)
+    assert config.bases["ut"].label == подпись
+
+
+def test_обрезка_длинного_имени_не_склеивает_разные_базы():
+    """Регресс: normalize_name обрезает имя до 32 символов; два разных исходных идентификатора
+    базы, различающиеся только хвостом за 32-м символом, раньше давали один и тот же ключ — записи
+    молча перемешивались под одним именем."""
+    длинное_1 = "A" * 32 + "_ONE"
+    длинное_2 = "A" * 32 + "_TWO"
+    env = (
+        f"ODATA_DB_{длинное_1}_BASE_URL=http://one/odata/standard.odata/\n"
+        f"ODATA_DB_{длинное_2}_BASE_URL=http://two/odata/standard.odata/\n"
+    )
+    _, базы = parse_env(env)
+
+    имена = [b["name"] for b in базы]
+    assert len(имена) == len(set(имена)) == 2
+    по_url = {b["url"]: b["name"] for b in базы}
+    имя_1 = по_url["http://one/odata/standard.odata/"]
+    имя_2 = по_url["http://two/odata/standard.odata/"]
+    assert имя_1 != имя_2
+    assert all(len(n) <= 32 for n in имена)
