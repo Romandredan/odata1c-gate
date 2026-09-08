@@ -1,0 +1,130 @@
+"""Классификация полей по имени при реиндексе (SPEC §6.4 слой имени, §6.5 слои 1 и 2).
+
+Результат ложится в секцию auto политики базы; ложные срабатывания пользователь переводит
+в keep вручную. Классифицируются только строковые поля.
+"""
+
+from __future__ import annotations
+
+import re
+
+СТРОКОВЫЕ_ТИПЫ = ("Edm.String",)
+
+# SPEC §6.5, слой 1: сущности, в которых Description и поля ФИО заменяются.
+DEFAULT_NAMES_FOR = frozenset(
+    {
+        "Catalog_Контрагенты",
+        "Catalog_Партнеры",
+        "Catalog_Организации",
+        "Catalog_ФизическиеЛица",
+        "Catalog_Сотрудники",
+        "Catalog_КонтактныеЛица",
+        "Catalog_Пользователи",
+    }
+)
+СУЩНОСТИ_ФИЗЛИЦ = frozenset(
+    {
+        "Catalog_ФизическиеЛица",
+        "Catalog_Сотрудники",
+        "Catalog_КонтактныеЛица",
+        "Catalog_Пользователи",
+    }
+)
+NAME_FIELD_RE = re.compile(
+    r"наименованиеполное|полноенаименование|фамилия|имя|отчество|фио|представление", re.IGNORECASE
+)
+
+# SPEC §6.4: реквизиты по имени поля. Порядок важен: doc проверяется раньше общего «номер».
+ПРАВИЛА_РЕКВИЗИТОВ: tuple[tuple[str, re.Pattern], ...] = (
+    ("email", re.compile(r"^email$|эл(ектронная)?почта|адресэп|^email", re.IGNORECASE)),
+    ("phone", re.compile(r"телефон|^phone$|номертелефона|мобильный", re.IGNORECASE)),
+    ("snils", re.compile(r"снилс|^snils$", re.IGNORECASE)),
+    ("iban", re.compile(r"^iban$", re.IGNORECASE)),
+    ("card", re.compile(r"номеркарты|^card$", re.IGNORECASE)),
+    ("corr", re.compile(r"коррсчет|корреспондентскийсчет", re.IGNORECASE)),
+    ("bic", re.compile(r"^бик$|^bic$", re.IGNORECASE)),
+    (
+        "acc",
+        re.compile(
+            r"номерсчета|расчетныйсчет|счет(получателя|плательщика)|лицевойсчет"
+            r"|^account$",
+            re.IGNORECASE,
+        ),
+    ),
+    ("ogrn", re.compile(r"огрн(ип)?|^ogrn$", re.IGNORECASE)),
+    ("kpp", re.compile(r"кпп|^kpp$", re.IGNORECASE)),
+    ("inn", re.compile(r"^инн$|инн(организации|контрагента|физлица)?|^inn$", re.IGNORECASE)),
+    ("dob", re.compile(r"датарождения|birth|^dob$", re.IGNORECASE)),
+    (
+        "doc",
+        re.compile(
+            r"^серия$|номер(документа|паспорта)|документсерия|документномер"
+            r"|кемвыдан|кодподразделения|датавыдачи",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "addr",
+        re.compile(
+            r"^адрес|адрес(регистрации|проживания|фактический|юридический)?$"
+            r"|^address$",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+# SPEC §6.5, слой 2: имена в строковых реквизитах любой сущности.
+ЛИЦО_ТОЧНО = re.compile(
+    r"^(имя|фамилия|отчество|фио|кассир|подписант|представитель|исполнитель|менеджер|автор)$",
+    re.IGNORECASE,
+)
+ЛИЦО_ЧАСТЬ = re.compile(
+    r"фио|ответственн(ое|ый)лицо|руководител|бухгалтер|контактноелицо|физлицо|сотрудник",
+    re.IGNORECASE,
+)
+ОРГ_ТОЧНО = re.compile(
+    r"^(организация|контрагент|плательщик|получатель|поставщик|покупатель|грузополучатель"
+    r"|грузоотправитель)$",
+    re.IGNORECASE,
+)
+ОРГ_ЧАСТЬ = re.compile(
+    r"наименованиеорганизации|наименованиеконтрагента|наименованиеполное|полноенаименование"
+    r"|наименованиебанка",
+    re.IGNORECASE,
+)
+
+
+def classify_field(
+    entity: str, field: str, edm_type: str, *, names_for: set[str] | None = None
+) -> tuple[str, str] | None:
+    if edm_type not in СТРОКОВЫЕ_ТИПЫ:
+        return None
+    if field in ("Ref_Key", "Code", "Number", "DataVersion") or field.endswith("_Type"):
+        return None
+
+    # Счёт учёта в плане счетов — не банковский счёт (SPEC §6.4, оговорка про chartofaccounts).
+    if entity.startswith("ChartOfAccounts") and re.fullmatch(r"account|счет", field, re.IGNORECASE):
+        return None
+
+    for класс, шаблон in ПРАВИЛА_РЕКВИЗИТОВ:
+        if шаблон.search(field):
+            return (класс, "auto")
+
+    список = names_for if names_for is not None else set(DEFAULT_NAMES_FOR)
+    if entity in список and (field == "Description" or NAME_FIELD_RE.search(field)):
+        класс = "person" if entity in СУЩНОСТИ_ФИЗЛИЦ else "org"
+        return (класс, "auto")
+
+    имя_класса = _имя_в_чужой_сущности(entity, field)
+    return (имя_класса, "auto") if имя_класса else None
+
+
+def _имя_в_чужой_сущности(entity: str, field: str) -> str | None:
+    """Слой 2 SPEC §6.5: строковый реквизит, несущий имя открытым текстом."""
+    if entity == "Catalog_Банки" and ОРГ_ЧАСТЬ.search(field):
+        return None  # названия банков не защищаются (SPEC §6.4)
+    if ЛИЦО_ТОЧНО.fullmatch(field) or ЛИЦО_ЧАСТЬ.search(field):
+        return "person"
+    if ОРГ_ТОЧНО.fullmatch(field) or ОРГ_ЧАСТЬ.search(field):
+        return "org"
+    return None
