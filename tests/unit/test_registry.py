@@ -115,6 +115,17 @@ def test_обновление_состояния_для_неизвестного
     assert ошибка.value.code == "base_unknown"
 
 
+def test_visible_возвращает_копии_а_не_живые_объекты_состояния():
+    """Регресс: visible() отдавал наружу живые объекты BaseState, общие для всех сессий,
+    читающих реестр. Правка снаружи полученного объекта не должна менять состояние в реестре."""
+    registry = Registry(собрать("ut"))
+    состояние = registry.visible(SessionScope(None, None))[0]
+
+    состояние.last_error = "испорчено снаружи"
+
+    assert registry.visible(SessionScope(None, None))[0].last_error is None
+
+
 def test_состояние_скрытой_базы_не_видно_другой_сессии():
     registry = Registry(собрать("ut", "buh"))
     registry.set_error("buh", "ошибка")

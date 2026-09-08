@@ -35,6 +35,13 @@ def resolve_home(explicit: str | None = None) -> pathlib.Path:
     return pathlib.Path.home() / ".claude" / "odata1c"
 
 
+def base_dir(home: pathlib.Path, name: str) -> pathlib.Path:
+    """Каталог конкретной базы внутри домашнего: политика, индекс метаданных, сохранённое
+    описание $metadata, рецепты (SPEC §2.2) — всё, что появится там на следующих этапах,
+    должно собирать этот путь одним и тем же способом, а не по месту в разных модулях."""
+    return home / "bases" / name
+
+
 def ensure_home(path: pathlib.Path) -> HomeStatus:
     created = not path.exists()
     path.mkdir(parents=True, exist_ok=True)
@@ -52,13 +59,24 @@ def _narrow_permissions(path: pathlib.Path) -> tuple[bool, str | None]:
             return False, f"не удалось определить имя пользователя: {exc}"
         user = f"{os.environ.get('USERDOMAIN', '')}\\{username}".lstrip("\\")
         try:
+            # text=False (байты) — как в check_file_permissions ниже: icacls пишет в
+            # кодировке консоли (OEM), а не в кодировке процесса, которую подставляет
+            # text=True. При PYTHONUTF8=1 кодировка процесса — utf-8, и text=True пытается
+            # декодировать байты OEM как utf-8 ВНУТРИ subprocess.run — необработанный
+            # UnicodeDecodeError вылетает раньше, чем этот except успевает сработать,
+            # даже при успешном выполнении icacls. Поэтому декодируем сами и только
+            # при неудаче — сообщение об успехе вывод icacls не использует.
             subprocess.run(
                 ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
                 check=True,
                 capture_output=True,
-                text=True,
+                text=False,
             )
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except subprocess.CalledProcessError as exc:
+            сырой_вывод = exc.stderr or exc.stdout or b""
+            вывод = сырой_вывод.decode(_консольная_кодировка(), errors="replace")
+            return False, f"не удалось закрыть права на {path}: {вывод.strip() or exc}"
+        except OSError as exc:
             return False, f"не удалось закрыть права на {path}: {exc}"
         return True, None
     path.chmod(stat.S_IRWXU)

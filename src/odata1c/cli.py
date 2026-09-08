@@ -16,11 +16,11 @@ import pydantic
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
-from odata1c.config.home import ensure_home, resolve_home
+from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
-from odata1c.config.loader import ConfigError, load_config
+from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
-from odata1c.config.writer import append_base
+from odata1c.config.writer import append_base, ensure_gate_secret
 from odata1c.registry.registry import Registry, SessionScope
 
 ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
@@ -86,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_add(home, args.name, args.role, args.recipes)
         if args.команда == "base" and args.подкоманда == "import":
             return cmd_base_import(home, pathlib.Path(args.path))
-    except ConfigError as ошибка:
+    except (ConfigError, OdataError) as ошибка:
+        # ConfigError (настройки) и OdataError (ответ 1С) — разные классы, но у обеих есть
+        # code и hint, и str() на обеих даёт человекочитаемое сообщение (Exception.__init__
+        # получает его же); одно место форматирования вместо двух копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")
@@ -102,6 +105,10 @@ def cmd_init(home: pathlib.Path) -> int:
             continue
         шаблон = importlib.resources.files("odata1c.templates").joinpath(имя_шаблона)
         назначение.write_text(шаблон.read_text(encoding="utf-8"), encoding="utf-8")
+    # Секрет гейта создаётся здесь, а не при чтении настроек: чтение больше ничего не пишет
+    # на диск. Вызов идемпотентен — если секрет уже есть (файл существовал и до этой команды),
+    # он не меняется.
+    ensure_gate_secret(home / "daemon.yaml")
     print(f"домашний каталог: {home}")
     print(f"опишите базы в {home / 'bases.yaml'}")
     print("перенести базы из прежнего сервера: odata1c base import <путь к 1c-odata.env>")
@@ -110,10 +117,14 @@ def cmd_init(home: pathlib.Path) -> int:
     return 0
 
 
-def cmd_base_list(home: pathlib.Path) -> int:
-    config = load_config(home)
+def _печать_предупреждений(config) -> None:
     for предупреждение in config.warnings:
         print(f"предупреждение: {предупреждение}")
+
+
+def cmd_base_list(home: pathlib.Path) -> int:
+    config = load_config(home)
+    _печать_предупреждений(config)
     registry = Registry(config)
     состояния = registry.visible(SessionScope())
     if not состояния:
@@ -133,20 +144,19 @@ def cmd_base_list(home: pathlib.Path) -> int:
 
 def cmd_base_test(home: pathlib.Path, name: str) -> int:
     config = load_config(home)
+    _печать_предупреждений(config)
     registry = Registry(config)
     base = registry.get(name, SessionScope())
     return asyncio.run(_проверить_соединение(base))
 
 
 async def _проверить_соединение(base) -> int:
+    # OdataError (сертификат не найден, отказ аутентификации, таймаут и т.д.) здесь
+    # не перехватывается — единое место форматирования [code] сообщение + подсказка
+    # в main() обрабатывает оба класса ошибок, ConfigError и OdataError.
     client = Client1C(base)
     try:
         данные = await client.get_raw("$metadata", accept="application/xml", add_format=False)
-    except OdataError as ошибка:
-        print(f"[{ошибка.code}] {ошибка.message}")
-        if ошибка.hint:
-            print(f"подсказка: {ошибка.hint}")
-        return 1
     finally:
         await client.close()
     print(
@@ -162,7 +172,9 @@ async def _проверить_соединение(base) -> int:
 
 def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) -> int:
     cmd_init(home)
-    if name in load_config(home).bases:
+    config = load_config(home)
+    _печать_предупреждений(config)
+    if name in config.bases:
         raise ConfigError(
             f"база «{name}» уже описана в bases.yaml",
             hint="поправьте существующую запись вручную или выберите другое имя",
@@ -179,7 +191,9 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
     try:
         BaseConfig(name=name, **values)  # проверка имени и адреса до записи в файл
     except pydantic.ValidationError as ошибка:
-        raise ConfigError(f"база «{name}» описана неверно: {_кратко(ошибка)}") from ошибка
+        raise ConfigError(
+            f"база «{name}» описана неверно: {format_validation_error(ошибка)}"
+        ) from ошибка
     append_base(home / "bases.yaml", name, values)
     print(f"база «{name}» дописана в {home / 'bases.yaml'}")
     if recipes:
@@ -188,20 +202,19 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
     return 0
 
 
-def _кратко(ошибка: pydantic.ValidationError) -> str:
-    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in ошибка.errors())
-
-
 def cmd_base_import(home: pathlib.Path, path: pathlib.Path) -> int:
     if not path.exists():
         print(f"файл не найден: {path}")
         return 1
     cmd_init(home)
-    по_умолчанию, базы = parse_env(path.read_text(encoding="utf-8"))
+    текст = _прочитать_env(path)
+    по_умолчанию, базы = parse_env(текст)
     if not базы:
         print(f"в {path} не нашлось ключей ODATA_DB_<ИМЯ>_BASE_URL")
         return 1
-    существующие = set((load_config(home)).bases)
+    config = load_config(home)
+    _печать_предупреждений(config)
+    существующие = set(config.bases)
     добавлено = 0
     for запись in базы:
         имя = запись.pop("name")
@@ -216,11 +229,44 @@ def cmd_base_import(home: pathlib.Path, path: pathlib.Path) -> int:
             continue
         append_base(home / "bases.yaml", имя, запись)
         добавлено += 1
-        print(f"перенесена база «{имя}»: {запись['url']}")
+        print(f"перенесена база «{имя}»: {_без_учётных_данных(запись['url'])}")
     if по_умолчанию and добавлено:
         _записать_базу_по_умолчанию(home / "bases.yaml", по_умолчанию)
     print(f"перенесено баз: {добавлено}; проверьте: odata1c base list")
     return 0
+
+
+def _прочитать_env(path: pathlib.Path) -> str:
+    """Файл окружения прежнего сервера мог остаться в кодировке Windows (cp1251) — так его
+    писали старые версии на локализованной Windows; текущий сервер и большинство редакторов
+    пишут utf-8. Пробуем оба варианта по очереди вместо того, чтобы падать необработанным
+    UnicodeDecodeError на первой же кириллической подписи базы."""
+    сырые = path.read_bytes()
+    for кодировка in ("utf-8", "cp1251"):
+        try:
+            return сырые.decode(кодировка)
+        except UnicodeDecodeError:
+            continue
+    raise ConfigError(
+        f"не удалось определить кодировку файла {path}: это не utf-8 и не cp1251",
+        hint="сохраните файл в кодировке utf-8 и повторите перенос",
+    )
+
+
+def _без_учётных_данных(url: str) -> str:
+    """Убрать user:password@ из адреса перед печатью. Прежний сервер иногда хранил их прямо
+    в URL (https://имя:пароль@сервер/...) — переносим значение в bases.yaml как есть, но
+    в консоль такое печатать нельзя."""
+    if "://" not in url:
+        return url
+    схема, _, остаток = url.partition("://")
+    конец_адреса = остаток.find("/")
+    адрес = остаток[:конец_адреса] if конец_адреса != -1 else остаток
+    хвост = остаток[конец_адреса:] if конец_адреса != -1 else ""
+    if "@" not in адрес:
+        return url
+    _, _, узел = адрес.rpartition("@")
+    return f"{схема}://{узел}{хвост}"
 
 
 def _записать_базу_по_умолчанию(path: pathlib.Path, name: str) -> None:
@@ -232,7 +278,7 @@ def _записать_базу_по_умолчанию(path: pathlib.Path, name:
 
 def _скопировать_рецепты(home: pathlib.Path, name: str, шаблон: str) -> None:
     источник = importlib.resources.files("odata1c.templates.recipes").joinpath(f"{шаблон}.yaml")
-    назначение = home / "bases" / name / "recipes.yaml"
+    назначение = base_dir(home, name) / "recipes.yaml"
     назначение.parent.mkdir(parents=True, exist_ok=True)
     if назначение.exists():
         print(f"рецепты уже есть: {назначение}, не трогаю")

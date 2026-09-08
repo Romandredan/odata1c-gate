@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import copy
-import os
 import pathlib
-import secrets
 
 import pydantic
 import yaml
@@ -62,12 +59,23 @@ class ConfigError(Exception):
 
 
 def _разобрать_yaml(path: pathlib.Path) -> dict:
-    """Прочитать YAML-файл; синтаксическая ошибка — ConfigError с именем файла, а не сырой дамп."""
+    """Прочитать YAML-файл; синтаксическая ошибка — ConfigError с именем файла и местом ошибки.
+
+    Текст исключения PyYAML целиком не используется: библиотека вклеивает в него фрагмент
+    исходного файла вокруг места ошибки, и если повреждение пришлось на строку с паролем,
+    пароль дословно попадает в сообщение. Берём из исключения только позицию (строка,
+    колонка) — это числа, не текст файла, — и строим собственное сообщение.
+    """
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        if mark is not None:
+            место = f"строка {mark.line + 1}, колонка {mark.column + 1}"
+        else:
+            место = "точное место в файле не определено"
         raise ConfigError(
-            f"файл {path.name} повреждён и не разбирается как YAML: {exc}",
+            f"файл {path.name} повреждён и не разбирается как YAML: {место}",
             hint=f"проверьте синтаксис файла {path}",
         ) from exc
     return data or {}
@@ -127,6 +135,16 @@ def _load_bases(
         if raw is None:
             warnings.append(f"база «{name}»: запись в bases.yaml пуста, база пропущена")
             continue
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"база «{name}»: запись должна быть набором полей (ключ: значение), "
+                f"получено {type(raw).__name__}"
+            )
+        if "name" in raw:
+            raise ConfigError(
+                f"база «{name}»: ключ name внутри записи базы недопустим — "
+                f"имя базы уже задано ключом «{name}» в bases.yaml"
+            )
         role = raw.get("role", "prod")
         try:
             resolved = apply_role(role, raw)
@@ -135,13 +153,26 @@ def _load_bases(
         try:
             bases[name] = BaseConfig(name=name, **resolved)
         except pydantic.ValidationError as exc:
-            raise ConfigError(f"база «{name}» описана неверно: {_кратко(exc)}") from exc
+            текст_ошибки = format_validation_error(exc)
+            raise ConfigError(f"база «{name}» описана неверно: {текст_ошибки}") from exc
         if bases[name].password == "keyring":
             bases[name] = bases[name].model_copy(update={"password": _из_keyring(name)})
-    return data.get("default"), bases
+
+    default = data.get("default")
+    if default is not None and not isinstance(default, str):
+        raise ConfigError(
+            f"default должен быть строкой с именем базы, получено {type(default).__name__}"
+        )
+    return default, bases
 
 
 def _load_daemon(home: pathlib.Path, warnings: list[str]) -> DaemonConfig:
+    """Прочитать daemon.yaml. Только чтение: секрет гейта здесь никогда не создаётся и не
+    пишется на диск (SPEC §6.3) — иначе несколько одновременных чтений на свежем каталоге
+    порождают в памяти разные секреты при одном значении на диске (задокументированный
+    дефект ревью M1a). Создание секрета — обязанность команды создания домашнего каталога,
+    см. odata1c.config.writer.ensure_gate_secret.
+    """
     path = home / "daemon.yaml"
     data = {}
     if path.exists():
@@ -149,30 +180,16 @@ def _load_daemon(home: pathlib.Path, warnings: list[str]) -> DaemonConfig:
     try:
         daemon = DaemonConfig(**data)
     except pydantic.ValidationError as exc:
-        raise ConfigError(f"daemon.yaml описан неверно: {_кратко(exc)}") from exc
+        raise ConfigError(f"daemon.yaml описан неверно: {format_validation_error(exc)}") from exc
     if not daemon.gate_secret:
-        daemon = daemon.model_copy(update={"gate_secret": _создать_секрет(path, data)})
-    # gate_secret — ключ HMAC, которым строятся все токены гейта; после этой точки файл
-    # с ним точно существует (был на диске или только что создан), поэтому права проверяем
-    # здесь одним местом на оба случая.
+        raise ConfigError(
+            "секрет гейта (gate_secret) не найден в daemon.yaml",
+            hint=f"выполните: odata1c init --home {home}",
+        )
     предупреждение = check_file_permissions(path)
     if предупреждение:
         warnings.append(предупреждение)
     return daemon
-
-
-def _создать_секрет(path: pathlib.Path, data: dict) -> str:
-    """Секрет HMAC — 32 случайных байта, создаётся при первом запуске (SPEC §6.3)."""
-    secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
-    data = {**data, "gate_secret": secret}
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    # На Windows chmod не управляет ACL и здесь ничего не защищает — правами файла управляет
-    # NTFS, а не биты POSIX. Реальная защита от других учётных записей закрывается на уровне
-    # всего домашнего каталога через icacls в odata1c.config.home.ensure_home; этот модуль
-    # только предупреждает (check_file_permissions), если права оказались широкими.
-    if os.name != "nt":
-        path.chmod(0o600)
-    return secret
 
 
 def _из_keyring(base_name: str) -> str:
@@ -192,5 +209,7 @@ def _из_keyring(base_name: str) -> str:
     return password
 
 
-def _кратко(exc: pydantic.ValidationError) -> str:
+def format_validation_error(exc: pydantic.ValidationError) -> str:
+    """Сжатый текст ошибки pydantic для сообщений ConfigError/OdataError. Публичная —
+    используется и здесь, и в odata1c.cli, чтобы не дублировать одну и ту же функцию."""
     return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())

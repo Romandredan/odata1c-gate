@@ -1,12 +1,13 @@
 """Домашний каталог: порядок разрешения пути, создание, права."""
 
 import pathlib
+import stat
 import subprocess
 import sys
 
 import pytest
 
-from odata1c.config.home import check_file_permissions, ensure_home, resolve_home
+from odata1c.config.home import base_dir, check_file_permissions, ensure_home, resolve_home
 
 
 def test_явный_путь_главнее_переменной_окружения(tmp_path, monkeypatch):
@@ -36,10 +37,21 @@ def test_повторный_вызов_не_считается_создание�
     assert ensure_home(tmp_path / "home").created is False
 
 
+def test_каталог_базы_собирается_из_home_и_имени():
+    home = pathlib.Path("/tmp/odata1c-home")
+    assert base_dir(home, "ut") == home / "bases" / "ut"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="проверка POSIX-прав, пропускается на Windows")
 def test_права_каталога_закрыты(tmp_path):
-    status = ensure_home(tmp_path / "home")
+    """Регресс: тест раньше проверял только возвращённый признак permissions_narrowed, а не
+    фактический режим доступа — он проходил и на реализации, которая права вообще не меняла.
+    Проверяем реальный режим самого home (подкаталоги bases/logs создаются обычным mkdir
+    и наследуют umask, а не режим, который ensure_home закрывает только на home)."""
+    home = tmp_path / "home"
+    status = ensure_home(home)
     assert status.permissions_narrowed is True
+    assert stat.S_IMODE(home.stat().st_mode) == stat.S_IRWXU
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
@@ -100,3 +112,24 @@ def test_check_file_permissions_кодировка_читаема_и_систе�
     assert "SYSTEM" not in warning
     assert "Администраторы" not in warning
     assert "Administrators" not in warning
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
+def test_narrow_permissions_не_падает_в_режиме_принудительного_utf8(tmp_path, monkeypatch, capsys):
+    """Регресс: первый вызов icacls в _narrow_permissions читал вывод через
+    subprocess.run(text=True) — decode кодировкой процесса (locale.getpreferredencoding()).
+    При PYTHONUTF8=1 эта кодировка становится utf-8, а icacls всё равно печатает в кодировке
+    консоли (обычно cp866 на ru-RU): subprocess.run пытается декодировать эти байты как
+    utf-8 ВНУТРИ себя и роняет UnicodeDecodeError необработанным следом стека прямо из
+    первого вызова icacls в ensure_home — даже при успешном закрытии прав. Второй вызов
+    (check_file_permissions) читает байты и декодирует их сам, этот регресс его не касался;
+    подставляем "utf-8" тем же способом, каким его получает subprocess.run с text=True, не
+    трогая переменные окружения самого процесса.
+    """
+    monkeypatch.setattr("locale.getpreferredencoding", lambda do_setlocale=True: "utf-8")
+
+    status = ensure_home(tmp_path / "home")
+    вывод = capsys.readouterr()
+
+    assert вывод.err == ""
+    assert status.permissions_narrowed is True

@@ -5,6 +5,7 @@ import pathlib
 import httpx
 import pytest
 import respx
+import yaml
 
 import odata1c.cli as cli
 from odata1c.cli import main
@@ -314,3 +315,209 @@ def test_base_import_переносит_базу_по_умолчанию_из_en
     config = load_config(home)
 
     assert config.default == "buh"
+
+
+# --- секрет гейта: создаётся командой создания каталога, не чтением настроек ---
+
+
+def test_init_кладёт_непустой_секрет_гейта_в_daemon_yaml(tmp_path):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+
+    данные = yaml.safe_load((home / "daemon.yaml").read_text(encoding="utf-8"))
+    assert данные.get("gate_secret")
+
+
+def test_init_повторный_вызов_не_меняет_секрет(tmp_path):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    секрет_1 = yaml.safe_load((home / "daemon.yaml").read_text(encoding="utf-8"))["gate_secret"]
+
+    main(["init", "--home", str(home)])
+    секрет_2 = yaml.safe_load((home / "daemon.yaml").read_text(encoding="utf-8"))["gate_secret"]
+
+    assert секрет_1 == секрет_2
+
+
+def test_init_комментарии_daemon_yaml_переживают_повторный_init_и_base_list(tmp_path):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    исходный_daemon_yaml = (home / "daemon.yaml").read_text(encoding="utf-8")
+    assert "gate_secret заполняется автоматически" in исходный_daemon_yaml
+
+    main(["base", "list", "--home", str(home)])
+
+    assert (home / "daemon.yaml").read_text(encoding="utf-8") == исходный_daemon_yaml
+
+
+# --- пять входов, дававших необработанный след стека вместо сообщения (правка 2) ---
+
+
+def test_base_import_кодировка_cp1251_переносит_кириллическую_подпись(tmp_path, capsys):
+    """Регресс: файл окружения прежнего сервера 1c-odata-mcp мог остаться в cp1251 (типично
+    для старых версий на локализованной Windows) — чтение как utf-8 роняло
+    UnicodeDecodeError на первой же кириллической подписи базы, а команда переноса ради
+    этого входа и существует."""
+    home = tmp_path / "home"
+    env = tmp_path / "1c-odata.env"
+    содержимое = (
+        "ODATA_DB_UT_BASE_URL=http://x.invalid/ut/odata/standard.odata/\n"
+        "ODATA_DB_UT_LABEL=Управление торговлей, боевая\n"
+    )
+    env.write_bytes(содержимое.encode("cp1251"))
+
+    код = main(["base", "import", str(env), "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "перенесена база" in вывод
+    config = load_config(home)
+    assert config.bases["ut"].label == "Управление торговлей, боевая"
+
+
+def test_base_import_неизвестная_кодировка_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "home"
+    env = tmp_path / "1c-odata.env"
+    env.write_bytes(b"\x98ODATA_DB_UT_BASE_URL=http://x.invalid/ut/odata/standard.odata/\n")
+
+    код = main(["base", "import", str(env), "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_base_test_сертификат_не_найден_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    """filterwarnings глушит отдельный от этой правки долг httpx (verify=<строка> устарел
+    как API) — без него DeprecationWarning, ставший ошибкой в настройках тестов проекта,
+    перехватывает выполнение раньше, чем код доходит до проверяемого поведения."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    сертификат = (tmp_path / "нет_такого.pem").as_posix()
+    (home / "bases.yaml").write_text(
+        "bases:\n"
+        "  ut:\n"
+        "    label: УТ\n"
+        f"    url: {URL}\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: test\n"
+        f'    verify_tls: "{сертификат}"\n',
+        encoding="utf-8",
+    )
+
+    код = main(["base", "test", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "odata_error" in вывод
+    assert "нет_такого.pem" in вывод
+
+
+def test_base_list_ключ_name_внутри_записи_базы_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(
+        "bases:\n"
+        "  ut:\n"
+        "    name: другое\n"
+        "    label: УТ\n"
+        f"    url: {URL}\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: prod\n",
+        encoding="utf-8",
+    )
+
+    код = main(["base", "list", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+
+
+def test_base_list_default_списком_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(
+        "default: [ut, buh]\n"
+        "bases:\n"
+        "  ut:\n"
+        "    label: УТ\n"
+        f"    url: {URL}\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: prod\n",
+        encoding="utf-8",
+    )
+
+    код = main(["base", "list", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+
+
+def test_base_list_запись_базы_строкой_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text("bases:\n  ut: просто_строка\n", encoding="utf-8")
+
+    код = main(["base", "list", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+
+
+# --- правка 8: адрес без учётных данных в выводе, предупреждение о правах у всех команд ---
+
+
+def test_base_import_печатает_адрес_без_учётных_данных(tmp_path, capsys):
+    home = tmp_path / "home"
+    env = tmp_path / "1c-odata.env"
+    env.write_text(
+        "ODATA_DB_UT_BASE_URL=https://имя:пароль@1c.corp.local/ut/odata/standard.odata/\n",
+        encoding="utf-8",
+    )
+
+    код = main(["base", "import", str(env), "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "пароль" not in вывод
+    assert "имя:пароль" not in вывод
+    assert "1c.corp.local" in вывод
+    config = load_config(home)
+    assert config.bases["ut"].url == "https://имя:пароль@1c.corp.local/ut/odata/standard.odata/"
+
+
+@respx.mock
+def test_base_test_печатает_предупреждение_о_правах(tmp_path, capsys, monkeypatch):
+    """Регресс: предупреждение о широких правах на bases.yaml собиралось верно, но печатала
+    его только base list — base test (и остальные команды, читающие настройки) молчали."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES, encoding="utf-8")
+    исходная_load_config = cli.load_config
+
+    def с_предупреждением(путь):
+        конфигурация = исходная_load_config(путь)
+        конфигурация.warnings.append("bases.yaml доступен другим учётным записям")
+        return конфигурация
+
+    monkeypatch.setattr(cli, "load_config", с_предупреждением)
+    respx.get(f"{URL}$metadata").mock(
+        return_value=httpx.Response(
+            200, text="<edmx:Edmx/>", headers={"Content-Type": "application/xml"}
+        )
+    )
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"value": []}))
+
+    код = main(["base", "test", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "предупреждение" in вывод
+    assert "доступен другим учётным записям" in вывод

@@ -72,8 +72,12 @@ class Registry:
         }
 
     def visible(self, session: SessionScope) -> list[BaseState]:
+        # Копии, а не живые объекты: BaseState общий для всех сессий, читающих реестр.
+        # Пока в нём только диагностика (последняя ошибка, статус индекса), правка снаружи
+        # безобидна, но со следующим этапом сюда добавится политика замены — общая ссылка
+        # тогда станет источником трудноуловимых ошибок между сессиями.
         names = self._visible_names(session)
-        return [self._state[name] for name in names]
+        return [dataclasses.replace(self._state[name]) for name in names]
 
     def get(self, name: str | None, session: SessionScope) -> BaseConfig:
         names = self._visible_names(session)

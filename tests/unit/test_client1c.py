@@ -163,3 +163,22 @@ def test_тело_ошибки_число_не_роняет_разбор():
     ошибка = map_error(400, "42")
     assert ошибка.code == "odata_error"
     assert "42" in ошибка.message
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_несуществующий_файл_сертификата_даёт_понятную_ошибку(tmp_path):
+    """Регресс: verify_tls как путь к несуществующему CA-сертификату роняет конструктор
+    Client1C необработанным FileNotFoundError (httpx строит ssl-контекст синхронно, ещё до
+    первого запроса) вместо ошибки с кодом и подсказкой, которую понимает командная строка.
+
+    filterwarnings здесь не про сам дефект: httpx отдельно и заранее предупреждает
+    (DeprecationWarning), что verify=<строка> устарел как API — это самостоятельный, не
+    связанный с этой правкой долг миграции на verify=ssl.SSLContext(...), а в тестах этого
+    проекта предупреждения превращены в ошибки (filterwarnings = ["error"]). Глушим здесь
+    только его, чтобы дойти до проверяемого поведения — файла нет, ошибка понятная.
+    """
+    путь = tmp_path / "нет_такого.pem"
+    with pytest.raises(OdataError) as ошибка:
+        Client1C(база(verify_tls=str(путь)))
+    assert ошибка.value.code == "odata_error"
+    assert str(путь) in ошибка.value.message

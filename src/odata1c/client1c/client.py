@@ -24,13 +24,23 @@ class Client1C:
         self._semaphore = asyncio.Semaphore(base.concurrency)
         self._session_started = False
         self._session_lock = asyncio.Lock()
-        self._client = httpx.AsyncClient(
-            base_url=base.url,
-            auth=(base.user, base.password),
-            verify=base.verify_tls,
-            timeout=base.timeout_s,
-            headers={"Accept": "application/json"},
-        )
+        try:
+            self._client = httpx.AsyncClient(
+                base_url=base.url,
+                auth=(base.user, base.password),
+                verify=base.verify_tls,
+                timeout=base.timeout_s,
+                headers={"Accept": "application/json"},
+            )
+        except OSError as exc:
+            # verify_tls как путь к CA-сертификату (PEM): httpx строит ssl-контекст уже здесь,
+            # синхронно, и при отсутствующем файле роняет OSError (обычно FileNotFoundError)
+            # прямо из конструктора — до первого запроса и до входа в асинхронный код.
+            raise OdataError(
+                "odata_error",
+                f"файл сертификата не найден: {base.verify_tls}",
+                f"проверьте путь verify_tls в настройках базы {base.name}",
+            ) from exc
 
     async def get(self, path: str, params: dict | None = None) -> dict:
         response = await self._request("GET", path, params=params, retry=True)
