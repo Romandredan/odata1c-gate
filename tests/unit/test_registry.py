@@ -65,3 +65,60 @@ def test_состояние_обновляется():
     assert состояние.indexed is True
     assert состояние.entity_count == 1200
     assert состояние.last_error is None
+
+
+def test_пустой_список_видимых_баз():
+    registry = Registry(собрать("ut", "buh"))
+    видимые = registry.visible(SessionScope(bases=("unknown",), default=None))
+    assert видимые == []
+
+
+def test_список_видимости_отбрасывает_несуществующие_имена():
+    registry = Registry(собрать("ut", "buh"))
+    видимые = registry.visible(SessionScope(bases=("ut", "unknown", "buh"), default=None))
+    assert {b.name for b in видимые} == {"ut", "buh"}
+
+
+def test_сужение_видимости_до_несуществующей_базы():
+    registry = Registry(собрать("ut", "buh"))
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.get("unknown", SessionScope(bases=("unknown",), default=None))
+    assert ошибка.value.code == "base_unknown"
+    assert "unknown" in str(ошибка.value)
+
+
+def test_обращение_с_пустой_строкой_вместо_имени():
+    registry = Registry(собрать("ut", "buh"))
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.get("", SessionScope(bases=("ut", "buh"), default=None))
+    assert ошибка.value.code == "base_unknown"
+    assert "пусто" in str(ошибка.value)
+
+
+def test_база_по_умолчанию_скрытая_от_сессии():
+    registry = Registry(собрать("ut", "buh"))
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.get(None, SessionScope(bases=("buh",), default=None))
+    assert ошибка.value.code == "base_unknown"
+    assert "по умолчанию" in str(ошибка.value)
+
+
+def test_обновление_состояния_для_неизвестного_имени():
+    registry = Registry(собрать("ut"))
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.set_error("unknown", "сообщение")
+    assert ошибка.value.code == "base_unknown"
+
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.set_indexed("unknown", "2026-09-07T10:00:00", 100)
+    assert ошибка.value.code == "base_unknown"
+
+
+def test_состояние_скрытой_базы_не_видно_другой_сессии():
+    registry = Registry(собрать("ut", "buh"))
+    registry.set_error("buh", "ошибка")
+
+    видимые = registry.visible(SessionScope(bases=("ut",), default=None))
+    имена = {b.name for b in видимые}
+    assert имена == {"ut"}
+    assert "buh" not in имена

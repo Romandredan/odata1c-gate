@@ -9,12 +9,31 @@ from odata1c.config.models import AppConfig, BaseConfig
 
 
 class UnknownBase(ConfigError):
-    def __init__(self, name: str | None, известные: list[str]) -> None:
-        super().__init__(
-            f"база «{name}» неизвестна" if name else "база не указана и нет базы по умолчанию",
-            code="base_unknown",
-            hint=f"доступные базы: {', '.join(известные) or 'ни одной, опишите их в bases.yaml'}",
-        )
+    def __init__(
+        self,
+        name: str | None,
+        известные: list[str],
+        is_default: bool = False,
+        has_any_bases: bool = True,
+    ) -> None:
+        if is_default:
+            message = "база по умолчанию недоступна в текущей сессии"
+        elif name is None:
+            message = "база не указана и нет базы по умолчанию"
+        elif name == "":
+            message = "база указана, но имя пусто"
+        else:
+            message = f"база «{name}» неизвестна"
+
+        if not известные:
+            if has_any_bases:
+                hint = "видимость ограничена аргументами запуска, нет доступных баз"
+            else:
+                hint = "ни одной базы, опишите их в bases.yaml"
+        else:
+            hint = f"доступные базы: {', '.join(известные)}"
+
+        super().__init__(message, code="base_unknown", hint=hint)
 
 
 @dataclasses.dataclass(slots=True)
@@ -58,19 +77,49 @@ class Registry:
 
     def get(self, name: str | None, session: SessionScope) -> BaseConfig:
         names = self._visible_names(session)
+        is_default_used = False
         if name is None:
-            name = session.default or self._config.default
-            if name is None or name not in names:
-                raise UnknownBase(None, names)
-        if name not in names:
-            raise UnknownBase(name, names)
+            session_default = session.default or self._config.default
+            if session_default is None:
+                raise UnknownBase(
+                    None,
+                    names,
+                    is_default=False,
+                    has_any_bases=bool(self._config.bases),
+                )
+            name = session_default
+            is_default_used = True
+
+        if not name or name not in names:
+            raise UnknownBase(
+                name,
+                names,
+                is_default=is_default_used,
+                has_any_bases=bool(self._config.bases),
+            )
         return self._config.bases[name]
 
     def set_error(self, name: str, message: str) -> None:
-        self._state[name].last_error = message
+        try:
+            self._state[name].last_error = message
+        except KeyError as err:
+            raise UnknownBase(
+                name,
+                sorted(self._config.bases),
+                is_default=False,
+                has_any_bases=bool(self._config.bases),
+            ) from err
 
     def set_indexed(self, name: str, indexed_at: str, entity_count: int) -> None:
-        state = self._state[name]
+        try:
+            state = self._state[name]
+        except KeyError as err:
+            raise UnknownBase(
+                name,
+                sorted(self._config.bases),
+                is_default=False,
+                has_any_bases=bool(self._config.bases),
+            ) from err
         state.indexed, state.indexed_at, state.entity_count = True, indexed_at, entity_count
         state.last_error = None
 
