@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
+  <edmx:DataServices m:DataServiceVersion="3.0"
+                     xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+    <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
+
+      <EntityType Name="Catalog_Контрагенты">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Code" Type="Edm.String" Nullable="false"/>
+        <Property Name="Description" Type="Edm.String" Nullable="false"/>
+        <Property Name="ИНН" Type="Edm.String" Nullable="true"/>
+        <Property Name="КПП" Type="Edm.String" Nullable="true"/>
+        <Property Name="ЮридическоеФизическоеЛицо" Type="Edm.String" Nullable="true"/>
+        <Property Name="DeletionMark" Type="Edm.Boolean" Nullable="false"/>
+        <Property Name="ГоловнойКонтрагент_Key" Type="Edm.Guid" Nullable="true"/>
+        <NavigationProperty Name="ГоловнойКонтрагент"
+                            Relationship="StandardODATA.Catalog_Контрагенты_ГоловнойКонтрагент"
+                            FromRole="Catalog_Контрагенты" ToRole="Catalog_Контрагенты1"/>
+      </EntityType>
+
+      <EntityType Name="Document_РеализацияТоваровУслуг">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Number" Type="Edm.String" Nullable="false"/>
+        <Property Name="Date" Type="Edm.DateTime" Nullable="false"/>
+        <Property Name="Posted" Type="Edm.Boolean" Nullable="false"/>
+        <Property Name="DeletionMark" Type="Edm.Boolean" Nullable="false"/>
+        <Property Name="СуммаДокумента" Type="Edm.Decimal" Nullable="true"/>
+        <Property Name="Контрагент_Key" Type="Edm.Guid" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="Document_РеализацияТоваровУслуг_Товары">
+        <Key>
+          <PropertyRef Name="Ref_Key"/>
+          <PropertyRef Name="LineNumber"/>
+        </Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="LineNumber" Type="Edm.String" Nullable="false"/>
+        <Property Name="Номенклатура_Key" Type="Edm.Guid" Nullable="true"/>
+        <Property Name="Количество" Type="Edm.Decimal" Nullable="true"/>
+        <Property Name="Сумма" Type="Edm.Decimal" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="InformationRegister_КурсыВалют">
+        <Key>
+          <PropertyRef Name="Period"/>
+          <PropertyRef Name="Валюта_Key"/>
+        </Key>
+        <Property Name="Period" Type="Edm.DateTime" Nullable="false"/>
+        <Property Name="Валюта_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Курс" Type="Edm.Decimal" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="InformationRegister_КурсыВалют_SliceLast">
+        <Key>
+          <PropertyRef Name="Period"/>
+          <PropertyRef Name="Валюта_Key"/>
+        </Key>
+        <Property Name="Period" Type="Edm.DateTime" Nullable="false"/>
+        <Property Name="Валюта_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Курс" Type="Edm.Decimal" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="InformationRegister_СостоянияЗаказов">
+        <Key>
+          <PropertyRef Name="Recorder"/>
+          <PropertyRef Name="LineNumber"/>
+        </Key>
+        <Property Name="Recorder" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Recorder_Type" Type="Edm.String" Nullable="false"/>
+        <Property Name="LineNumber" Type="Edm.String" Nullable="false"/>
+        <Property Name="Период" Type="Edm.DateTime" Nullable="true"/>
+        <Property Name="Состояние" Type="Edm.String" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="AccumulationRegister_ТоварыНаСкладах_Balance">
+        <Key><PropertyRef Name="Номенклатура_Key"/></Key>
+        <Property Name="Номенклатура_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Склад_Key" Type="Edm.Guid" Nullable="true"/>
+        <Property Name="ВНаличииBalance" Type="Edm.Decimal" Nullable="true"/>
+      </EntityType>
+
+      <EntityType Name="Catalog_БанковскиеСчета">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Description" Type="Edm.String" Nullable="false"/>
+        <Property Name="НомерСчета" Type="Edm.String" Nullable="true"/>
+        <Property Name="Владелец_Key" Type="Edm.Guid" Nullable="true"/>
+        <Property Name="Владелец_Type" Type="Edm.String" Nullable="true"/>
+      </EntityType>
+
+      <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
+        <EntitySet Name="Catalog_Контрагенты" EntityType="StandardODATA.Catalog_Контрагенты"/>
+        <EntitySet Name="Document_РеализацияТоваровУслуг"
+                   EntityType="StandardODATA.Document_РеализацияТоваровУслуг"/>
+        <EntitySet Name="Document_РеализацияТоваровУслуг_Товары"
+                   EntityType="StandardODATA.Document_РеализацияТоваровУслуг_Товары"/>
+        <EntitySet Name="InformationRegister_КурсыВалют"
+                   EntityType="StandardODATA.InformationRegister_КурсыВалют"/>
+        <EntitySet Name="InformationRegister_КурсыВалют_SliceLast"
+                   EntityType="StandardODATA.InformationRegister_КурсыВалют_SliceLast"/>
+        <EntitySet Name="InformationRegister_СостоянияЗаказов"
+                   EntityType="StandardODATA.InformationRegister_СостоянияЗаказов"/>
+        <EntitySet Name="AccumulationRegister_ТоварыНаСкладах_Balance"
+                   EntityType="StandardODATA.AccumulationRegister_ТоварыНаСкладах_Balance"/>
+        <EntitySet Name="Catalog_БанковскиеСчета" EntityType="StandardODATA.Catalog_БанковскиеСчета"/>
+        <FunctionImport Name="Document_РеализацияТоваровУслуг_Post"
+                        ReturnType="StandardODATA.Document_РеализацияТоваровУслуг"
+                        EntitySet="Document_РеализацияТоваровУслуг" m:HttpMethod="POST">
+          <Parameter Name="PostingModeOperational" Type="Edm.Boolean" Mode="In"/>
+        </FunctionImport>
+        <FunctionImport Name="Document_РеализацияТоваровУслуг_Unpost"
+                        ReturnType="StandardODATA.Document_РеализацияТоваровУслуг"
+                        EntitySet="Document_РеализацияТоваровУслуг" m:HttpMethod="POST"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
