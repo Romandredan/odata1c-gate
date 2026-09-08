@@ -21,6 +21,7 @@ from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.index.reindex import reindex
 from odata1c.registry.registry import Registry, SessionScope
 
 ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
@@ -72,6 +73,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     импорт.add_argument("path", help="путь к 1c-odata.env")
 
+    reindex_parser = команды.add_parser(
+        "reindex", help="обновить индекс метаданных базы", parents=[домашний]
+    )
+    reindex_parser.add_argument("name", help="имя базы")
+    reindex_parser.add_argument(
+        "--force", action="store_true", help="перестроить, даже если $metadata не менялся"
+    )
+
     args = parser.parse_args(argv)
     home = resolve_home(getattr(args, "home", None))
 
@@ -86,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_add(home, args.name, args.role, args.recipes)
         if args.команда == "base" and args.подкоманда == "import":
             return cmd_base_import(home, pathlib.Path(args.path))
+        if args.команда == "reindex":
+            return cmd_reindex(home, args.name, args.force)
     except (ConfigError, OdataError) as ошибка:
         # ConfigError (настройки) и OdataError (ответ 1С) — разные классы, но у обеих есть
         # code и hint, и str() на обеих даёт человекочитаемое сообщение (Exception.__init__
@@ -167,6 +178,49 @@ async def _проверить_соединение(base) -> int:
         f"$metadata получен: {len(данные) / 1024:.1f} КБ; "
         f"следующий шаг — odata1c reindex {base.name}"
     )
+    return 0
+
+
+def cmd_reindex(home: pathlib.Path, name: str, force: bool) -> int:
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    return asyncio.run(_реиндекс(base, home, force))
+
+
+async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -> int:
+    client = Client1C(base)
+    try:
+        результат = await reindex(base, client, home, force=force)
+    except OdataError as ошибка:
+        print(f"[{ошибка.code}] {ошибка.message}")
+        return 1
+    finally:
+        await client.close()
+
+    print(результат.message)
+    if результат.added_entities:
+        print(
+            f"добавлены сущности ({len(результат.added_entities)}): "
+            f"{', '.join(результат.added_entities[:20])}"
+        )
+    if результат.removed_entities:
+        print(
+            f"удалены сущности ({len(результат.removed_entities)}): "
+            f"{', '.join(результат.removed_entities[:20])}"
+        )
+    if результат.new_sensitive_fields:
+        print(
+            f"новые поля под защитой ({len(результат.new_sensitive_fields)}) — проверьте политику:"
+        )
+        for поле in результат.new_sensitive_fields[:20]:
+            print(f"  {поле['entity']}.{поле['field']} → {поле['sensitivity']}")
+    if результат.unresolved_entity_sets:
+        print(
+            f"наборы с испорченной ссылкой на тип ({len(результат.unresolved_entity_sets)}) — "
+            f"это признак повреждённого $metadata, а не удалённых объектов:"
+        )
+        for имя in результат.unresolved_entity_sets[:20]:
+            print(f"  {имя}")
     return 0
 
 
