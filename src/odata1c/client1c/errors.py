@@ -39,12 +39,22 @@ def map_error(status: int, body: str) -> OdataError:
 
 
 def _текст_ошибки_платформы(body: str) -> str:
-    """Из тела odata.error достать человекочитаемое сообщение."""
+    """Из тела odata.error достать человекочитаемое сообщение.
+
+    Тело приходит из сети — доверять его форме нельзя. Если платформа вместо объекта
+    отдала список, число или что-то ещё не-словарное (на любом уровне вложенности),
+    считаем сообщение неразобранным и возвращаем пустую строку: вызывающий код (map_error)
+    в этом случае берёт сырой текст тела как есть, но не падает необработанным исключением.
+    """
     try:
         data = json.loads(body)
     except (ValueError, TypeError):
         return ""
+    if not isinstance(data, dict):
+        return ""
     ошибка = data.get("odata.error") or data.get("error") or {}
+    if not isinstance(ошибка, dict):
+        return ""
     сообщение = ошибка.get("message")
     if isinstance(сообщение, dict):
         return str(сообщение.get("value", ""))
