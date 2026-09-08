@@ -67,6 +67,7 @@ class ParsedMetadata:
     actions: list[ParsedAction]
     edmx_sha256: str
     platform_hint: str | None = None
+    unresolved_entity_sets: list[str] = dataclasses.field(default_factory=list)
 
 
 def parse_edmx(data: bytes) -> ParsedMetadata:
@@ -75,13 +76,22 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
     наборы, действия, подсказка = _разобрать_контейнер(data)
 
     сущности: list[ParsedEntity] = []
+    нераспознанные_наборы: list[str] = []
     for имя_набора, имя_типа in наборы.items():
         поля = типы.get(имя_типа) or типы.get(имя_набора)
         if поля is None:
+            # Набор ссылается на тип, которого нет среди EntityType — испорченная ссылка
+            # в описании, а не удалённая сущность. Отдаём список отдельно, чтобы обновление
+            # индекса не приняло это молча за исчезновение объекта.
+            нераспознанные_наборы.append(имя_набора)
             continue
         сущности.append(_собрать_сущность(имя_набора, поля))
     return ParsedMetadata(
-        entities=сущности, actions=действия, edmx_sha256=контрольная_сумма, platform_hint=подсказка
+        entities=сущности,
+        actions=действия,
+        edmx_sha256=контрольная_сумма,
+        platform_hint=подсказка,
+        unresolved_entity_sets=нераспознанные_наборы,
     )
 
 
@@ -120,12 +130,30 @@ def _разобрать_типы(data: bytes) -> dict[str, tuple[list[ParsedFiel
 
 
 def _пометить_ссылки_и_составные(поля: list[ParsedField]) -> None:
+    """Ссылочные и составные поля (SPEC §9).
+
+    Поле — кандидат в ссылки, если у него тип идентификатора (Edm.Guid). Составной тип
+    опознаётся по наличию парного поля с суффиксом "_Type" при том же базовом имени
+    (суффикс "_Key", если он есть, при сравнении отбрасывается: "Владелец_Key" ищет
+    "Владелец_Type", "Recorder" без "_Key" ищет "Recorder_Type" — это регистратор
+    регистра с несколькими типами регистраторов, тоже составная ссылка).
+    """
     имена = {поле.name for поле in поля}
     for поле in поля:
-        if поле.name.endswith("_Key") and поле.edm_type in СЛУЖЕБНЫЕ_ТИПЫ:
+        if поле.edm_type not in СЛУЖЕБНЫЕ_ТИПЫ:
+            continue
+        базовое_имя = поле.name[: -len("_Key")] if поле.name.endswith("_Key") else поле.name
+        составное = f"{базовое_имя}_Type" in имена
+        if поле.name.endswith("_Key") or составное:
             поле.is_ref = True
-            # Составной тип: рядом лежит парное поле *_Type (SPEC §9).
-            поле.is_composite = поле.name[: -len("_Key")] + "_Type" in имена
+        поле.is_composite = составное
+
+
+# Узлы, которые ко времени завершения полностью разобраны в этом проходе и больше не нужны:
+# EntityType здесь только читается заново по имени (состав полей уже взят первым проходом),
+# EntitySet и FunctionImport уже дали всё нужное. Родителей (EntityContainer, Schema,
+# DataServices, Edmx) не трогаем — они ещё разбираются, пока документ не дочитан до конца.
+_ОСВОБОЖДАЕМЫЕ_УЗЛЫ_КОНТЕЙНЕРА = frozenset({"EntityType", "EntitySet", "FunctionImport"})
 
 
 def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str], list[ParsedAction], str | None]:
@@ -145,6 +173,10 @@ def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str],
                     "{http://schemas.microsoft.com/ado/2007/08/dataservices/metadata}"
                     "DataServiceVersion"
                 )
+            if имя_тега in _ОСВОБОЖДАЕМЫЕ_УЗЛЫ_КОНТЕЙНЕРА:
+                элемент.clear()
+                while элемент.getprevious() is not None:
+                    del элемент.getparent()[0]
     except etree.XMLSyntaxError as exc:
         raise EdmxError(f"не удалось разобрать $metadata: {exc}") from exc
     return наборы, действия, подсказка
