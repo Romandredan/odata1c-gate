@@ -1,10 +1,12 @@
 """Домашний каталог: порядок разрешения пути, создание, права."""
 
 import pathlib
+import subprocess
+import sys
 
 import pytest
 
-from odata1c.config.home import ensure_home, resolve_home
+from odata1c.config.home import check_file_permissions, ensure_home, resolve_home
 
 
 def test_явный_путь_главнее_переменной_окружения(tmp_path, monkeypatch):
@@ -34,7 +36,34 @@ def test_повторный_вызов_не_считается_создание�
     assert ensure_home(tmp_path / "home").created is False
 
 
-@pytest.mark.skipif(pathlib.Path("/etc").exists(), reason="проверка режима только для POSIX-прав")
+@pytest.mark.skipif(sys.platform == "win32", reason="проверка POSIX-прав, пропускается на Windows")
 def test_права_каталога_закрыты(tmp_path):
     status = ensure_home(tmp_path / "home")
     assert status.permissions_narrowed is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
+def test_check_file_permissions_ensure_home_без_предупреждений(tmp_path):
+    status = ensure_home(tmp_path / "home")
+    assert check_file_permissions(status.path) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
+def test_check_file_permissions_широкий_доступ_первой_записью_даёт_предупреждение(tmp_path):
+    test_dir = tmp_path / "open"
+    test_dir.mkdir()
+    # Даём широкий доступ группе "Все" (Everyone) — GUID *S-1-1-0
+    subprocess.run(
+        ["icacls", str(test_dir), "/grant", "*S-1-1-0:(F)"],
+        check=True,
+        capture_output=True,
+    )
+    warning = check_file_permissions(test_dir)
+    assert warning is not None
+    assert "доступен" in warning
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
+def test_check_file_permissions_несуществующий_путь_возвращает_none(tmp_path):
+    nonexistent = tmp_path / "nonexistent"
+    assert check_file_permissions(nonexistent) is None

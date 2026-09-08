@@ -46,7 +46,11 @@ def ensure_home(path: pathlib.Path) -> HomeStatus:
 
 def _narrow_permissions(path: pathlib.Path) -> tuple[bool, str | None]:
     if sys.platform == "win32":
-        user = f"{os.environ.get('USERDOMAIN', '')}\\{getpass.getuser()}".lstrip("\\")
+        try:
+            username = getpass.getuser()
+        except Exception as exc:
+            return False, f"не удалось определить имя пользователя: {exc}"
+        user = f"{os.environ.get('USERDOMAIN', '')}\\{username}".lstrip("\\")
         try:
             subprocess.run(
                 ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
@@ -70,17 +74,37 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
             output = subprocess.run(
                 ["icacls", str(path)], check=True, capture_output=True, text=True
             ).stdout
-        except (OSError, subprocess.CalledProcessError):
-            return None
-        me = getpass.getuser().lower()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return f"не удалось проверить права на {path}: {exc}"
+        try:
+            username = getpass.getuser().lower()
+        except Exception as exc:
+            return f"не удалось определить имя пользователя: {exc}"
+        # Парсим вывод icacls: первая строка может содержать путь и первую запись
+        # Формат: "C:\path ГРУППА:(F)" или "C:\path ГРУППА1:(F)\n                 ГРУППА2:(R)"
+        lines = output.splitlines()
+        acl_entries = []
+        path_str = str(path)
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line or "Successfully processed" in line or "Failed processing" in line:
+                continue
+            # Первая непустая строка может содержать путь и запись
+            if i == 0 and line.startswith(path_str):
+                remainder = line[len(path_str) :].strip()
+                if remainder and ":" in remainder:
+                    acl_entries.append(remainder)
+            elif ":" in line:
+                # Остальные строки — это ACL записи
+                acl_entries.append(line)
+        # Проверяем каждую запись на наличие доступа для других учётных записей
         others = [
-            line.strip()
-            for line in output.splitlines()[1:]
-            if ":" in line
-            and me not in line.lower()
-            and "NT AUTHORITY\\SYSTEM" not in line
-            and "BUILTIN\\Администраторы" not in line
-            and "BUILTIN\\Administrators" not in line
+            entry
+            for entry in acl_entries
+            if username not in entry.lower()
+            and "NT AUTHORITY\\SYSTEM" not in entry
+            and "BUILTIN\\Администраторы" not in entry
+            and "BUILTIN\\Administrators" not in entry
         ]
         if others:
             return f"{path} доступен другим учётным записям: {'; '.join(others)}"
