@@ -1,4 +1,5 @@
 """Общие фикстуры юнит-тестов."""
+
 import pathlib
 
 import pytest
