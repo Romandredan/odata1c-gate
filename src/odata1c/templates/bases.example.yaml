@@ -1,0 +1,53 @@
+# odata1c: все базы 1С этой машины. Файл закрыт правами текущего пользователя ОС.
+# Пароли хранятся здесь открытым текстом (см. SPEC §3.4) либо `password: keyring`.
+
+default: ut                          # база по умолчанию, если тул вызван без `base`
+
+bases:
+  ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
+    label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
+    url: https://1c.corp.local/ut/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
+    user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
+    password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС (odata1c base secret ut)
+    role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
+
+    # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
+    # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
+    # timeout_s: 60                  # таймаут обычного запроса; виртуальные таблицы — 180
+    # concurrency: 2                 # одновременных запросов к этой базе от всех сессий
+    # ib_session: true               # держать сеанс 1С (IBSession) между запросами
+
+    # --- запись (умолчание роли prod: write: false) ---
+    write: true                      # разрешить пишущие тулы (create/update/mark/action); commit всегда с подтверждением
+    # permissions:
+    #   post_documents: true         # действия Post/Unpost из $metadata
+    #   mark_deletion: true          # PATCH DeletionMark у объектов
+    #   independent_register_delete: false   # DELETE записей регистров сведений без регистратора (odata1c_delete_record)
+    #   register_direct_write: false # POST/PATCH в регистры накопления, бухгалтерии, расчёта и регистры с регистратором
+    #   allow_entities: []           # если не пусто — запись только в эти сущности
+    #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
+    #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
+    #   commit_limit: 20             # коммитов за 10 минут на сессию; 0 = без лимита
+
+    # --- гейт (умолчание роли prod: identifiers+names) ---
+    # gate:
+    #   mode: identifiers+names      # off | identifiers | identifiers+names, см. §6.2
+    #   names_for: [...]             # сущности, чьи Description и поля ФИО заменяются; умолчание в §6.5
+    #   scan_free_text: true         # искать реквизиты и известные названия в любых строках ответа
+
+    # --- рецепты ---
+    # recipes: bases/ut/recipes.yaml # путь относительно домашнего каталога; создаётся из шаблона (base add --recipes ut)
+
+  # buh:
+  #   label: БП 3.0, боевая
+  #   url: https://1c.corp.local/buh/odata/standard.odata/
+  #   user: odata_claude
+  #   password: "…"
+  #   role: prod
+
+  # ut_test:
+  #   label: копия УТ для отладки
+  #   url: http://localhost/ut_test/odata/standard.odata/
+  #   user: Администратор
+  #   password: ""
+  #   role: dev                      # гейт выключен, запись и удаление в независимых регистрах разрешены

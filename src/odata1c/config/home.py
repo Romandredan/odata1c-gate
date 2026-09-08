@@ -65,17 +65,36 @@ def _narrow_permissions(path: pathlib.Path) -> tuple[bool, str | None]:
     return True, None
 
 
+def _консольная_кодировка() -> str:
+    """Кодовая страница, в которой icacls (консольная утилита) пишет свой вывод.
+
+    Вывод идёт в кодировке консоли (OEM), а не в кодировке процесса (ANSI, её берёт
+    subprocess.run(text=True) по умолчанию из locale.getpreferredencoding()). На русской
+    Windows это разные страницы (обычно cp866 против cp1251): при разборе в кодировке
+    процесса имена системных групп («Администраторы», «SYSTEM») превращаются в нечитаемые
+    символы, и сравнение с ними в этой функции перестаёт срабатывать.
+    """
+    try:
+        import ctypes
+
+        код = ctypes.windll.kernel32.GetOEMCP()
+        return f"cp{код}"
+    except Exception:
+        return "cp866"
+
+
 def check_file_permissions(path: pathlib.Path) -> str | None:
     """Предупреждение, если файл виден другим учётным записям (SPEC §2.3)."""
     if not path.exists():
         return None
     if sys.platform == "win32":
         try:
-            output = subprocess.run(
-                ["icacls", str(path)], check=True, capture_output=True, text=True
+            raw = subprocess.run(
+                ["icacls", str(path)], check=True, capture_output=True, text=False
             ).stdout
         except (OSError, subprocess.CalledProcessError) as exc:
             return f"не удалось проверить права на {path}: {exc}"
+        output = raw.decode(_консольная_кодировка(), errors="replace")
         try:
             username = getpass.getuser().lower()
         except Exception as exc:
@@ -103,6 +122,7 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
             for entry in acl_entries
             if username not in entry.lower()
             and "NT AUTHORITY\\SYSTEM" not in entry
+            and "NT AUTHORITY\\СИСТЕМА" not in entry  # SYSTEM на локализованной (ru-RU) Windows
             and "BUILTIN\\Администраторы" not in entry
             and "BUILTIN\\Administrators" not in entry
         ]
