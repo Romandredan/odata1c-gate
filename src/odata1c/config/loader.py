@@ -88,6 +88,14 @@ def apply_role(role: str, raw: dict) -> dict:
 
 
 def load_config(home: pathlib.Path) -> AppConfig:
+    if not home.is_dir():
+        # is_dir(), не exists(): путь может существовать как обычный файл (опечатка в --home),
+        # и тогда попытка создать home/daemon.yaml упадёт NotADirectoryError чуть ниже —
+        # тем же необработанным трейсбеком, который чинит эта проверка.
+        raise ConfigError(
+            f"домашний каталог не найден: {home}",
+            hint=f"выполните: odata1c init --home {home}",
+        )
     warnings: list[str] = []
     daemon = _load_daemon(home, warnings)
     default, bases = _load_bases(home, warnings)

@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import importlib.resources
 import pathlib
-import sys
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
@@ -22,12 +21,22 @@ from odata1c.registry.registry import Registry, SessionScope
 
 
 def main(argv: list[str] | None = None) -> int:
-    # --home общий для всех команд. argparse не пробрасывает опции родителя в подкоманду:
-    # без parents=[домашний] значение после имени подкоманды («init --home X») не распознаётся,
-    # поэтому опция добавлена явно на каждый уровень, где она может встретиться.
+    # --home общий для всех команд, в любой позиции: до подкоманды, между уровнями подкоманд
+    # или после них. Наивное решение — добавить --home через parents=[...] на каждый уровень —
+    # не работает: argparse разбирает хвост, доставшийся подпарсеру, в отдельное пространство
+    # имён и затем ЦЕЛИКОМ копирует его поверх пространства имён родителя
+    # (`_SubParsersAction.__call__`).
+    # Если подпарсер не получил --home в своей части хвоста, он подставляет СВОЙ default (None)
+    # и это None затирает уже распознанное родителем значение — независимо от того, что дальше
+    # по цепочке использует parents. Проверено матрицей из шести форм записи --home
+    # (tests/unit/test_cli_base.py::test_home_разбирается_в_любой_позиции).
+    # Лечится default=argparse.SUPPRESS: тогда при отсутствии --home в конкретном хвосте
+    # атрибут просто не появляется в подпространстве имён и копирование его не трогает.
     домашний = argparse.ArgumentParser(add_help=False)
     домашний.add_argument(
-        "--home", help="домашний каталог шлюза (иначе ODATA1C_HOME или ~/.claude/odata1c)"
+        "--home",
+        default=argparse.SUPPRESS,
+        help="домашний каталог шлюза (иначе ODATA1C_HOME или ~/.claude/odata1c)",
     )
 
     parser = argparse.ArgumentParser(
@@ -46,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("name", help="имя базы из bases.yaml")
 
     args = parser.parse_args(argv)
-    home = resolve_home(args.home)
+    home = resolve_home(getattr(args, "home", None))
 
     try:
         if args.команда == "init":
@@ -127,7 +136,3 @@ async def _проверить_соединение(base) -> int:
         f"следующий шаг — odata1c reindex {base.name}"
     )
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

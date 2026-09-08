@@ -1,9 +1,14 @@
 """Команды CLI: init, base list, base test."""
 
+import pathlib
+
 import httpx
+import pytest
 import respx
 
+import odata1c.cli as cli
 from odata1c.cli import main
+from odata1c.config.loader import ConfigError, load_config
 
 URL = "http://localhost/ut/odata/standard.odata/"
 BASES = f"""
@@ -108,3 +113,99 @@ def test_base_test_неизвестной_базы(tmp_path, capsys):
     assert код == 1
     assert "base_unknown" in вывод
     assert "ut" in вывод  # подсказка со списком доступных
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--home", "X", "init"],
+        ["init", "--home", "X"],
+        ["base", "--home", "X", "list"],
+        ["base", "list", "--home", "X"],
+        ["base", "test", "--home", "X", "ut"],
+        ["base", "test", "ut", "--home", "X"],
+    ],
+    ids=[
+        "--home перед init",
+        "--home после init",
+        "--home между base и list",
+        "--home после list",
+        "--home между test и именем базы",
+        "--home после имени базы",
+    ],
+)
+def test_home_разбирается_в_любой_позиции(argv, monkeypatch):
+    """Регресс: argparse копирует пространство имён подпарсера ЦЕЛИКОМ поверх пространства
+    имён родителя (`_SubParsersAction.__call__`). Без `default=argparse.SUPPRESS` подпарсер,
+    в чей хвост --home не попал, подставляет свой default (None) и затирает уже
+    распознанное родителем значение — независимо от того, добавлен ли --home через
+    `parents=` на этом уровне. Проверяем именно разобранное значение, не выполняя команду.
+    """
+    увиденный: dict[str, pathlib.Path] = {}
+
+    def записать_init(home):
+        увиденный["home"] = home
+        return 0
+
+    def записать_list(home):
+        увиденный["home"] = home
+        return 0
+
+    def записать_test(home, name):
+        увиденный["home"] = home
+        увиденный["name"] = name
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_init", записать_init)
+    monkeypatch.setattr(cli, "cmd_base_list", записать_list)
+    monkeypatch.setattr(cli, "cmd_base_test", записать_test)
+
+    код = cli.main(argv)
+
+    assert код == 0
+    assert увиденный["home"] == pathlib.Path("X")
+
+
+def test_base_list_несуществующий_домашний_каталог_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "нет_такого_каталога"
+
+    код = main(["base", "list", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+    assert str(home) in вывод
+    assert "init" in вывод
+
+
+def test_base_test_несуществующий_домашний_каталог_даёт_ошибку_а_не_трейсбек(tmp_path, capsys):
+    home = tmp_path / "нет_такого_каталога"
+
+    код = main(["base", "test", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод
+    assert str(home) in вывод
+    assert "init" in вывод
+
+
+def test_load_config_несуществующий_домашний_каталог(tmp_path):
+    """Дефект жил в загрузчике настроек (задача 3): попытка создать daemon.yaml внутри
+    ещё не существующего каталога роняла load_config необработанным FileNotFoundError."""
+    home = tmp_path / "нет_такого_каталога"
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(home)
+    assert str(home) in str(ошибка.value)
+    assert "init" in (ошибка.value.hint or "")
+
+
+def test_load_config_домашний_путь_указывает_на_файл(tmp_path):
+    """Тот же класс дефекта на шаг дальше: путь существует, но это обычный файл (опечатка
+    в --home), а не каталог. home / "daemon.yaml" в этом случае роняет NotADirectoryError,
+    если проверка входа использует exists() вместо is_dir()."""
+    файл = tmp_path / "не_каталог.txt"
+    файл.write_text("", encoding="utf-8")
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(файл)
+    assert str(файл) in str(ошибка.value)

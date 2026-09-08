@@ -67,3 +67,36 @@ def test_check_file_permissions_широкий_доступ_первой_зап�
 def test_check_file_permissions_несуществующий_путь_возвращает_none(tmp_path):
     nonexistent = tmp_path / "nonexistent"
     assert check_file_permissions(nonexistent) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls работает только на Windows")
+def test_check_file_permissions_кодировка_читаема_и_системные_группы_исключены(tmp_path):
+    """Регресс на смешение кодировок: icacls пишет в кодировке консоли (OEM, обычно cp866
+    на ru-RU), а не в кодировке процесса (ANSI, cp1251), которую subprocess.run(text=True)
+    берёт по умолчанию.
+
+    Каталоги под tmp_path уже наследуют явные ACE от NT AUTHORITY\\СИСТЕМА и
+    BUILTIN\\Администраторы (проверено вручную: icacls на новом подкаталоге показывает
+    оба флагами (I)(OI)(CI)(F)) — тест не вакуумный. Ключевая проверка ниже —
+    `"Все" in warning`: экспериментально подтверждено (decode тем же сырым выводом
+    кодировкой процесса, cp1251, вместо кодировки консоли, cp866), что при возврате
+    дефекта группа "Все" превращается в "‚бҐ" и эта проверка падает первой — однобайтовые
+    кодовые страницы не бросают UnicodeDecodeError на "чужих" байтах, поэтому символа
+    замены U+FFFD при такой порче не возникает и его отдельно не проверяем.
+    """
+    test_dir = tmp_path / "wide"
+    test_dir.mkdir()
+    subprocess.run(
+        ["icacls", str(test_dir), "/grant", "*S-1-1-0:(R)"],
+        check=True,
+        capture_output=True,
+    )
+
+    warning = check_file_permissions(test_dir)
+
+    assert warning is not None
+    assert "Все" in warning  # реальный широкий доступ по-прежнему виден и читаем
+    assert "СИСТЕМА" not in warning
+    assert "SYSTEM" not in warning
+    assert "Администраторы" not in warning
+    assert "Administrators" not in warning
