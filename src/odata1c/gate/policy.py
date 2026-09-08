@@ -1,7 +1,11 @@
 """Политика гейта на базу: какие поля к какому классу, что скрыто, что открыто (SPEC §6.9).
 
-Приоритет: fields > entities > defaults > auto. Секцию auto перезаписывает реиндекс,
-ручные разделы не трогаются никогда.
+Приоритет источников класса поля: `fields` (ручной раздел) > `custom` (свои классы, по имени
+поля) > `defaults` (глобальные умолчания, применяются к уже найденному значению) > `auto`
+(автоматика reindex). Признак скрытости сущности (`entities.hide`) — отдельная настройка и в
+этом приоритете не участвует (поправка SPEC §6.9, 2026-09-09: исходная формула ошибочно смешивала
+обе оси). Секцию `auto` перезаписывает реиндекс, ручные разделы (`fields`, `entities`, `custom`,
+`names_for`, `defaults`) не трогаются никогда.
 """
 
 from __future__ import annotations
@@ -12,9 +16,21 @@ import re
 
 import yaml
 
-from odata1c.gate.field_rules import classify_field
+from odata1c.gate.field_rules import СУЩНОСТИ_ФИЗЛИЦ, classify_field
 
 ОТКРЫТЫЕ_ПО_УМОЛЧАНИЮ = ("corr", "bic")
+
+
+class PolicyError(Exception):
+    """Ошибка политики базы: неверная разметка `policy.yaml`, раздел неожиданного типа,
+    недопустимое регулярное выражение своего класса. Тот же протокол атрибутов (code, hint), что
+    у `odata1c.config.loader.ConfigError` и `odata1c.index.repository.IndexCorruptError` — CLI и
+    демон различают причину отказа одинаково."""
+
+    def __init__(self, message: str, code: str = "policy_invalid", hint: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
 
 
 @dataclasses.dataclass(slots=True)
@@ -29,9 +45,17 @@ class Policy:
 
     def sensitivity_of(self, entity: str, field: str) -> str | None:
         ключ = f"{entity}.{field}"
-        значение = self._fields.get(ключ) or self._auto.get(ключ)
+        if ключ in self._fields:
+            значение = self._fields[ключ]
+        else:
+            значение = self.custom_fields().get(field)
+            if значение is None:
+                значение = self._auto.get(ключ)
         if значение is None:
             return None
+        return self._применить_умолчания(значение, entity)
+
+    def _применить_умолчания(self, значение: str, entity: str) -> str:
         if значение in ОТКРЫТЫЕ_ПО_УМОЛЧАНИЮ and self._defaults.get(значение) == "keep":
             return "keep"
         правило_адреса = self._defaults.get("addr")
@@ -56,7 +80,9 @@ class Policy:
         return собранное
 
     def custom_fields(self) -> dict[str, str]:
-        """Имя поля → класс custom:*, из раздела custom политики."""
+        """Имя поля → класс custom:*, из раздела custom политики (SPEC §6.4, строка `custom:*`:
+        свой класс задаётся и по имени поля, и по выражению для значения — здесь первая
+        половина, используется в sensitivity_of наравне с ручным разделом fields)."""
         собранное: dict[str, str] = {}
         for имя, описание in self._custom.items():
             for поле in (описание or {}).get("fields", []):
@@ -65,9 +91,11 @@ class Policy:
 
 
 def load_policy(path: pathlib.Path) -> Policy:
-    if not pathlib.Path(path).exists():
+    path = pathlib.Path(path)
+    if not path.exists():
         return Policy()
-    данные = yaml.safe_load(pathlib.Path(path).read_text(encoding="utf-8")) or {}
+    данные = _разобрать_yaml(path)
+    _проверить_разделы(данные, path)
     return Policy(
         scan_free_text=bool(данные.get("scan_free_text", True)),
         _defaults=данные.get("defaults") or {},
@@ -77,6 +105,62 @@ def load_policy(path: pathlib.Path) -> Policy:
         _custom=данные.get("custom") or {},
         _names_for=данные.get("names_for"),
     )
+
+
+def _разобрать_yaml(path: pathlib.Path) -> dict:
+    """Прочитать YAML политики; синтаксическая ошибка — PolicyError с местом (строка, колонка),
+    без фрагмента файла в сообщении (по образцу odata1c.config.loader._разобрать_yaml — то же
+    соображение: в policy.yaml секреты не хранятся, но принцип «не цитировать файл целиком»
+    единый для всех загрузчиков настроек)."""
+    try:
+        данные = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        if mark is not None:
+            место = f"строка {mark.line + 1}, колонка {mark.column + 1}"
+        else:
+            место = "точное место в файле не определено"
+        raise PolicyError(
+            f"файл {path.name} повреждён и не разбирается как YAML: {место}",
+            hint=f"проверьте синтаксис файла {path}",
+        ) from exc
+    return данные or {}
+
+
+def _проверить_тип_раздела(данные: dict, ключ: str) -> None:
+    значение = данные.get(ключ)
+    if значение is not None and not isinstance(значение, dict):
+        raise PolicyError(
+            f"policy.yaml: раздел {ключ} должен быть словарём, получено {type(значение).__name__}"
+        )
+
+
+def _проверить_разделы(данные: dict, path: pathlib.Path) -> None:
+    """Раздел неожиданного типа и недопустимое regex своего класса — ошибка при чтении политики,
+    а не при первом обращении к полю посреди обработки ответа тула (SPEC §6.9)."""
+    for раздел in ("defaults", "entities", "fields", "auto", "custom"):
+        _проверить_тип_раздела(данные, раздел)
+    имена = данные.get("names_for")
+    if имена is not None and not isinstance(имена, list):
+        raise PolicyError(
+            f"policy.yaml: раздел names_for должен быть списком, получено {type(имена).__name__}"
+        )
+    for имя, описание in (данные.get("custom") or {}).items():
+        if not isinstance(описание, dict):
+            raise PolicyError(
+                f"policy.yaml: свой класс custom:{имя} должен быть набором полей "
+                f"(fields/regex), получено {type(описание).__name__}"
+            )
+        выражение = описание.get("regex")
+        if выражение:
+            try:
+                re.compile(выражение)
+            except re.error as exc:
+                raise PolicyError(
+                    f"policy.yaml: свой класс custom:{имя} — недопустимое регулярное "
+                    f"выражение: {exc}",
+                    hint=f"проверьте regex своего класса custom:{имя} в {path}",
+                ) from exc
 
 
 def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
@@ -95,7 +179,14 @@ def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
     return {
         "version": 2,
         "scan_free_text": True,
-        "defaults": {"corr": "keep", "bic": "keep"},
+        "defaults": {
+            "corr": "keep",
+            "bic": "keep",
+            # Адрес — персональные данные только у сущностей физлиц (SPEC §6.9): склад, магазин,
+            # банк защиты не требуют. Список сущностей — та же константа, что определяет класс
+            # person слоя 1 (SPEC §6.5), не дублируется здесь отдельно.
+            "addr": {"mask_for": sorted(СУЩНОСТИ_ФИЗЛИЦ)},
+        },
         "entities": {},
         "fields": {},
         "custom": {},
