@@ -21,6 +21,7 @@ from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
 from odata1c.registry.registry import Registry, SessionScope
 
@@ -97,10 +98,11 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
             return cmd_reindex(home, args.name, args.force)
-    except (ConfigError, OdataError) as ошибка:
-        # ConfigError (настройки) и OdataError (ответ 1С) — разные классы, но у обеих есть
-        # code и hint, и str() на обеих даёт человекочитаемое сообщение (Exception.__init__
-        # получает его же); одно место форматирования вместо двух копий.
+    except (ConfigError, OdataError, EdmxError) as ошибка:
+        # ConfigError (настройки), OdataError (ответ 1С) и EdmxError (не удалось разобрать
+        # $metadata) — разные классы, но у всех есть code и hint, и str() на всех даёт
+        # человекочитаемое сообщение (Exception.__init__ получает его же); одно место
+        # форматирования вместо трёх копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")
@@ -188,12 +190,13 @@ def cmd_reindex(home: pathlib.Path, name: str, force: bool) -> int:
 
 
 async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -> int:
+    # OdataError (недоступный адрес, отказ аутентификации и т.д.) и EdmxError (не удалось
+    # разобрать $metadata) здесь не перехватываются — единое место форматирования
+    # [code] сообщение + подсказка в main() обрабатывает все три класса ошибок одинаково
+    # (тот же приём, что в cmd_base_test._проверить_соединение).
     client = Client1C(base)
     try:
         результат = await reindex(base, client, home, force=force)
-    except OdataError as ошибка:
-        print(f"[{ошибка.code}] {ошибка.message}")
-        return 1
     finally:
         await client.close()
 

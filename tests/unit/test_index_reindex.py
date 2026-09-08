@@ -1,5 +1,7 @@
 """Реиндекс: пропуск при неизменном $metadata, разница, атомарная замена (SPEC §4.3)."""
 
+import pathlib
+
 import httpx
 import respx
 
@@ -171,3 +173,65 @@ async def test_нераспознанные_наборы_попадают_в_р�
     assert первый.unresolved_entity_sets == ["Catalog_Пропавший"]
     assert второй.changed is False
     assert второй.unresolved_entity_sets == ["Catalog_Пропавший"]
+
+
+@respx.mock
+async def test_сбой_записи_не_портит_прежний_индекс_и_не_оставляет_мусора(
+    tmp_path, edmx_synthetic, monkeypatch
+):
+    """Правки по итогам ревью задачи 5 (Critical + Important): единственный тест, который
+    реально ловит поломку атомарной подмены — а не только ветку, где до подмены дело не
+    доходит (сбой разбора EDMX, см. test_повреждённый_метаданные_не_ломают_старый_индекс —
+    там временный файл вообще не успевает появиться, потому что parse_edmx падает раньше
+    записи). Здесь второй проход падает НА ЭТАПЕ ЗАПИСИ временного индекса: сначала реально
+    отрабатывает write() (временный файл получает настоящие данные на диск — ровно то
+    состояние, при котором прямая запись поверх прежнего файла, без временного файла и
+    os.replace, уже необратимо испортила бы прежний индекс), и только после этого — сбой.
+
+    Проверяются все три вещи, которые просил ревьюер: прежний файл индекса не изменился
+    побайтово, он по-прежнему читается и содержит прежнее число сущностей, временный файл
+    и его журналы (-wal, -shm) не остались на диске.
+    """
+    from odata1c.index.repository import IndexRepository
+
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_synthetic))
+    _замокать_завершение_сеанса()
+    client = Client1C(база())
+
+    # Первый реиндекс — обычный, без патча: строит прежний, заведомо исправный индекс.
+    первый = await reindex(база(), client, tmp_path)
+    assert первый.changed is True
+
+    путь = index_path(tmp_path, "ut")
+    содержимое_до = путь.read_bytes()
+    размер_до = путь.stat().st_size
+
+    исходный_write = IndexRepository.write
+
+    def падающий_write(self, разобрано):
+        исходный_write(self, разобрано)  # временный файл реально получает данные на диск
+        raise RuntimeError("смоделированный сбой на этапе записи временного индекса")
+
+    monkeypatch.setattr(IndexRepository, "write", падающий_write)
+
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        # force=True: sha256 не изменился (тот же edmx_synthetic), без force сработала бы
+        # ветка «без изменений» и до записи дело бы не дошло.
+        await reindex(база(), client, tmp_path, force=True)
+    await client.close()
+
+    временный = путь.with_suffix(".sqlite.new")
+    assert not временный.exists(), "временный файл .sqlite.new остался после сбоя"
+    for суффикс in ("-wal", "-shm"):
+        # Тот же способ собрать путь к журналу, что в reindex.py::_удалить_с_журналами.
+        журнал = pathlib.Path(str(временный) + суффикс)
+        assert not журнал.exists(), f"журнал {журнал.name} остался после сбоя"
+
+    assert путь.read_bytes() == содержимое_до, "прежний индекс изменился побайтово"
+    assert путь.stat().st_size == размер_до
+
+    хранилище = IndexRepository(путь)
+    assert len(хранилище.entity_names()) == 8  # прежний индекс по-прежнему читается
+    хранилище.close()

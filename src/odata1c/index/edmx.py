@@ -19,8 +19,23 @@ from odata1c.index.naming import parse_entity_name
 СЛУЖЕБНЫЕ_ТИПЫ = ("Edm.Guid",)
 
 
+СОВЕТ_ПРИ_ОШИБКЕ_РАЗБОРА = (
+    "проверьте, что по адресу базы опубликован именно интерфейс OData "
+    "(URL оканчивается на /odata/standard.odata/), а не веб-страница — "
+    "типичная причина именно в этом"
+)
+
+
 class EdmxError(Exception):
-    """Не удалось разобрать $metadata."""
+    """Не удалось разобрать $metadata — тот же протокол ошибок, что у OdataError/ConfigError
+    (SPEC §5.2): код, сообщение, подсказка, чтобы вызывающая команда перехватывала её наравне
+    с остальными, а не роняла процесс необработанным исключением."""
+
+    def __init__(self, message: str, hint: str = СОВЕТ_ПРИ_ОШИБКЕ_РАЗБОРА) -> None:
+        super().__init__(message)
+        self.code = "odata_error"
+        self.message = message
+        self.hint = hint
 
 
 @dataclasses.dataclass(slots=True)
