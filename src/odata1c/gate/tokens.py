@@ -51,7 +51,15 @@ _ОБРЕЗОК = re.compile(
 
 
 def normalize_value(type_: str, value: str) -> str:
-    """Нормализация перед хэшированием (SPEC §6.3)."""
+    """Нормализация перед хэшированием (SPEC §6.3).
+
+    Поправка (amended, 2026-09-09): для `org`/`person` нормализация приводит и к нижнему
+    регистру, а не только схлопывает пробелы — иначе «ООО Ромашка» и «ооо ромашка» (одно и то
+    же юридическое лицо) получали два разных токена, что нарушает основное свойство словаря:
+    одно значение с разным написанием — один токен. Написание с исходным регистром при этом не
+    теряется: словарь (`gate/dictionary.py`) хранит его отдельно, в вариантах по базе и полю, и
+    именно его возвращает `reveal()` при обратной подмене.
+    """
     if type_ in ТОЛЬКО_ЦИФРЫ:
         return re.sub(r"\D", "", value)
     if type_ == "email":
@@ -60,8 +68,10 @@ def normalize_value(type_: str, value: str) -> str:
         return re.sub(r"\s", "", value).upper()
     if type_ == "dob":
         return value.strip()[:10]
-    if type_ in ("addr", "org", "person"):
+    if type_ == "addr":
         return " ".join(value.split())
+    if type_ in ("org", "person"):
+        return " ".join(value.split()).lower()
     return value.strip()
 
 

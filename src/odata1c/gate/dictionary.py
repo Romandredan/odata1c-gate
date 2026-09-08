@@ -36,10 +36,17 @@ CREATE TABLE IF NOT EXISTS variants (
     PRIMARY KEY (token, base, field, raw_value)
 );
 
+-- Ключ — пара (token, variant_norm), а не один variant_norm: короткий вариант вида "ромашка"
+-- законно принадлежит разным организациям (ООО "Ромашка" и АО "Ромашка" — два разных токена).
+-- Оба варианта должны быть записаны, а не молчаливо потеряны через INSERT OR IGNORE по одному
+-- variant_norm — иначе один общий вариант остаётся закреплён за первым встреченным токеном, и
+-- страж заменит им упоминание второй организации. Различение однозначных и неоднозначных
+-- вариантов при чтении — в Dictionary.name_variants()/ambiguous_name_variants()
+-- (поправка ревью, 2026-09-09).
 CREATE TABLE IF NOT EXISTS name_variants (
     token TEXT NOT NULL REFERENCES tokens(token) ON DELETE CASCADE,
     variant_norm TEXT NOT NULL,
-    PRIMARY KEY (variant_norm)
+    PRIMARY KEY (token, variant_norm)
 );
 
 CREATE INDEX IF NOT EXISTS idx_variants_lookup ON variants(token, base, field);
@@ -61,6 +68,25 @@ def name_variants_of(value: str) -> list[str]:
     return [вариант for вариант in варианты if len(вариант) >= МИНИМАЛЬНАЯ_ДЛИНА_ВАРИАНТА]
 
 
+class DictionaryCorruptError(Exception):
+    """Файл словаря — не SQLite-база или повреждён (тот же набор атрибутов, что у OdataError,
+    ConfigError и IndexCorruptError: SPEC §5.2 — code, message, hint; см.
+    index/repository.py::IndexCorruptError — тот же дефект и то же решение, перенесённое сюда
+    по итогам ревью, 2026-09-09)."""
+
+    def __init__(self, path: pathlib.Path, детали: str) -> None:
+        message = f"словарь гейта повреждён или недоступен: {path}"
+        super().__init__(message)
+        self.code = "dictionary_corrupt"
+        self.message = message
+        self.hint = (
+            f"словарь — единственное место, где хранится связь токена со значением: "
+            f"восстановить его нельзя, только начать заново. Переместите повреждённый файл "
+            f"{path} в сторону и запустите ещё раз — новый словарь начнёт накапливаться с нуля, "
+            f"но токены, выданные до сих пор, перестанут раскрываться ({детали})"
+        )
+
+
 class Dictionary:
     def __init__(self, path: pathlib.Path, secret: bytes) -> None:
         self.path = pathlib.Path(path)
@@ -78,21 +104,34 @@ class Dictionary:
         # и _запомнить_вариант() действительно фиксирует или откатывает её целиком.
         self._connection = sqlite3.connect(self.path)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        # synchronous=NORMAL при журнале WAL — штатная и безопасная комбинация (документация
-        # SQLite): повреждения базы она не допускает, checkpoint всё равно синхронизируется
-        # полностью. Риск ограничен потерей нескольких последних зафиксированных транзакций при
-        # внезапном отказе ОС или питания (не при обычном сбое процесса — commit остаётся
-        # atomic). Для словаря этот риск приемлем, а не просто дешевле: токены реквизитов (ИНН,
-        # счета, телефоны) вычисляются из значения и секретного ключа, а не читаются из словаря —
-        # потерянная запись сама восстановится при следующей встрече того же значения. Токены
-        # названий и ФИО при потере получат новые порядковые номера — старые перестанут
-        # раскрываться в уже закрытых чатах, но это неудобство истории переписки, а не потеря
-        # данных базы. Против этого — цена полной синхронизации на каждом ответе 1С, которую
-        # иначе платил бы каждый запрос модели (решение координатора, 2026-09-09).
-        self._connection.execute("PRAGMA synchronous=NORMAL")
-        self._connection.executescript(СХЕМА)
+        # Если файл существует, но не является SQLite-базой (или повреждён), sqlite3 узнаёт об
+        # этом не на connect(), а только на первой операции — здесь на PRAGMA/executescript.
+        # Соединение к этому моменту уже открыто и держит файловый дескриптор; не закрыв его
+        # перед тем, как исключение уйдёт наверх, получаем недостижимый, но не закрытый
+        # sqlite3.Connection — на сборке мусора ResourceWarning (в тестах — ошибка сессии
+        # pytest, см. filterwarnings=["error"]). Решение и формулировка — по образцу
+        # index/schema.py::connect() + index/repository.py::IndexRepository.__init__ (тот же
+        # дефект уже находили и чинили там; перенесено сюда по итогам ревью, 2026-09-09).
+        try:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL при журнале WAL — штатная и безопасная комбинация (документация
+            # SQLite): повреждения базы она не допускает, checkpoint всё равно синхронизируется
+            # полностью. Риск ограничен потерей нескольких последних зафиксированных транзакций
+            # при внезапном отказе ОС или питания (не при обычном сбое процесса — commit
+            # остаётся atomic). Для словаря этот риск приемлем, а не просто дешевле: токены
+            # реквизитов (ИНН, счета, телефоны) вычисляются из значения и секретного ключа, а не
+            # читаются из словаря — потерянная запись сама восстановится при следующей встрече
+            # того же значения. Токены названий и ФИО при потере получат новые порядковые
+            # номера — старые перестанут раскрываться в уже закрытых чатах, но это неудобство
+            # истории переписки, а не потеря данных базы. Против этого — цена полной
+            # синхронизации на каждом ответе 1С, которую иначе платил бы каждый запрос модели
+            # (решение координатора, 2026-09-09).
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.executescript(СХЕМА)
+        except sqlite3.DatabaseError as ошибка:
+            self._connection.close()
+            raise DictionaryCorruptError(self.path, str(ошибка)) from ошибка
         self._revision = self._count()
 
     def close(self) -> None:
@@ -160,12 +199,44 @@ class Dictionary:
         }
 
     def name_variants(self) -> dict[str, str]:
+        """Однозначные варианты названий: с этим множеством сверяется страж (SPEC §6.5, слой 3).
+
+        Вариант, закреплённый более чем за одним токеном (короткая форма совпала у разных
+        организаций/физлиц — например, «Ромашка» у ООО «Ромашка» и АО «Ромашка»), сюда не
+        попадает. Заменить такой вариант правильно невозможно — неизвестно, к какому из токенов
+        он относится в конкретном тексте, — а неправильная подмена подставит одно юридическое
+        лицо вместо другого, что хуже отсутствия подмены. Полное название каждой организации
+        (со своей организационно-правовой формой) при этом по-прежнему однозначно и остаётся
+        здесь — коллизия задевает только общую сокращённую часть (поправка ревью, 2026-09-09).
+        """
         return {
             строка["variant_norm"]: строка["token"]
             for строка in self._connection.execute(
                 "SELECT variant_norm, token FROM name_variants"
+                " WHERE variant_norm IN ("
+                "   SELECT variant_norm FROM name_variants"
+                "   GROUP BY variant_norm HAVING COUNT(*) = 1"
+                " )"
             ).fetchall()
         }
+
+    def ambiguous_name_variants(self) -> dict[str, list[str]]:
+        """Варианты названий, закреплённые более чем за одним токеном (см. name_variants()).
+
+        Не участвуют в подмене — нужны, чтобы предупредить пользователя: короткая форма
+        встретилась у нескольких организаций/физлиц, и страж сознательно не подменяет её ни
+        одним из токенов (поправка ревью, 2026-09-09).
+        """
+        результат: dict[str, list[str]] = {}
+        for строка in self._connection.execute(
+            "SELECT variant_norm, token FROM name_variants"
+            " WHERE variant_norm IN ("
+            "   SELECT variant_norm FROM name_variants GROUP BY variant_norm HAVING COUNT(*) > 1"
+            " )"
+            " ORDER BY variant_norm, token"
+        ).fetchall():
+            результат.setdefault(строка["variant_norm"], []).append(строка["token"])
+        return результат
 
     def _создать(self, type_: str, нормализованное: str, base: str, entity: str, field: str) -> str:
         """Вставки без собственной транзакции — вызывающий (token_for) держит одну на всё."""
