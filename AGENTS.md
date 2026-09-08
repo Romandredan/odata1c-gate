@@ -71,7 +71,12 @@ M3 (package) → M4 (сетевая публикация).
 
 ## Сборка, тесты, команды
 
-Кода пока нет — команды ниже из спецификации и станут актуальны с реализацией.
+Команды разработки (Python 3.12, менеджер окружения `uv`):
+
+- `uv sync` — поставить зависимости, включая группу `dev`;
+- `uv run pytest` — все тесты; `uv run pytest tests/unit -q` — только юнит;
+- `uv run ruff check .` и `uv run ruff format --check .` — линт и формат;
+- `uv run odata1c <команда>` — CLI из рабочей копии.
 
 CLI (SPEC §3.5): `odata1c mcp|daemon|init|base add|base import|base list|base test|reindex|policy show|reveal|doctor|service install|remove`.
 
