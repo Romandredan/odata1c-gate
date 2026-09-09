@@ -44,7 +44,15 @@ def classifier_for(base: BaseConfig):
 
 
 def refresh_policy(home: pathlib.Path, base: BaseConfig) -> list[dict]:
-    """Пересобрать секцию auto по индексу, сохранив ручные разделы (SPEC §4.3 п. 3)."""
+    """Пересобрать секцию auto по индексу, сохранив ручные разделы (SPEC §4.3 п. 3).
+
+    Правка ревью задачи 9 (Important): «на проверку» возвращает только поля классов org/person,
+    у которых класс в СТАРОЙ секции auto (та, что лежала в файле до этого вызова) отличался от
+    нового — не весь текущий auto целиком. Без сравнения список на боевой базе (сотни полей
+    классов org/person) печатался бы заново при каждом реиндексе, меняющем состав сущностей, хотя
+    для подавляющего большинства полей ничего не изменилось; сигнал о действительно новых полях
+    тонет в шуме. Тот же приём, что уже применён в `index/reindex.py::_классифицировать` —
+    сравнение с состоянием ДО перестройки, снятым заранее."""
     путь = policy_path(home, base.name)
     путь.parent.mkdir(parents=True, exist_ok=True)
 
@@ -58,6 +66,7 @@ def refresh_policy(home: pathlib.Path, base: BaseConfig) -> list[dict]:
     существующая = {}
     if путь.exists():
         существующая = yaml.safe_load(путь.read_text(encoding="utf-8")) or {}
+    прежний_auto = (существующая or {}).get("auto") or {}
     итог = merge_auto(существующая or собранное, собранное["auto"])
     итог.setdefault("version", 2)
     итог.setdefault("scan_free_text", True)
@@ -67,7 +76,7 @@ def refresh_policy(home: pathlib.Path, base: BaseConfig) -> list[dict]:
     return [
         {"entity": ключ.rsplit(".", 1)[0], "field": ключ.rsplit(".", 1)[1], "sensitivity": класс}
         for ключ, класс in собранное["auto"].items()
-        if класс in КЛАССЫ_НАЗВАНИЙ
+        if класс in КЛАССЫ_НАЗВАНИЙ and прежний_auto.get(ключ) != класс
     ]
 
 

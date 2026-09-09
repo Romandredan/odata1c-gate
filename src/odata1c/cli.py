@@ -21,6 +21,8 @@ from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.gate.dictionary import DictionaryCorruptError
+from odata1c.gate.policy import PolicyError, load_policy
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
@@ -93,6 +95,12 @@ def main(argv: list[str] | None = None) -> int:
         "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
     )
     reveal.add_argument("token", help="токен вида [[inn:M4T2Q9XZ7K]]")
+    reveal.add_argument(
+        "--base", help="имя базы — вместе с --field вернуть написание именно из неё"
+    )
+    reveal.add_argument(
+        "--field", help="имя поля — вместе с --base вернуть написание именно из этого поля"
+    )
 
     args = parser.parse_args(argv)
     home = resolve_home(getattr(args, "home", None))
@@ -113,13 +121,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.команда == "policy" and args.подкоманда == "show":
             return cmd_policy_show(home, args.name)
         if args.команда == "reveal":
-            return cmd_reveal(home, args.token)
-    except (ConfigError, OdataError, EdmxError, IndexCorruptError) as ошибка:
+            return cmd_reveal(home, args.token, base=args.base, field=args.field)
+    except (
+        ConfigError,
+        OdataError,
+        EdmxError,
+        IndexCorruptError,
+        PolicyError,
+        DictionaryCorruptError,
+    ) as ошибка:
         # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать
-        # $metadata) и IndexCorruptError (файл индекса повреждён — reindex открывает прежний
-        # индекс перед перестройкой, см. правку по итогам ревью задачи 5) — разные классы,
-        # но у всех есть code и hint, и str() на всех даёт человекочитаемое сообщение
-        # (Exception.__init__ получает его же); одно место форматирования вместо четырёх копий.
+        # $metadata), IndexCorruptError (файл индекса повреждён — reindex открывает прежний
+        # индекс перед перестройкой, см. правку по итогам ревью задачи 5), PolicyError
+        # (policy.yaml повреждён или разобран неверно) и DictionaryCorruptError (файл словаря
+        # гейта — не SQLite или повреждён; правка по итогам ревью задачи 9: раньше эти два
+        # класса были объявлены с тем же протоколом code/hint, что и остальные, но не попадали
+        # в общий перехват — команды policy show и reveal роняли голый traceback вместо
+        # понятного сообщения) — разные классы, но у всех есть code и hint, и str() на всех даёт
+        # человекочитаемое сообщение (Exception.__init__ получает его же); одно место
+        # форматирования вместо шести копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")
@@ -259,17 +279,38 @@ def cmd_policy_show(home: pathlib.Path, name: str) -> int:
     if not путь.exists():
         print(f"политика ещё не создана; выполните: odata1c reindex {base.name}")
         return 1
+    # Валидация тем же способом, что и остальной код (gate/policy.py::load_policy), а не молчаливая
+    # печать сырого текста: испорченный YAML или раздел неожиданного типа должны остановить команду
+    # понятной ошибкой, а не мусором на экране (правка по итогам ревью задачи 9). PolicyError
+    # уходит наверх — форматирует общий перехват в main() (код + подсказка).
+    load_policy(путь)
     print(f"# {путь}")
     print(путь.read_text(encoding="utf-8"))
     return 0
 
 
-def cmd_reveal(home: pathlib.Path, token: str) -> int:
-    """Раскрытие токена только локально: наружу реальное значение не выходит (SPEC §14.5)."""
+def cmd_reveal(
+    home: pathlib.Path, token: str, *, base: str | None = None, field: str | None = None
+) -> int:
+    """Раскрытие токена только локально: наружу реальное значение не выходит (SPEC §14.5).
+
+    Без --base/--field показывается любое сохранённое исходное написание токена (SPEC §6.3) —
+    точное, как оно встретилось в данных 1С, а не нормализованная форма из tokens (нижний
+    регистр, выпрямленные кавычки) — правка по итогам ревью задачи 9: раньше эта ветка
+    показывала именно нормализованную форму, что расходится со SPEC §6.3 («написание с
+    исходным регистром не теряется»). Нормализованное значение остаётся запасным вариантом —
+    только когда у токена вообще нет ни одного сохранённого варианта написания. С --base и
+    --field вместе — точное написание именно из указанной базы и поля.
+    """
     config = load_config(home)
     словарь = open_dictionary(home, config.daemon.gate_secret)
     try:
-        значение = словарь.reveal(token)
+        if base and field:
+            значение = словарь.reveal(token, base=base, field=field)
+        else:
+            значение = словарь.any_variant(token)
+            if значение is None:
+                значение = словарь.reveal(token)
     finally:
         словарь.close()
     if значение is None:
