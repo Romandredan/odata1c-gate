@@ -2,6 +2,12 @@
 
 Точки входа: $filter, ключи в URL, params виртуальных таблиц и рецептов, тела create/update,
 params действий, query у raw_get. Обратимость существует только внутри гейта.
+
+Ревью задачи 7 (2026-09-09): поле, к которому относится строковый литерал внутри `$filter`,
+определяется по СТРУКТУРЕ сравнения (что стоит по другую сторону оператора или какой аргумент
+функции — идентификатор), а не по близости («последний идентификатор левее литерала» обходился
+перестановкой операндов и открывал оракул подбора через `substringof`). Если поле определить не
+удалось — запрос отклоняется, а не уходит в 1С непроверенным (Правка 1).
 """
 
 from __future__ import annotations
@@ -10,12 +16,18 @@ import re
 from collections.abc import Callable
 
 from odata1c.gate.detectors import inn_valid, ogrn_valid, snils_valid
-from odata1c.gate.dictionary import Dictionary
+from odata1c.gate.dictionary import НУМЕРУЕМЫЕ, Dictionary
 from odata1c.gate.filter_lexer import Token, lex_filter
 from odata1c.gate.tokens import TOKEN_RE, find_tokens, is_partial_token, parse_token
 
 ФУНКЦИИ_ПОДСТРОКИ = ("substringof", "startswith", "endswith")
 ПРОВЕРКИ = {"inn": inn_valid, "ogrn": ogrn_valid, "snils": snils_valid}
+СРАВНЕНИЯ = frozenset({"eq", "ne", "gt", "ge", "lt", "le"})
+# org/person — пользователь называет их сам, поиск по вхождению текста, который он написал,
+# разрешён без токена (SPEC §6.5). Для остальных защищаемых классов (номера, коды, документы)
+# модель никогда не видит реальное значение и не может знать, что искать частью строки —
+# единственная причина такого запроса — подбор по символу (Правка 1, «закрыть оракул»).
+ИМЕНОВАННЫЕ_КЛАССЫ = frozenset(НУМЕРУЕМЫЕ)
 
 
 class GateError(Exception):
@@ -34,18 +46,42 @@ class Unmasker:
         self._field_class = field_class
 
     def filter(self, expression: str, *, entity: str) -> str:
-        лексемы = lex_filter(expression)
-        переписанное = self._переписать_функции(лексемы, expression, entity=entity)
-        if переписанное is not None:
-            return переписанное
+        значимые = [лексема for лексема in lex_filter(expression) if лексема.kind != "space"]
+        вызовы = self._вызовы_функций(значимые)
 
-        куски: list[str] = []
-        for лексема in лексемы:
-            if лексема.kind != "string":
-                куски.append(лексема.text)
+        занято: set[int] = set()
+        for вызов in вызовы:
+            занято.update(range(вызов["start"], вызов["close"] + 1))
+
+        поля_сравнений = self._поля_сравнений(значимые, занято)
+
+        сегменты: list[tuple[int, int, str]] = []
+        for вызов in вызовы:
+            сегмент = self._обработать_вызов(вызов, значимые, entity=entity)
+            if сегмент is not None:
+                сегменты.append(сегмент)
+
+        for индекс, поле in поля_сравнений.items():
+            сегмент = self._обработать_сравнение(значимые[индекс], поле, entity=entity)
+            if сегмент is not None:
+                сегменты.append(сегмент)
+
+        обработанные = {
+            вызов["literal_idx"] for вызов in вызовы if вызов["literal_idx"] is not None
+        }
+        обработанные |= set(поля_сравнений)
+        for индекс, токен in enumerate(значимые):
+            if токен.kind != "string" or индекс in обработанные or индекс in занято:
                 continue
-            куски.append(self._подставить_в_литерал(лексема, лексемы, entity=entity))
-        return "".join(куски)
+            raise GateError(
+                "filter_syntax",
+                f"не удалось определить поле для литерала «{токен.text}»: структура сравнения "
+                "не распознана",
+                "сравнивайте литерал с полем через eq/ne/gt/ge/lt/le или через substringof/"
+                "startswith/endswith",
+            )
+
+        return _собрать(expression, сегменты)
 
     def value(self, text: str, *, entity: str, field: str) -> str:
         """Одно значение: параметр рецепта, элемент ключа, аргумент действия."""
@@ -71,18 +107,33 @@ class Unmasker:
                 ключ: self._обойти_значение(значение, entity=entity, field=ключ)
                 for ключ, значение in data.items()
             }
-        if isinstance(data, list):
-            return [self.body(элемент, entity=entity) for элемент in data]
-        return data
+        # Верхний уровень без словаря (голая строка или список — например, список значений
+        # табличной части без обёртки-объекта) обходится тем же путём, что и вложенное значение
+        # под пустым именем поля: раньше здесь была отдельная ветка для list, которая рекурсивно
+        # звала body() для каждого элемента, а body() строку саму по себе не обрабатывал вовсе —
+        # токен в такой строке уходил в 1С дословно, обрезанный не отклонялся (Правка 4, ревью
+        # задачи 7). `_обойти_значение` уже умеет строку/словарь/список/прочее в одном месте.
+        return self._обойти_значение(data, entity=entity, field="")
 
     def key(self, value, *, entity: str):
         if isinstance(value, dict):
-            return {
-                ключ: self.value(часть, entity=entity, field=ключ)
-                if isinstance(часть, str)
-                else часть
-                for ключ, часть in value.items()
-            }
+            результат = {}
+            for ключ, часть in value.items():
+                # Испорченный токен, случайно оказавшийся в ИМЕНИ поля составного ключа —
+                # подставлять там нечего (это не значение), но он всё равно обязан вызвать
+                # отказ, а не пройти незамеченным (Правка 5, ревью задачи 7).
+                if is_partial_token(ключ):
+                    raise GateError(
+                        "token_partial",
+                        f"в имени поля составного ключа «{ключ}» обрезанный токен",
+                        "токены непрозрачны: их нельзя достраивать и обрезать",
+                    )
+                результат[ключ] = (
+                    self.value(часть, entity=entity, field=ключ)
+                    if isinstance(часть, str)
+                    else часть
+                )
+            return результат
         return self.value(value, entity=entity, field="") if isinstance(value, str) else value
 
     def _обойти_значение(self, значение, *, entity: str, field: str):
@@ -96,36 +147,106 @@ class Unmasker:
             ]
         return значение
 
-    def _переписать_функции(
-        self, лексемы: list[Token], expression: str, *, entity: str
-    ) -> str | None:
-        """substringof/startswith/endswith с полным токеном → строгое равенство (SPEC §6.7)."""
-        значимые = [лексема for лексема in лексемы if лексема.kind != "space"]
-        if not значимые or значимые[0].kind != "identifier":
-            return None
-        имя = значимые[0].text.lower()
-        if имя not in ФУНКЦИИ_ПОДСТРОКИ or len(значимые) < 6:
-            return None
-        аргументы = [
-            лексема for лексема in значимые[1:] if лексема.kind in ("string", "identifier")
-        ]
-        строковые = [лексема for лексема in аргументы if лексема.kind == "string"]
-        поля = [лексема for лексема in аргументы if лексема.kind == "identifier"]
-        if len(строковые) != 1 or len(поля) != 1:
-            return None
-        целиком = parse_token(_снять_кавычки(строковые[0].text))
-        if not целиком:
-            return None
-        поле = поля[0].text
-        реальное = self._раскрыть(целиком, entity=entity, field=поле)
-        return f"{поле} eq '{_экранировать(реальное)}'"
+    # ------------------------------------------------------------------
+    # Разбор структуры $filter (Правка 1, 3 — ревью задачи 7)
+    # ------------------------------------------------------------------
 
-    def _подставить_в_литерал(self, лексема: Token, лексемы: list[Token], *, entity: str) -> str:
-        содержимое = _снять_кавычки(лексема.text)
-        поле = _поле_слева(лексемы, лексема)
+    def _вызовы_функций(self, значимые: list[Token]) -> list[dict]:
+        """Найти вызовы substringof/startswith/endswith: поле — аргумент-идентификатор,
+        образец — аргумент-строка, независимо от того, какой из них идёт первым."""
+        вызовы: list[dict] = []
+        i, n = 0, len(значимые)
+        while i < n:
+            токен = значимые[i]
+            if (
+                токен.kind == "identifier"
+                and токен.text.lower() in ФУНКЦИИ_ПОДСТРОКИ
+                and i + 1 < n
+                and значимые[i + 1].kind == "paren"
+                and значимые[i + 1].text == "("
+            ):
+                открывающая = i + 1
+                глубина = 1
+                j = открывающая + 1
+                while j < n and глубина > 0:
+                    if значимые[j].kind == "paren":
+                        глубина += 1 if значимые[j].text == "(" else -1
+                    j += 1
+                закрывающая = j - 1
+                внутренние = list(
+                    enumerate(значимые[открывающая + 1 : закрывающая], start=открывающая + 1)
+                )
+                строки = [idx for idx, t in внутренние if t.kind == "string"]
+                поля = [idx for idx, t in внутренние if t.kind == "identifier"]
+                вызовы.append(
+                    {
+                        "name": токен.text.lower(),
+                        "start": i,
+                        "close": закрывающая,
+                        "literal_idx": строки[0] if len(строки) == 1 else None,
+                        "field_idx": поля[0] if len(поля) == 1 else None,
+                    }
+                )
+                i = закрывающая + 1
+                continue
+            i += 1
+        return вызовы
+
+    def _поля_сравнений(self, значимые: list[Token], занято: set[int]) -> dict[int, str]:
+        """Поле для литерала в бинарном сравнении: идентификатор по другую сторону оператора
+        от литерала, в любом порядке (Правка 1)."""
+        поля: dict[int, str] = {}
+        for i in range(len(значимые) - 2):
+            if i in занято or i + 1 in занято or i + 2 in занято:
+                continue
+            левый, оператор, правый = значимые[i], значимые[i + 1], значимые[i + 2]
+            if оператор.kind != "operator" or оператор.text.lower() not in СРАВНЕНИЯ:
+                continue
+            if левый.kind == "identifier" and правый.kind == "string":
+                поля[i + 2] = левый.text
+            elif левый.kind == "string" and правый.kind == "identifier":
+                поля[i] = правый.text
+        return поля
+
+    def _обработать_вызов(
+        self, вызов: dict, значимые: list[Token], *, entity: str
+    ) -> tuple[int, int, str] | None:
+        if вызов["literal_idx"] is None:
+            return None  # нет строкового аргумента — нечего подставлять и нечем злоупотребить
+        if вызов["field_idx"] is None:
+            raise GateError(
+                "filter_syntax",
+                f"не удалось определить поле для {вызов['name']}(...): нужен ровно один "
+                "аргумент-идентификатор рядом с образцом",
+                "функция поиска подстроки сравнивает образец с одним полем",
+            )
+        литерал = значимые[вызов["literal_idx"]]
+        поле = значимые[вызов["field_idx"]].text
+        содержимое = _снять_кавычки(литерал.text)
         целиком = parse_token(содержимое)
         if целиком:
-            return f"'{_экранировать(self._раскрыть(целиком, entity=entity, field=поле))}'"
+            реальное = self._раскрыть(целиком, entity=entity, field=поле)
+            замена = f"{поле} eq '{_экранировать(реальное)}'"
+            return (значимые[вызов["start"]].start, значимые[вызов["close"]].end, замена)
+        self._проверить_литерал_текстом(содержимое, entity=entity, field=поле, оракул=True)
+        return None  # реальный текст на разрешённом классе — вызов остаётся как есть
+
+    def _обработать_сравнение(
+        self, литерал: Token, поле: str, *, entity: str
+    ) -> tuple[int, int, str] | None:
+        содержимое = _снять_кавычки(литерал.text)
+        целиком = parse_token(содержимое)
+        if целиком:
+            замена = f"'{_экранировать(self._раскрыть(целиком, entity=entity, field=поле))}'"
+            return (литерал.start, литерал.end, замена)
+        self._проверить_литерал_текстом(содержимое, entity=entity, field=поле, оракул=False)
+        return None
+
+    def _проверить_литерал_текстом(
+        self, содержимое: str, *, entity: str, field: str, оракул: bool
+    ) -> None:
+        """Литерал — не целый токен: закрыть смешение токена с текстом и (внутри функции
+        поиска подстроки на защищаемом классе) закрыть оракул подбора по символу (Правка 1)."""
         if is_partial_token(содержимое) or (
             TOKEN_RE.search(содержимое) and содержимое.strip() != содержимое
         ):
@@ -140,8 +261,17 @@ class Unmasker:
                 f"в литерале «{содержимое}» токен смешан с текстом",
                 "передайте токен целиком и сравнивайте через eq",
             )
-        self._проверить_реальное_значение(содержимое, entity=entity, field=поле)
-        return лексема.text
+        if оракул:
+            класс = self._field_class(entity, field) if field else None
+            if класс and класс not in ("keep", "scan") and класс not in ИМЕНОВАННЫЕ_КЛАССЫ:
+                raise GateError(
+                    "filter_syntax",
+                    f"поиск по вхождению подстроки запрещён для поля «{field}» класса "
+                    f"{класс}: образец не является токеном целиком",
+                    "модель не знает защищённое значение — передайте токен целиком, запрос "
+                    "перепишется в точное сравнение",
+                )
+        self._проверить_реальное_значение(содержимое, entity=entity, field=field)
 
     def _подставить_внутри_текста(self, текст: str, *, entity: str, field: str) -> str:
         куски, позиция = [], 0
@@ -176,7 +306,9 @@ class Unmasker:
 
         Код ошибки — filter_syntax: отдельного кода для «значение не прошло контрольную сумму»
         в перечне SPEC §5.2 нет, а новые коды заводятся только через ADR с правкой §5.2.
-        Смысл сохранён: запрос от модели синтаксически неприемлем и в 1С не уходит.
+        Смысл сохранён: запрос от модели синтаксически неприемлем и в 1С не уходит. Тот же код
+        переиспользован для «поле не определено» и «оракул подбора» (Правка 1) — по той же
+        причине: это не новый смысл ошибки, а тот же самый «запрос от модели неприемлем».
         """
         класс = self._field_class(entity, field) if field else None
         проверка = ПРОВЕРКИ.get(класс or "")
@@ -199,11 +331,14 @@ def _экранировать(значение: str) -> str:
     return значение.replace("'", "''")
 
 
-def _поле_слева(лексемы: list[Token], литерал: Token) -> str:
-    """Имя поля, стоящее слева от литерала: нужно для выбора варианта и проверки класса."""
-    предыдущие = [
-        лексема
-        for лексема in лексемы
-        if лексема.end <= литерал.start and лексема.kind == "identifier"
-    ]
-    return предыдущие[-1].text if предыдущие else ""
+def _собрать(expression: str, сегменты: list[tuple[int, int, str]]) -> str:
+    """Склеить исходное выражение с точечными заменами (Правка 3): вне сегментов текст остаётся
+    посимвольно как был — переписывание одного вызова не должно задевать соседние условия."""
+    куски: list[str] = []
+    позиция = 0
+    for начало, конец, замена in sorted(сегменты, key=lambda сегмент: сегмент[0]):
+        куски.append(expression[позиция:начало])
+        куски.append(замена)
+        позиция = конец
+    куски.append(expression[позиция:])
+    return "".join(куски)
