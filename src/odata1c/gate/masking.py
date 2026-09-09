@@ -11,7 +11,7 @@ import re
 
 from odata1c.gate.detectors import scan_value
 from odata1c.gate.dictionary import Dictionary
-from odata1c.gate.field_rules import classify_field
+from odata1c.gate.field_rules import classify_field, is_naming_field
 from odata1c.gate.policy import Policy
 from odata1c.gate.tokens import CLASSES
 
@@ -59,7 +59,22 @@ class Masker:
             text, entity=entity, field=field, класс=None, замаскированные=[], force_scan=True
         )
 
-    def _обойти(self, значение, *, entity: str, замаскированные: list[str], field: str = ""):
+    def _обойти(
+        self,
+        значение,
+        *,
+        entity: str,
+        замаскированные: list[str],
+        field: str = "",
+        класс_контейнера: str | None = None,
+    ):
+        """`класс_контейнера` — класс родительского поля-контейнера, если это org/person
+        (правка ревью, 2026-09-09): раскрытый вложенный объект под полем «Контрагент» — это и
+        есть организация, под полем «ФизЛицо»/«ОтветственноеЛицо» — физическое лицо, и поля
+        наименования/ФИО внутри такого объекта наследуют класс поля-контейнера (см.
+        `_класс_вложенного_поля`). Для прочих контейнеров (например, «КонтактнаяИнформация» —
+        не название) остаётся `None`, и внутри работает обычная классификация по паре
+        «сущность и поле», без наследования."""
         if isinstance(значение, dict):
             результат = {}
             for ключ, вложенное in значение.items():
@@ -74,7 +89,7 @@ class Masker:
                     ключ, entity=entity, field=ключ, класс=None, замаскированные=замаскированные
                 )
                 if isinstance(вложенное, str):
-                    класс = self._класс_поля(entity, ключ)
+                    класс = self._класс_вложенного_поля(entity, ключ, класс_контейнера)
                     результат[новый_ключ] = self._обработать_строку(
                         вложенное,
                         entity=entity,
@@ -84,12 +99,22 @@ class Masker:
                     )
                 else:
                     результат[новый_ключ] = self._обойти(
-                        вложенное, entity=entity, замаскированные=замаскированные, field=ключ
+                        вложенное,
+                        entity=entity,
+                        замаскированные=замаскированные,
+                        field=ключ,
+                        класс_контейнера=self._базовый_класс_названия(entity, ключ),
                     )
             return результат
         if isinstance(значение, list):
             return [
-                self._обойти(элемент, entity=entity, замаскированные=замаскированные, field=field)
+                self._обойти(
+                    элемент,
+                    entity=entity,
+                    замаскированные=замаскированные,
+                    field=field,
+                    класс_контейнера=класс_контейнера,
+                )
                 for элемент in значение
             ]
         if isinstance(значение, str):
@@ -98,13 +123,32 @@ class Masker:
             # Раньше такая строка проходила насквозь без проверки (правка ревью, критично: слой
             # тулов будет вызывать `mask()` и для таких форм ответа тоже, тихо возвращать
             # незащищённые данные нельзя).
-            класс = self._класс_поля(entity, field)
+            класс = self._класс_вложенного_поля(entity, field, класс_контейнера)
             return self._обработать_строку(
                 значение, entity=entity, field=field, класс=класс, замаскированные=замаскированные
             )
         return значение
 
-    def _класс_поля(self, entity: str, field: str) -> str | None:
+    def _класс_вложенного_поля(
+        self, entity: str, field: str, класс_контейнера: str | None
+    ) -> str | None:
+        """Класс строкового поля с учётом наследования от контейнера (см. `_обойти`): внутри
+        объекта, лежащего под полем-организацией/лицом, поле наименования/представления/ФИО
+        получает класс контейнера вместо собственной (обычно пустой) классификации — но так же,
+        как и обычное поле названия, понижается до сканирования не на верхнем уровне защиты
+        (правка ревью: раскрытие названия/ФИО не должно обходить понижение уровня)."""
+        if класс_контейнера is not None and is_naming_field(field):
+            return self._понизить_класс_названия(класс_контейнера)
+        return self._класс_поля(entity, field)
+
+    def _базовый_класс_названия(self, entity: str, field: str) -> str | None:
+        """Класс поля-контейнера без понижения по уровню — только если это org/person; иначе
+        `None` (наследовать нечего). Вычисляется тем же путём, что и `_класс_поля`, но до
+        понижения — понижение при наследовании применяется отдельно, к вложенному полю."""
+        класс = self._базовый_класс_поля(entity, field)
+        return класс if класс in КЛАССЫ_НАЗВАНИЙ else None
+
+    def _базовый_класс_поля(self, entity: str, field: str) -> str | None:
         класс = self._policy.sensitivity_of(entity, field)
         if класс is None:
             класс = self._policy.custom_fields().get(field)
@@ -127,8 +171,15 @@ class Masker:
             найдено = classify_field(entity, field, "Edm.String", names_for=set())
             if найдено is not None:
                 класс = найдено[0]
+        return класс
+
+    def _класс_поля(self, entity: str, field: str) -> str | None:
+        класс = self._базовый_класс_поля(entity, field)
         if класс in ("keep", None, "scan"):
             return класс
+        return self._понизить_класс_названия(класс)
+
+    def _понизить_класс_названия(self, класс: str | None) -> str | None:
         if класс in КЛАССЫ_НАЗВАНИЙ and self._mode != "identifiers+names":
             # Названия защищаются только на верхнем уровне (SPEC §6.2), но поле всё равно
             # сканируется: None ведёт к сканированию, keep отключил бы и его. В Description

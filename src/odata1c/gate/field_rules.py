@@ -126,6 +126,16 @@ def _фио_или_наименование(field: str) -> bool:
 )
 
 
+def is_naming_field(field: str) -> bool:
+    """Поле само по себе — наименование или ФИО, без привязки к сущности (тот же признак, что
+    даёт слою 1 право сработать в `classify_field`, вынесен отдельно): `Description` — общее
+    техническое имя представления любого объекта платформы, остальное — по
+    `_фио_или_наименование`. Используется в `gate/masking.py`, чтобы поле раскрытого вложенного
+    объекта (contragent/физлицо внутри документа) наследовало класс родительского поля-контейнера
+    (SPEC §6.5, поправка 2026-09-09)."""
+    return field == "Description" or _фио_или_наименование(field)
+
+
 def classify_field(
     entity: str, field: str, edm_type: str, *, names_for: set[str] | None = None
 ) -> tuple[str, str] | None:
@@ -143,7 +153,7 @@ def classify_field(
             return (класс, "auto")
 
     список = names_for if names_for is not None else set(DEFAULT_NAMES_FOR)
-    if entity in список and (field == "Description" or _фио_или_наименование(field)):
+    if entity in список and is_naming_field(field):
         класс = "person" if entity in СУЩНОСТИ_ФИЗЛИЦ else "org"
         return (класс, "auto")
 
