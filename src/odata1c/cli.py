@@ -21,6 +21,7 @@ from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
 from odata1c.index.repository import IndexCorruptError
@@ -83,6 +84,16 @@ def main(argv: list[str] | None = None) -> int:
         "--force", action="store_true", help="перестроить, даже если $metadata не менялся"
     )
 
+    policy = команды.add_parser("policy", help="политика гейта", parents=[домашний])
+    policy_sub = policy.add_subparsers(dest="подкоманда", required=True)
+    show = policy_sub.add_parser("show", help="показать политику базы", parents=[домашний])
+    show.add_argument("name", help="имя базы")
+
+    reveal = команды.add_parser(
+        "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
+    )
+    reveal.add_argument("token", help="токен вида [[inn:M4T2Q9XZ7K]]")
+
     args = parser.parse_args(argv)
     home = resolve_home(getattr(args, "home", None))
 
@@ -99,6 +110,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
             return cmd_reindex(home, args.name, args.force)
+        if args.команда == "policy" and args.подкоманда == "show":
+            return cmd_policy_show(home, args.name)
+        if args.команда == "reveal":
+            return cmd_reveal(home, args.token)
     except (ConfigError, OdataError, EdmxError, IndexCorruptError) as ошибка:
         # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать
         # $metadata) и IndexCorruptError (файл индекса повреждён — reindex открывает прежний
@@ -198,11 +213,19 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
     # (тот же приём, что в cmd_base_test._проверить_соединение).
     client = Client1C(base)
     try:
-        результат = await reindex(base, client, home, force=force)
+        результат = await reindex(base, client, home, force=force, classifier=classifier_for(base))
     finally:
         await client.close()
 
     print(результат.message)
+    if результат.changed:
+        на_проверку = refresh_policy(home, base)
+        print(f"политика обновлена: {policy_path(home, base.name)}")
+        if на_проверку:
+            print(f"поля классов org и person на проверку ({len(на_проверку)}):")
+            for поле in на_проверку[:20]:
+                print(f"  {поле['entity']}.{поле['field']} → {поле['sensitivity']}")
+            print("ложное срабатывание переводится в keep в разделе fields политики")
     if результат.added_entities:
         print(
             f"добавлены сущности ({len(результат.added_entities)}): "
@@ -226,6 +249,33 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
         )
         for имя in результат.unresolved_entity_sets[:20]:
             print(f"  {имя}")
+    return 0
+
+
+def cmd_policy_show(home: pathlib.Path, name: str) -> int:
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    путь = policy_path(home, base.name)
+    if not путь.exists():
+        print(f"политика ещё не создана; выполните: odata1c reindex {base.name}")
+        return 1
+    print(f"# {путь}")
+    print(путь.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_reveal(home: pathlib.Path, token: str) -> int:
+    """Раскрытие токена только локально: наружу реальное значение не выходит (SPEC §14.5)."""
+    config = load_config(home)
+    словарь = open_dictionary(home, config.daemon.gate_secret)
+    try:
+        значение = словарь.reveal(token)
+    finally:
+        словарь.close()
+    if значение is None:
+        print(f"[token_unknown] токен {token} не найден в словаре")
+        return 1
+    print(значение)
     return 0
 
 
