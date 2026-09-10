@@ -39,6 +39,7 @@ def _сущность(name, kind, russian_kind, base_name, fields) -> ParsedEnti
         base_name=base_name,
         parent_entity=None,
         is_tabular_part=False,
+        is_records=False,
         is_virtual=False,
         virtual_kind=None,
         key_fields=[],

@@ -20,7 +20,6 @@ from lxml import etree
 
 from odata1c.config.home import resolve_home
 from odata1c.config.loader import load_config
-from odata1c.index.naming import VIRTUAL_SUFFIXES
 
 OUT = pathlib.Path("tests/fixtures/edmx")
 REGISTER_KINDS = ("AccumulationRegister", "InformationRegister", "AccountingRegister",
@@ -90,14 +89,6 @@ def report_structure(md: Metadata, edmx: bytes) -> None:
 
     kinds = collections.Counter(name.split("_", 1)[0] for name in md.sets)
     print("виды по префиксу:", dict(kinds.most_common()))
-
-    known = collections.Counter()
-    for name in md.sets:
-        for suffix in VIRTUAL_SUFFIXES:
-            if name.endswith(suffix):
-                known[suffix] += 1
-                break
-    print("известные суффиксы среди EntitySet:", dict(known))
 
     # Хвосты латиницей после имени объекта — их порождает платформа, а не разработчик.
     tails = collections.Counter()

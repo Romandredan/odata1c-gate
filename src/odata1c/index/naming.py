@@ -27,22 +27,6 @@ KINDS: dict[str, str] = {
     "Enum": "Перечисление",
 }
 
-# SPEC §4.2: суффиксы виртуальных таблиц. Порядок от длинных к коротким —
-# страховка на случай, если в будущем суффикс окажется окончанием другого суффикса.
-VIRTUAL_SUFFIXES: tuple[str, ...] = (
-    "BalanceAndTurnovers",
-    "RecordsWithExtDimensions",
-    "ActualActionPeriod",
-    "DrCrTurnovers",
-    "ExtDimensions",
-    "ScheduleData",
-    "SliceFirst",
-    "Turnovers",
-    "SliceLast",
-    "Balance",
-    "Base",
-)
-
 _CAMEL = re.compile(
     r"(?<=[a-zа-яё0-9])(?=[A-ZА-Я])|(?<=[A-ZА-Я])(?=[A-ZА-Я][a-zа-яё])"
     r"|(?<=[a-zA-Z])(?=[а-яА-ЯёЁ])|(?<=[а-яА-ЯёЁ])(?=[a-zA-Z])"
@@ -56,48 +40,20 @@ class EntityName:
     kind: str
     russian_kind: str
     base_name: str
-    parent: str | None = None
-    is_tabular_part: bool = False
-    is_virtual: bool = False
-    virtual_kind: str | None = None
 
 
 def parse_entity_name(name: str) -> EntityName:
+    """Вид — префикс до первого `_`; всё остальное — имя объекта целиком.
+
+    Табличную часть, набор записей регистра и виртуальную таблицу по имени отделить нельзя:
+    подчёркивания и цифры бывают в именах объектов (`InformationRegister_пр_ОчередьДействий`,
+    `ExchangePlan_…_11_0_…`, проба P4). Структуру определяет разбор описания (edmx.py) по списку
+    наборов, ключам и действиям.
+    """
     kind, _, остаток = name.partition("_")
-    russian_kind = KINDS.get(kind, kind)
-    if not остаток:
-        return EntityName(full=name, kind=kind, russian_kind=russian_kind, base_name=name)
-
-    # Проверяю виртуальные суффиксы
-    for suffix in VIRTUAL_SUFFIXES:
-        if остаток.endswith("_" + suffix):
-            base_name = остаток[: -len(suffix) - 1]
-            if base_name:  # Пропускаю, если base_name пуст (например, `_Balance`)
-                return EntityName(
-                    full=name,
-                    kind=kind,
-                    russian_kind=russian_kind,
-                    base_name=base_name,
-                    parent=f"{kind}_{base_name}",
-                    is_virtual=True,
-                    virtual_kind=suffix,
-                )
-
-    # Проверяю табличную часть: ищу первый и второй непустые сегменты (пропускаю пустые)
-    сегменты = [s for s in остаток.split("_") if s]
-    if len(сегменты) >= 2:
-        base_name = сегменты[0]
-        return EntityName(
-            full=name,
-            kind=kind,
-            russian_kind=russian_kind,
-            base_name=base_name,
-            parent=f"{kind}_{base_name}",
-            is_tabular_part=True,
-        )
-
-    # Просто имя с префиксом, без табличной части
-    return EntityName(full=name, kind=kind, russian_kind=russian_kind, base_name=остаток)
+    return EntityName(
+        full=name, kind=kind, russian_kind=KINDS.get(kind, kind), base_name=остаток or name
+    )
 
 
 def normalize(text: str) -> str:

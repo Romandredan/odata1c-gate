@@ -16,7 +16,13 @@ from lxml import etree
 from odata1c.index.naming import parse_entity_name
 
 ПОЛЕ_ОПИСАНИЯ = "Description"
-СЛУЖЕБНЫЕ_ТИПЫ = ("Edm.Guid",)
+
+# Регистратор регистра, подчинённого документу: один тип регистратора — Edm.Guid с суффиксом
+# _Key; несколько типов — Recorder без суффикса, составная ссылка
+# (см. _пометить_ссылки_и_составные).
+РЕГИСТРАТОРЫ = ("Recorder", "Recorder_Key")
+НАБОР_ЗАПИСЕЙ = "RecordType"
+КЛЮЧ_ТАБЛИЧНОЙ_ЧАСТИ = frozenset({"Ref_Key", "LineNumber"})
 
 
 СОВЕТ_ПРИ_ОШИБКЕ_РАЗБОРА = (
@@ -66,6 +72,7 @@ class ParsedEntity:
     base_name: str
     parent_entity: str | None
     is_tabular_part: bool
+    is_records: bool
     is_virtual: bool
     virtual_kind: str | None
     key_fields: list[str]
@@ -100,7 +107,26 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
             # индекса не приняло это молча за исчезновение объекта.
             нераспознанные_наборы.append(имя_набора)
             continue
-        сущности.append(_собрать_сущность(имя_набора, поля))
+        родитель = _родитель(имя_набора, наборы)
+        записи = родитель is not None and родитель[1] == НАБОР_ЗАПИСЕЙ
+        табличная = родитель is not None and not записи and set(поля[1]) == КЛЮЧ_ТАБЛИЧНОЙ_ЧАСТИ
+        основной = родитель[0] if записи else имя_набора
+        ключи_основного = (типы.get(наборы.get(основной, "")) or поля)[1]
+        сущности.append(
+            _собрать_сущность(
+                имя_набора,
+                поля,
+                parent=родитель[0] if (записи or табличная) else None,
+                is_tabular_part=табличная,
+                is_records=записи,
+                has_recorder=any(ключ in РЕГИСТРАТОРЫ for ключ in ключи_основного),
+                base_name=(
+                    parse_entity_name(родитель[0]).base_name
+                    if (записи or табличная)
+                    else parse_entity_name(имя_набора).base_name
+                ),
+            )
+        )
     return ParsedMetadata(
         entities=сущности,
         actions=действия,
@@ -145,23 +171,26 @@ def _разобрать_типы(data: bytes) -> dict[str, tuple[list[ParsedFiel
 
 
 def _пометить_ссылки_и_составные(поля: list[ParsedField]) -> None:
-    """Ссылочные и составные поля (SPEC §9).
+    """Ссылочные и составные поля (SPEC §4.2, поправка 2026-09-10; §9).
 
-    Поле — кандидат в ссылки, если у него тип идентификатора (Edm.Guid). Составной тип
-    опознаётся по наличию парного поля с суффиксом "_Type" при том же базовом имени
-    (суффикс "_Key", если он есть, при сравнении отбрасывается: "Владелец_Key" ищет
-    "Владелец_Type", "Recorder" без "_Key" ищет "Recorder_Type" — это регистратор
-    регистра с несколькими типами регистраторов, тоже составная ссылка).
+    `Edm.Guid` с суффиксом `_Key` — ссылка одного типа. Составное поле опознаётся по парному
+    `<база>_Type` (суффикс `_Key` при сравнении отбрасывается): у ссылки составного типа в 1С тип
+    `Edm.String` — значение приходит строкой GUID, в `_Type` имя набора; для примитивного типа
+    в поле само значение (проба P4). Такое поле помечается ссылкой-кандидатом; решение по
+    конкретному значению принимает гейт.
     """
     имена = {поле.name for поле in поля}
     for поле in поля:
-        if поле.edm_type not in СЛУЖЕБНЫЕ_ТИПЫ:
+        if поле.name.endswith("_Type"):
             continue
-        базовое_имя = поле.name[: -len("_Key")] if поле.name.endswith("_Key") else поле.name
+        базовое_имя = поле.name.removesuffix("_Key")
         составное = f"{базовое_имя}_Type" in имена
-        if поле.name.endswith("_Key") or составное:
+        if поле.edm_type == "Edm.Guid":
+            поле.is_ref = поле.name.endswith("_Key") or составное
+            поле.is_composite = составное
+        elif поле.edm_type == "Edm.String" and составное:
             поле.is_ref = True
-        поле.is_composite = составное
+            поле.is_composite = True
 
 
 # Узлы, которые ко времени завершения полностью разобраны в этом проходе и больше не нужны:
@@ -219,27 +248,57 @@ def _без_пространства(значение: str) -> str:
     return значение.rsplit(".", 1)[-1] if значение else ""
 
 
-def _собрать_сущность(имя: str, поля_и_ключи: tuple[list[ParsedField], list[str]]) -> ParsedEntity:
+def _родитель(имя: str, наборы) -> tuple[str, str] | None:
+    """Самый длинный опубликованный набор P, для которого имя == P + "_" + хвост.
+
+    Поиск справа налево: `Catalog_A_B_C` сначала проверяет `Catalog_A_B`, затем `Catalog_A`.
+    Имя объекта с подчёркиванием (`InformationRegister_пр_ОчередьДействий`) родителя не находит:
+    набора `InformationRegister_пр` нет.
+    """
+    позиция = len(имя)
+    while (позиция := имя.rfind("_", 0, позиция)) > 0:
+        кандидат = имя[:позиция]
+        if кандидат in наборы:
+            хвост = имя[позиция + 1 :]
+            return (кандидат, хвост) if хвост else None
+    return None
+
+
+def _собрать_сущность(
+    имя: str,
+    поля_и_ключи: tuple[list[ParsedField], list[str]],
+    *,
+    parent: str | None,
+    is_tabular_part: bool,
+    is_records: bool,
+    has_recorder: bool,
+    base_name: str,
+    is_virtual: bool = False,
+    virtual_kind: str | None = None,
+) -> ParsedEntity:
     поля, ключи = поля_и_ключи
-    разобранное_имя = parse_entity_name(имя)
+    вид = parse_entity_name(имя)
     имена_полей = {поле.name for поле in поля}
-    has_recorder = "Recorder" in ключи
-    регистр_сведений = разобранное_имя.kind == "InformationRegister"
     return ParsedEntity(
         name=имя,
-        kind=разобранное_имя.kind,
-        russian_kind=разобранное_имя.russian_kind,
-        base_name=разобранное_имя.base_name,
-        parent_entity=разобранное_имя.parent,
-        is_tabular_part=разобранное_имя.is_tabular_part,
-        is_virtual=разобранное_имя.is_virtual,
-        virtual_kind=разобранное_имя.virtual_kind,
+        kind=вид.kind,
+        russian_kind=вид.russian_kind,
+        base_name=base_name,
+        parent_entity=parent,
+        is_tabular_part=is_tabular_part,
+        is_records=is_records,
+        is_virtual=is_virtual,
+        virtual_kind=virtual_kind,
         key_fields=list(ключи),
         description_field=ПОЛЕ_ОПИСАНИЯ if ПОЛЕ_ОПИСАНИЯ in имена_полей else None,
         has_posted="Posted" in имена_полей,
         has_recorder=has_recorder,
-        is_independent_register=регистр_сведений
-        and not has_recorder
-        and not разобранное_имя.is_virtual,
+        # Независимость — свойство регистра, а не набора: у набора записей подчинённого регистра
+        # регистратора в ключе может не быть (СтоимостьТоваров_RecordType), признак берётся
+        # у основного набора через has_recorder. Инвариант 3: ложная независимость открывает
+        # физическое удаление подчинённому регистру.
+        is_independent_register=вид.kind == "InformationRegister"
+        and not is_virtual
+        and not has_recorder,
         fields=поля,
     )

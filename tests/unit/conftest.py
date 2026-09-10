@@ -13,6 +13,12 @@ def edmx_synthetic() -> bytes:
     return (ОБРАЗЦЫ / "synthetic.edmx").read_bytes()
 
 
+@pytest.fixture
+def edmx_ut_real() -> bytes:
+    """Урезанный реальный $metadata УТ (проба P4): структура, которую синтетика не воспроизводит."""
+    return (ОБРАЗЦЫ / "ut-real.edmx").read_bytes()
+
+
 def обёртка_эдмкс(тело_контейнера: str) -> bytes:
     """Минимальный валидный EDMX с произвольным содержимым EntityContainer — для сценариев,
     которые не должны затрагивать общую фикстуру synthetic.edmx.

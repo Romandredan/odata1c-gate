@@ -10,47 +10,12 @@ def test_справочник():
     assert имя.kind == "Catalog"
     assert имя.russian_kind == "Справочник"
     assert имя.base_name == "Контрагенты"
-    assert имя.parent is None
-    assert имя.is_tabular_part is False
-    assert имя.is_virtual is False
-
-
-def test_табличная_часть_документа():
-    имя = parse_entity_name("Document_РеализацияТоваровУслуг_Товары")
-    assert имя.kind == "Document"
-    assert имя.base_name == "РеализацияТоваровУслуг"
-    assert имя.parent == "Document_РеализацияТоваровУслуг"
-    assert имя.is_tabular_part is True
-    assert имя.is_virtual is False
-
-
-def test_виртуальная_таблица_остатков():
-    имя = parse_entity_name("AccumulationRegister_ТоварыНаСкладах_Balance")
-    assert имя.kind == "AccumulationRegister"
-    assert имя.parent == "AccumulationRegister_ТоварыНаСкладах"
-    assert имя.is_virtual is True
-    assert имя.virtual_kind == "Balance"
-    assert имя.is_tabular_part is False
-
-
-def test_виртуальная_таблица_среза_последних():
-    имя = parse_entity_name("InformationRegister_КурсыВалют_SliceLast")
-    assert имя.is_virtual is True
-    assert имя.virtual_kind == "SliceLast"
-    assert имя.parent == "InformationRegister_КурсыВалют"
-
-
-def test_составной_суффикс_остатков_и_оборотов():
-    имя = parse_entity_name("AccumulationRegister_Продажи_BalanceAndTurnovers")
-    assert имя.virtual_kind == "BalanceAndTurnovers"
-    assert имя.parent == "AccumulationRegister_Продажи"
 
 
 def test_неизвестный_префикс_не_ломает_разбор():
     имя = parse_entity_name("СовершенноНовыйВид_Объект")
     assert имя.kind == "СовершенноНовыйВид"
     assert имя.russian_kind == "СовершенноНовыйВид"
-    assert имя.parent is None
 
 
 def test_имя_без_подчёркивания():
@@ -59,14 +24,10 @@ def test_имя_без_подчёркивания():
     assert имя.base_name == "Catalog"
 
 
-def test_двойное_подчёркивание_в_имени():
-    """Пустые сегменты пропускаются, базовое имя не пустое, родитель указывает на реальное имя."""
-    имя = parse_entity_name("Document__Заказ__Товары")
-    assert имя.kind == "Document"
-    assert имя.base_name == "Заказ"
-    assert имя.parent == "Document_Заказ"
-    assert имя.is_tabular_part is True
-    assert имя.is_virtual is False
+def test_подчёркивание_в_имени_объекта_остаётся_в_имени():
+    имя = parse_entity_name("InformationRegister_пр_ОчередьДействий")
+    assert имя.kind == "InformationRegister"
+    assert имя.base_name == "пр_ОчередьДействий"
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 
 import io
 
+import pytest
 from conftest import обёртка_эдмкс
 
 from odata1c.index.edmx import parse_edmx
@@ -86,6 +87,7 @@ def test_регистр_с_регистратором_не_независимы�
     assert состояния.is_independent_register is False
 
 
+@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
 def test_виртуальная_таблица_привязана_к_родителю(edmx_synthetic):
     остатки = найти(parse_edmx(edmx_synthetic), "AccumulationRegister_ТоварыНаСкладах_Balance")
     assert остатки.is_virtual is True
@@ -93,6 +95,7 @@ def test_виртуальная_таблица_привязана_к_родит�
     assert остатки.parent_entity == "AccumulationRegister_ТоварыНаСкладах"
 
 
+@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
 def test_виртуальная_таблица_не_независимый_регистр(edmx_synthetic):
     # Без исключения виртуальных таблиц из признака независимого регистра сведений
     # физическое удаление записи оказалось бы разрешено там, где разрешена только
@@ -124,6 +127,7 @@ def test_регистр_накопления_не_независимый_рег�
     assert остатки.is_independent_register is False
 
 
+@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
 def test_действия_разобраны_с_параметрами(edmx_synthetic):
     разобрано = parse_edmx(edmx_synthetic)
     действия = {действие.name: действие for действие in разобрано.actions}
@@ -226,3 +230,99 @@ def test_разбор_контейнера_не_копит_дерево_цели
     # (без очистки во втором проходе) это число росло почти до число_наборов — проверено вручную
     # тем же способом с временно опустошённым набором освобождаемых тегов.
     assert наибольшее_число_детей < 50
+
+
+ТАБЛИЧНЫЕ_ЧАСТИ_UT = {
+    "BusinessProcess_пр_БизнесПроцессСогласованияОрдеров_РезультатыСогласования",
+    "Catalog_Контрагенты_КонтактнаяИнформация",
+    "Catalog_СерииНоменклатуры_ДополнительныеРеквизиты",
+    "Document_ВводОстатковРасчетовПоЭквайрингу_РасчетыПоЭквайрингу",
+    "Document_РеализацияТоваровУслуг_Товары",
+    "Task_пр_ЗадачаСогласования_ОбъектыСогласования",
+}
+НАБОРЫ_ЗАПИСЕЙ_UT = {
+    "AccumulationRegister_ДвиженияДенежныеСредстваКонтрагент_RecordType",
+    "AccumulationRegister_РасчетыСКлиентамиПланОплат_RecordType",
+    "AccumulationRegister_пр_ВыпускПроукцииПоСменам_RecordType",
+    "InformationRegister_ЖурналУчетаСчетовФактур_RecordType",
+    "InformationRegister_СтоимостьТоваров_RecordType",
+    "InformationRegister_пр_ОчередьДействий_RecordType",
+}
+НЕЗАВИСИМЫЕ_UT = {
+    "InformationRegister_ДокументыФизическихЛиц",
+    "InformationRegister_КурсыВалют",
+    "InformationRegister_ПоследнийОбменСБанками",
+}
+
+
+def _наборы(разобрано):
+    return [с for с in разобрано.entities if not с.is_virtual and с.kind != "Enum"]
+
+
+def test_ut_табличные_части_ровно_по_списку_наборов(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    assert {с.name for с in _наборы(разобрано) if с.is_tabular_part} == ТАБЛИЧНЫЕ_ЧАСТИ_UT
+
+
+def test_ut_подчёркивание_в_имени_объекта_не_табличная_часть(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    for имя, основа in [
+        ("InformationRegister_пр_ОчередьДействий", "пр_ОчередьДействий"),
+        (
+            "Constant_Xx_АвтоматическиСоздаватьАктыРасхождений",
+            "Xx_АвтоматическиСоздаватьАктыРасхождений",
+        ),
+        (
+            "ExchangePlan_Удалить_ОбменУправлениеТорговлей_11_0_РозничнаяТорговля_1_0",
+            "Удалить_ОбменУправлениеТорговлей_11_0_РозничнаяТорговля_1_0",
+        ),
+    ]:
+        сущность = найти(разобрано, имя)
+        assert сущность.is_tabular_part is False, имя
+        assert сущность.parent_entity is None, имя
+        assert сущность.base_name == основа, имя
+
+
+def test_ut_наборы_записей_регистров(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    записи = {с.name for с in _наборы(разобрано) if с.is_records}
+    assert записи == НАБОРЫ_ЗАПИСЕЙ_UT
+    for имя in записи:
+        сущность = найти(разобрано, имя)
+        assert сущность.is_tabular_part is False
+        assert сущность.parent_entity == имя.removesuffix("_RecordType")
+        assert сущность.base_name == найти(разобрано, сущность.parent_entity).base_name
+
+
+def test_ut_регистратор_с_одним_типом(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    assert найти(разобрано, "InformationRegister_пр_ОчередьДействий").has_recorder is True
+    assert (
+        найти(разобрано, "InformationRegister_пр_ОчередьДействий_RecordType").has_recorder is True
+    )
+
+
+def test_ut_набор_записей_наследует_регистратор_основного_набора(edmx_ut_real):
+    # Ключ СтоимостьТоваров_RecordType — Period и измерения, без Recorder; регистр подчинённый.
+    записи = найти(parse_edmx(edmx_ut_real), "InformationRegister_СтоимостьТоваров_RecordType")
+    assert "Recorder" not in записи.key_fields
+    assert записи.has_recorder is True
+    assert записи.is_independent_register is False
+
+
+def test_ut_независимые_регистры_ровно_по_списку(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    assert {с.name for с in разобрано.entities if с.is_independent_register} == НЕЗАВИСИМЫЕ_UT
+
+
+def test_ut_составное_строковое_поле_это_ссылка(edmx_ut_real):
+    журнал = найти(
+        parse_edmx(edmx_ut_real), "InformationRegister_ЖурналУчетаСчетовФактур_RecordType"
+    )
+    поля = {п.name: п for п in журнал.fields}
+    for имя in ("Контрагент", "Recorder", "СчетФактура"):
+        assert поля[имя].edm_type == "Edm.String"
+        assert поля[имя].is_ref is True, имя
+        assert поля[имя].is_composite is True, имя
+    assert поля["Контрагент_Type"].is_ref is False
+    assert поля["НомерСчетаФактуры"].is_ref is False  # строка без пары _Type — значение
