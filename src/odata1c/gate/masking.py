@@ -15,7 +15,7 @@ from odata1c.gate.detectors import scan_value
 from odata1c.gate.dictionary import Dictionary, normalize_text_with_map
 from odata1c.gate.field_rules import classify_field, is_naming_field
 from odata1c.gate.policy import Policy
-from odata1c.gate.tokens import CLASSES, find_tokens, overlaps_token
+from odata1c.gate.tokens import CLASSES, blank_tokens
 
 # Вырезается из ответа всегда (SPEC §5.1).
 СЛУЖЕБНЫЕ_ПОЛЯ = ("odata.metadata", "odata.type", "DataVersion")
@@ -306,21 +306,21 @@ class Masker:
         исходной строки на символах, чей нижний регистр разворачивается в несколько знаков
         (например, `İ`, U+0130) — с картой позиций обе проблемы решены одним приёмом.
 
-        Совпадение, попадающее внутрь уже поставленного токена (`tokens.find_tokens` /
-        `overlaps_token`), пропускается — хвост токена реквизита набран из тех же символов, что и
+        Уже стоящие в строке токены закрываются заглушкой той же длины до поиска
+        (`tokens.blank_tokens`): хвост токена реквизита набран из тех же символов, что и
         приведённое к нижнему регистру латинское название, и вариант мог бы разрезать токен
-        (ревью 2026-09-09, дыра 8).
+        (ревью 2026-09-09, дыра 8), а вариант, зацепивший скобку токена, подавлял более короткий
+        вариант названия рядом (Ruling 21 M1c, хвост 2) — с заглушкой совпасть с токеном нечему.
         """
         if self._mode != "identifiers+names":
             return текст
         self._обновить_автомат_названий()
         if self._названия_автомат is None:
             return текст
-        нормализованный, карта = normalize_text_with_map(текст)
+        нормализованный, карта = normalize_text_with_map(blank_tokens(текст))
         совпадения = self._названия_автомат.find_matches_as_indexes(нормализованный)
         if not совпадения:
             return текст
-        занятые_токенами = find_tokens(текст)
         куски: list[str] = []
         норм_позиция = 0
         текст_позиция = 0
@@ -332,9 +332,6 @@ class Masker:
                 continue
             текст_начало = карта[начало][0]
             текст_конец = карта[конец - 1][1]
-            if overlaps_token(текст_начало, текст_конец, занятые_токенами):
-                норм_позиция = конец
-                continue
             куски.append(текст[текст_позиция:текст_начало])
             куски.append(токен)
             норм_позиция = конец

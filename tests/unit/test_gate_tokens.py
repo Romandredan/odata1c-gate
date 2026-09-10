@@ -3,6 +3,7 @@
 import pytest
 
 from odata1c.gate.tokens import (
+    blank_tokens,
     find_tokens,
     is_partial_token,
     make_token,
@@ -53,6 +54,15 @@ def test_нормализация_названий_и_фио_приравнив�
     assert normalize_value(класс, "ООО Василёк") == "ооо василек"
     assert normalize_value(класс, "ООО Василек") == "ооо василек"
     assert normalize_value(класс, "ЁЛКИН Пётр") == "елкин петр"
+
+
+def test_заглушка_токенов_сохраняет_длину_и_позиции():
+    """`blank_tokens`: каждый целый токен — заглушкой той же длины, остальное посимвольно
+    прежнее; обрезанный токен не трогается (он не токен)."""
+    текст = "ИНН [[inn:62NZE46KVB]], [[org:7]]x [[inn:"
+    ожидаемый = "ИНН " + "\x00" * 18 + ", " + "\x00" * 9 + "x [[inn:"
+    assert blank_tokens(текст) == ожидаемый
+    assert len(blank_tokens(текст)) == len(текст)
 
 
 def test_ё_вне_названий_и_фио_не_сворачивается():
