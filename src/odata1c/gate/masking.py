@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 from ahocorasick_rs import AhoCorasick, MatchKind
 
@@ -20,6 +21,10 @@ from odata1c.gate.tokens import CLASSES, find_tokens, overlaps_token
 СЛУЖЕБНЫЕ_ПОЛЯ = ("odata.metadata", "odata.type", "DataVersion")
 ДВОИЧНЫЕ_СУФФИКСЫ = ("_Base64Data", "ХранилищеЗначения")
 КЛАССЫ_НАЗВАНИЙ = ("org", "person")
+# SPEC §6.4, сноска ⁴; инвариант 6: GUID не защищается ни на одном уровне. Значение составного
+# поля (`Контрагент` + `Контрагент_Type`) для ссылки — строка GUID; класс поля по имени (org)
+# относится к примитивному значению того же поля, а не к ссылке.
+GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _ссылочный_ключ(поле: str) -> bool:
@@ -220,6 +225,8 @@ class Masker:
         force_scan: bool = False,
     ) -> str:
         if not текст:
+            return текст
+        if GUID_RE.fullmatch(текст):
             return текст
         if класс == "keep":
             return текст
