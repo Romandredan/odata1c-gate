@@ -11,6 +11,7 @@ import base64
 import contextlib
 import ctypes
 import importlib.resources
+import logging
 import os
 import pathlib
 import secrets
@@ -19,6 +20,8 @@ import time
 import yaml
 
 from odata1c.config.loader import ConfigError
+
+_log = logging.getLogger(__name__)
 
 # Общее для `cmd_init` и лаунчера (`odata1c mcp` на чистой машине — SPEC §2.1 п. 1, план M1d,
 # задача 6, раунд правок 1, находка 3а): оба должны уметь досоздать то, чего не хватает домашнему
@@ -328,6 +331,15 @@ def _освободить_замок(lock_path: pathlib.Path, *, попыток:
             time.sleep(пауза)
         else:
             return
+    # Все попытки исчерпаны — файл остался на диске с номером ЖИВОГО процесса (нашим), и снять
+    # его по владельцу теперь нельзя: следующие запуски на этом домашнем каталоге будут ждать
+    # полный таймаут и получать отказ. Случай исчезающе редкий, но молчать о нём нельзя — иначе
+    # причина отказа не восстанавливается вообще ничем.
+    _log.warning(
+        "не удалось убрать файл замка %s: он остался на диске, и следующий запуск шлюза будет "
+        "ждать его полный таймаут — удалите файл, если ни один процесс шлюза не запущен",
+        lock_path,
+    )
 
 
 def _замок_занят(lock_path: pathlib.Path, таймаут: float) -> ConfigError:
