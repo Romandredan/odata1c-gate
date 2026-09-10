@@ -379,3 +379,45 @@ def test_родитель_опубликован_но_тип_не_резолви
     assert записи.parent_entity == "InformationRegister_X"
     assert записи.has_recorder is True  # консервативно: тип родителя не резолвится
     assert записи.is_independent_register is False
+
+
+# Раунд правок 2 (Important, инвариант 3): _родитель ищет любой опубликованный префикс — для
+# набора записей регистра это может подобрать чужой, более короткий (но опубликованный) набор
+# вместо настоящего, неопубликованного основного. Поиск родителя по префиксу для `_RecordType`
+# больше не используется: основной набор — ровно `имя.removesuffix("_RecordType")`.
+
+_ТИП_A_И_ЗАПИСЕЙ_A_B = """
+      <EntityType Name="InformationRegister_A">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+      </EntityType>
+      <EntityType Name="InformationRegister_A_B_RecordType">
+        <Key>
+          <PropertyRef Name="Period"/>
+          <PropertyRef Name="Измерение_Key"/>
+        </Key>
+        <Property Name="Period" Type="Edm.DateTime" Nullable="false"/>
+        <Property Name="Измерение_Key" Type="Edm.Guid" Nullable="false"/>
+      </EntityType>
+"""
+
+
+def test_короткий_чужой_префикс_не_становится_родителем_записи():
+    # InformationRegister_A опубликован и резолвится — но это НЕ основной набор для
+    # InformationRegister_A_B_RecordType (основной был бы InformationRegister_A_B, а он не
+    # опубликован). Воспроизведение ревьюера: старый _родитель находил "_A" как самый длинный
+    # ПОДХОДЯЩИЙ (то есть опубликованный) префикс и присваивал хвост "B_RecordType" — не
+    # записи, не осиротевшая запись, has_recorder по собственным ключам (без Recorder) →
+    # is_independent_register=True.
+    edmx = обёртка_эдмкс_с_типами(
+        _ТИП_A_И_ЗАПИСЕЙ_A_B,
+        '<EntitySet Name="InformationRegister_A" EntityType="StandardODATA.InformationRegister_A"/>'
+        '<EntitySet Name="InformationRegister_A_B_RecordType"'
+        ' EntityType="StandardODATA.InformationRegister_A_B_RecordType"/>',
+    )
+    записи = найти(parse_edmx(edmx), "InformationRegister_A_B_RecordType")
+    assert записи.is_records is True
+    assert записи.parent_entity is None  # InformationRegister_A_B не опубликован
+    assert записи.has_recorder is True  # консервативно: независимость не доказана
+    assert записи.is_independent_register is False
+    assert записи.base_name == "A_B"
