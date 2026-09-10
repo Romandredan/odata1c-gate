@@ -68,6 +68,44 @@ def test_отрицательный_skip_запрещён(индекс_ut, ли�
     assert ошибка.value.code == "params_invalid"
 
 
+def test_top_булево_запрещено(индекс_ut, лимиты):
+    # bool — подкласс int в Python; без явной проверки top=True тихо ушёл бы в 1С как $top=True.
+    with pytest.raises(QueryError) as ошибка:
+        build_query(
+            индекс_ut.describe("Catalog_Валюты"),
+            describe=индекс_ut.describe,
+            limits=лимиты,
+            virtual_timeout_s=180,
+            top=True,
+        )
+    assert ошибка.value.code == "params_invalid"
+
+
+def test_skip_строка_запрещена(индекс_ut, лимиты):
+    with pytest.raises(QueryError) as ошибка:
+        build_query(
+            индекс_ut.describe("Catalog_Валюты"),
+            describe=индекс_ut.describe,
+            limits=лимиты,
+            virtual_timeout_s=180,
+            skip="5",
+        )
+    assert ошибка.value.code == "params_invalid"
+
+
+def test_top_ноль_допустим(индекс_ut, лимиты):
+    # Проба P4: $top=0 отвечает 200 с пустым value — не то же самое, что «top не передан».
+    спец = build_query(
+        индекс_ut.describe("Catalog_Валюты"),
+        describe=индекс_ut.describe,
+        limits=лимиты,
+        virtual_timeout_s=180,
+        top=0,
+    )
+    assert спец.params["$top"] == "0"
+    assert спец.top == 0
+
+
 def test_expand_добавляет_путь_в_select(индекс_ut, лимиты):
     спец = build_query(
         индекс_ut.describe("Document_РеализацияТоваровУслуг"),

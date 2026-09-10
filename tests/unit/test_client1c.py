@@ -1,6 +1,8 @@
 """Клиент 1С: формирование запроса, сеанс, семафор, перевод ошибок."""
 
 import asyncio
+import urllib.parse
+from unittest import mock
 
 import httpx
 import pytest
@@ -188,6 +190,103 @@ async def test_таймаут_одного_запроса_называет_фа�
 
     assert ошибка.value.code == "timeout"
     assert "0.01" in ошибка.value.message
+
+
+# Раунд правок 1, задача 2 плана M1d (ревью Critical): QuerySpec.path — читаемый OData-текст,
+# не экранированный под URL (odata_query.py собирает его дословно так, как проверяют тесты
+# брифа). Экранирование — обязанность Client1C перед отправкой (_экранировать_путь в client.py).
+# Символы `?`/`#`/`&`, попавшие в путь из значения литерала (Condition, строковый ключ), без
+# экранирования httpx счёл бы началом query/query-разделителем и обрезал бы путь молча.
+#
+# Известный предел этой проверки: `_экранировать_путь` кодирует весь путь одним проходом и не
+# отличает `(`/`)`/`,`/`=`/`'`, которые сам построитель вставил как разметку (вызов виртуальной
+# таблицы, разделители аргументов, OData-кавычка), от тех же символов внутри значения литерала —
+# отличить их можно только на этапе сборки (odata_query.py), а туда экранирование сознательно не
+# перенесено: тесты брифа сверяют QuerySpec.path дословно, включая кириллицу и удвоенные
+# кавычки, без URL-экранирования. Поэтому `(`/`)`/`,`/`=`/`'` внутри значения долетают до 1С
+# буквально, и это вопрос к разбору строкового литерала парсером 1С, а не к обрезке URL — тесты
+# ниже проверяют то, для чего экранирование действительно нужно (`?`/`#`/`&`/`%`/перевод строки
+# не режут путь и не всплывают как отдельный параметр query), а не полную изоляцию значения.
+
+
+@respx.mock
+async def test_опасные_символы_в_литерале_пути_не_режут_путь():
+    """`Condition` с `?`, `#`, `&`, `%` и переводом строки — путь доходит целиком: ни один из
+    этих символов не стал query-разделителем (`params.keys() == {"$format"}`), хвост с
+    `Period=…` цел после декодирования пути обратно. `)`/`,` в значении здесь тоже есть (для
+    реалистичности содержимого), но сравнение через `unquote` не отличает их от таких же
+    символов, которые сам построитель вставляет как разметку, — оно не доказывает, что они
+    были закодированы (см. комментарий выше)."""
+    условие = "a?b#c&d%e\ng),h"
+    хвост_пути = f"Condition='{условие}',Period=datetime'2026-09-01T00:00:00')"
+    путь = f"AccumulationRegister_X_Balance({хвост_пути}"
+    route = respx.route(url__regex=r".*").mock(return_value=httpx.Response(200, json={"value": []}))
+    client = Client1C(база())
+    await client.get(путь)
+    await client.close()
+
+    запрос = route.calls[0].request
+    # Ничего из значения литерала не осело в query — там только $format (add_format=True).
+    assert set(запрос.url.params.keys()) == {"$format"}
+    декодированный_путь = urllib.parse.unquote(str(запрос.url.path))
+    assert декодированный_путь.endswith(хвост_пути)
+
+
+@respx.mock
+async def test_ключ_строка_со_слэшем_и_вопросом_не_режет_путь():
+    """Составной ключ со строковым полем (`Recorder` регистра — `Edm.String`, не `Edm.Guid`,
+    формат не проверяется `odata_literal`) может содержать `/` и `?` — путь всё равно доходит
+    целиком, символы не превращаются в лишние сегменты или query."""
+    путь = "AccumulationRegister_X(Recorder='a/b?c',Recorder_Type='StandardODATA.Document_Y')"
+    route = respx.route(url__regex=r".*").mock(return_value=httpx.Response(200, json={"value": []}))
+    client = Client1C(база())
+    await client.get(путь)
+    await client.close()
+
+    запрос = route.calls[0].request
+    assert set(запрос.url.params.keys()) == {"$format"}
+    декодированный_путь = urllib.parse.unquote(str(запрос.url.path))
+    assert декодированный_путь.endswith(
+        "Recorder='a/b?c',Recorder_Type='StandardODATA.Document_Y')"
+    )
+
+
+@respx.mock
+async def test_metadata_доходит_буквальной_строкой_не_процентами():
+    """`$` — легальный символ пути (RFC 3986 sub-delim), а не только начало `$select`/`$filter`
+    построителя запросов: `get_raw("$metadata", ...)` (index/reindex.py, cli.py) — единственный
+    путь этого клиента без литералов виртуальной таблицы, и он обязан дойти как буквальная
+    строка `$metadata`, а не `%24metadata`. Проверка через `raw_path` байт-в-байт, а не через
+    `respx`-сопоставление маршрута: respx сверяет URL по нормализованной форме и не отличил бы
+    `$metadata` от `%24metadata` как цель — раунд правок 1 подтвердил это отдельным прогоном
+    (существующие тесты test_index_reindex.py остаются зелёными в обоих случаях)."""
+    route = respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=b"<edmx/>"))
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    client = Client1C(база())
+    await client.get_raw("$metadata", accept="application/xml", add_format=False)
+    await client.close()
+
+    assert route.calls[0].request.url.raw_path == b"/ut/odata/standard.odata/$metadata"
+
+
+async def test_невалидный_url_даёт_odata_error_а_не_голое_исключение():
+    """Если бы экранирование где-то обошли (или ослабили), httpx поднял бы `httpx.InvalidURL` —
+    исключение, которое НЕ является подклассом `httpx.HTTPError` и без отдельного перехвата
+    пролетело бы мимо `_request` голым исключением (глобальное ограничение плана: тул не должен
+    ронять исключение без кода/подсказки). Проверяется перехват напрямую — подменой
+    `self._client.request`, а не реальным `\\n` в пути: `_экранировать_путь` кодирует перевод
+    строки в `%0A` раньше, чем путь доходит до httpx, так что естественным путём это исключение
+    больше не воспроизвести."""
+    client = Client1C(база())
+    client._client.request = mock.AsyncMock(side_effect=httpx.InvalidURL("плохой путь"))
+    with pytest.raises(OdataError) as ошибка:
+        await client.get("Catalog_Валюты")
+    # _release_session_claim снял признак начатого сеанса — close() не пойдёт в IBSession:finish
+    # тем же (замоканным) .request(): вызов ограничится aclose(), который не затронут подменой.
+    await client.close()
+
+    assert ошибка.value.code == "odata_error"
+    assert "плохой путь" in ошибка.value.message
 
 
 def test_тело_ошибки_список_не_роняет_разбор():

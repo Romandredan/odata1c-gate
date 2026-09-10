@@ -55,7 +55,9 @@ class QueryError(Exception):
 @dataclasses.dataclass(slots=True)
 class QuerySpec:
     path: str
-    """Относительно `standard.odata/`, без `$format` — его подставляет `Client1C`."""
+    """Относительно `standard.odata/`, без `$format` — его подставляет `Client1C`. Читаемый
+    OData-текст, не экранированный под URL (кириллица, `'`, `,`, `=` — буквально): экранирует
+    его `Client1C` перед отправкой (раунд правок 1, задача 2 плана M1d)."""
     params: dict[str, str]
     """`$filter`, `$select`, `$expand`, `$orderby`, `$top`, `$skip` и служебные `$inlinecount`,
     `allowedOnly`."""
@@ -72,6 +74,16 @@ Describe = Callable[[str], EntityDescription | None]
 
 def _ошибка(message: str, hint: str = "") -> QueryError:
     return QueryError("params_invalid", message, hint)
+
+
+def _проверить_целое(значение, имя: str) -> None:
+    """`top`/`skip` — только `int`, не `bool` (раунд правок 1, Important): `bool` — подкласс
+    `int` в Python, `isinstance(True, int)` истинно, и без явной проверки `top=True` тихо ушёл бы
+    в 1С как `$top=True` вместо ожидаемого числа; строка вроде `skip="5"` дала бы голый
+    `TypeError` при сравнении с 0, а не `params_invalid`. `0` — допустимое значение обоих (проба
+    P4: `$top=0` отвечает `200` с пустым `value`), проверка на отрицательность — отдельно."""
+    if значение is not None and (isinstance(значение, bool) or not isinstance(значение, int)):
+        raise _ошибка(f"{имя} должен быть целым числом, получено {значение!r}")
 
 
 def _к_списку(значение: list[str] | str | None) -> list[str]:
@@ -210,6 +222,9 @@ def _путь_виртуальной_таблицы(desc: EntityDescription, par
             hint=f"обязательные параметры: {', '.join(sorted(обязательные))}",
         )
 
+    # «В порядке имён» (бриф) — порядок объявления параметров в $metadata, как их сохраняет
+    # парсер (index/edmx.py: словарь params строится по document order Parameter, не
+    # пересортировывается); раунд правок 1 (Minor) подтвердил это чтение брифа.
     порядок = [имя for имя in схема_параметров if имя in заданные]
     аргументы = ",".join(
         f"{имя}={odata_literal(схема_параметров[имя], заданные[имя])}" for имя in порядок
@@ -233,6 +248,8 @@ def build_query(
     params: dict | None = None,
     allowed_only: bool = False,
 ) -> QuerySpec:
+    _проверить_целое(top, "top")
+    _проверить_целое(skip, "skip")
     if top is not None and top < 0:
         raise _ошибка(f"top не может быть отрицательным: {top}")
     if skip is not None and skip < 0:
