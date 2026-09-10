@@ -59,15 +59,28 @@ class EntityDescription:
 
 
 class IndexCorruptError(Exception):
-    """Файл индекса — не SQLite-база или повреждён (тот же код/атрибуты, что у OdataError и
-    ConfigError: SPEC §5.2 — code, message, hint)."""
+    """Файл индекса — не SQLite-база, повреждён, или построен прежней версией разбора (тот же
+    код/атрибуты, что у OdataError и ConfigError: SPEC §5.2 — code, message, hint).
 
-    def __init__(self, path: pathlib.Path, детали: str) -> None:
-        message = f"индекс метаданных повреждён или недоступен: {path}"
-        super().__init__(message)
+    `message`/`hint` — необязательные переопределения (раунд правок 1, задача 3 плана M1b-fix):
+    `require_current_version()` ниже поднимает эту же ошибку с собственным текстом, не подходящим
+    под «файл — не SQLite-база или повреждён». Вызовы без них (файл действительно повреждён)
+    не меняются — подсказка по-прежнему про `reindex`.
+    """
+
+    def __init__(
+        self,
+        path: pathlib.Path,
+        детали: str,
+        *,
+        message: str | None = None,
+        hint: str | None = None,
+    ) -> None:
+        итоговое_сообщение = message or f"индекс метаданных повреждён или недоступен: {path}"
+        super().__init__(итоговое_сообщение)
         self.code = "index_corrupt"
-        self.message = message
-        self.hint = f"обновите индекс командой odata1c reindex <база> ({детали})"
+        self.message = итоговое_сообщение
+        self.hint = hint or f"обновите индекс командой odata1c reindex <база> ({детали})"
 
 
 class IndexRepository:
@@ -80,6 +93,33 @@ class IndexRepository:
 
     def close(self) -> None:
         self._connection.close()
+
+    def require_current_version(self) -> None:
+        """Понятная ошибка проекта вместо сырого `sqlite3.OperationalError`, если файл индекса
+        построен прежней версией разбора (раунд правок 1, задача 3 плана M1b-fix, Important):
+        без этой проверки `describe()`/`find()` на индексе без `is_records`,
+        `actions.side_effecting`, таблиц `enums`/`navigations` падают необработанным
+        `no such column`/`no such table` — слой MCP-тулов M1d читает индекс напрямую и получил бы
+        внутреннюю ошибку вместо диагностики.
+
+        Не вызывается из `__init__`: временный пустой файл при построении индекса и старый файл,
+        который читает `reindex._прежнее_состояние`, не должны падать здесь — оба открываются до
+        того, как в них вообще появляется `parser_version` текущей версии. Вызывают этот метод
+        только читающие пути (слой тулов), которым нужны актуальные колонки/таблицы.
+        """
+        try:
+            версия = self.meta("parser_version")
+        except sqlite3.OperationalError:
+            # Совсем старый файл — до появления самой таблицы meta или её колонок; тот же
+            # диагноз, что и явное несовпадение версии.
+            версия = None
+        if версия != PARSER_VERSION:
+            raise IndexCorruptError(
+                self.path,
+                "версия разбора устарела",
+                message=f"индекс метаданных построен прежней версией разбора: {self.path}",
+                hint="обновите индекс: odata1c reindex <база> или тул odata1c_reindex",
+            )
 
     def write(self, parsed: ParsedMetadata) -> None:
         момент = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")

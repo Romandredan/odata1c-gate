@@ -1,6 +1,7 @@
 """Хранилище индекса: запись, поиск, описание сущности (SPEC §4.2, §4.4)."""
 
 import json
+import sqlite3
 
 import pytest
 from conftest import обёртка_эдмкс
@@ -359,3 +360,93 @@ def test_описание_содержит_навигации(индекс_ut):
     assert описание.navigations["Контрагент"] == "Catalog_Контрагенты"
     ключ = next(п for п in описание.fields if п["name"] == "Контрагент_Key")
     assert ключ["ref_targets"] == ["Catalog_Контрагенты"]
+
+
+# Раунд правок 1 (Important): открытие файла, построенного версией разбора до задачи 3 (нет
+# is_records, actions.side_effecting, таблиц enums/navigations), и последующий describe()/find()
+# давали сырой sqlite3.OperationalError, а не понятную ошибку проекта — слой MCP-тулов M1d читает
+# индекс напрямую. require_current_version() ловит это раньше, отдельно от __init__ (реиндекс
+# открывает и временный пустой файл, и старый файл через _прежнее_состояние — оба не должны
+# падать на открытии).
+
+_СХЕМА_ДО_ЗАДАЧИ_3 = """
+CREATE TABLE entities (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    russian_kind TEXT NOT NULL,
+    base_name TEXT NOT NULL,
+    parent_entity TEXT,
+    is_tabular_part INTEGER NOT NULL DEFAULT 0,
+    is_virtual INTEGER NOT NULL DEFAULT 0,
+    virtual_kind TEXT,
+    key_fields_json TEXT NOT NULL,
+    description_field TEXT,
+    has_posted INTEGER NOT NULL DEFAULT 0,
+    has_recorder INTEGER NOT NULL DEFAULT 0,
+    is_independent_register INTEGER NOT NULL DEFAULT 0,
+    norm_name TEXT NOT NULL DEFAULT '',
+    stems TEXT NOT NULL DEFAULT '',
+    indexed_at TEXT NOT NULL
+);
+CREATE TABLE fields (
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    edm_type TEXT NOT NULL,
+    nullable INTEGER NOT NULL DEFAULT 1,
+    is_key INTEGER NOT NULL DEFAULT 0,
+    is_ref INTEGER NOT NULL DEFAULT 0,
+    ref_targets_json TEXT NOT NULL DEFAULT '[]',
+    is_composite INTEGER NOT NULL DEFAULT 0,
+    sensitivity TEXT,
+    sensitivity_source TEXT,
+    PRIMARY KEY (entity_id, name)
+);
+CREATE TABLE actions (
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    http_method TEXT NOT NULL DEFAULT 'POST',
+    returns TEXT,
+    PRIMARY KEY (entity_id, name)
+);
+CREATE VIRTUAL TABLE entities_fts USING fts5(name, norm_name, stems, tokenize='trigram');
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def _файл_по_схеме_до_задачи_3(путь) -> None:
+    """Файл индекса ровно такой структуры, какую строил код до задачи 3 плана M1b-fix: без
+    is_records, actions.side_effecting, таблиц enums/navigations, без ключа parser_version в
+    meta (сама таблица meta уже существовала). Собирается напрямую через sqlite3, а не через
+    IndexRepository.write() — иначе получили бы текущую, а не прежнюю схему."""
+    соединение = sqlite3.connect(путь)
+    try:
+        соединение.executescript(_СХЕМА_ДО_ЗАДАЧИ_3)
+        соединение.commit()
+    finally:
+        соединение.close()
+
+
+def test_старый_файл_без_версии_разбора_требует_переиндексации(tmp_path):
+    путь = tmp_path / "old.sqlite"
+    _файл_по_схеме_до_задачи_3(путь)
+    хранилище = IndexRepository(путь)
+    with pytest.raises(IndexCorruptError) as ошибка:
+        хранилище.require_current_version()
+    assert ошибка.value.code == "index_corrupt"
+    assert "reindex" in ошибка.value.hint
+    хранилище.close()
+
+
+def test_свежий_индекс_проходит_проверку_версии(индекс_ut):
+    индекс_ut.require_current_version()  # не бросает
+
+
+def test_явно_устаревшая_версия_разбора_требует_переиндексации(индекс_ut):
+    индекс_ut._connection.execute("UPDATE meta SET value = ? WHERE key = 'parser_version'", ("1",))
+    индекс_ut._connection.commit()
+    with pytest.raises(IndexCorruptError) as ошибка:
+        индекс_ut.require_current_version()
+    assert ошибка.value.code == "index_corrupt"
+    assert "reindex" in ошибка.value.hint
