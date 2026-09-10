@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 
 from odata1c.config.models import BaseConfig
@@ -21,6 +22,8 @@ from odata1c.gate.unmasking import Unmasker
 # по политике конкретной базы нет, поэтому страж проверяет по максимально строгому уровню —
 # известные словарю значения (числа, названия) всё равно не должны выйти наружу (инвариант 1).
 СТРОЖАЙШИЙ_УРОВЕНЬ = "identifiers+names"
+
+_log = logging.getLogger(__name__)
 
 
 class BaseGate:
@@ -96,12 +99,23 @@ class BaseGate:
         """Сериализация ответа тула (`ensure_ascii=False` — страж должен видеть кириллицу как
         есть, не в `\\uXXXX`-экранировании) и страж утечек как последний проход по готовому
         тексту (SPEC §6.8, инвариант 1). Заменивший что-то страж помечает ответ `guard_replaced`
-        в `warnings` — маскировщик пропустил значение, страж поймал его отдельно."""
+        в `warnings` — маскировщик пропустил значение, страж поймал его отдельно.
+
+        Штатно `guard.py` сохраняет валидность JSON у изменённого текста (F2 M1c) — `json.loads`
+        ниже на это опирается. `try/except` вокруг него — страховка последнего рубежа (Important,
+        ревью 2026-09-10): finish — часть инварианта 1, и голое исключение здесь потеряло бы
+        текст ответа у клиента. Если страж когда-нибудь вернёт невалидный JSON, отдаём его текст
+        как есть (он уже прошёл страж — утечки в нём нет, только `warnings` не допишутся) и
+        логируем сам факт, без текста ответа (в нём могут быть данные)."""
         текст = json.dumps(envelope, ensure_ascii=False)
         проверено = self._guard.check(текст, mode=self.mode)
         if not проверено.replacements:
             return проверено.text
-        данные = json.loads(проверено.text)  # страж сохраняет валидность JSON
+        try:
+            данные = json.loads(проверено.text)
+        except json.JSONDecodeError:
+            _log.error("страж вернул невалидный JSON при непустых replacements")
+            return проверено.text
         данные.setdefault("warnings", []).append(
             f"guard_replaced: страж заменил {len(проверено.replacements)} значений, "
             "не распознанных маскировщиком"

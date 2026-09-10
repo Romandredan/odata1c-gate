@@ -9,7 +9,7 @@ import pytest
 
 from odata1c.config.models import BaseConfig, GateSettings
 from odata1c.gate.dictionary import Dictionary
-from odata1c.gate.guard import Guard
+from odata1c.gate.guard import Guard, GuardResult
 from odata1c.gate.pipeline import BaseGate, guard_only
 
 СЕКРЕТ = "секрет-для-тестов-ровно-32-байта".encode()
@@ -158,3 +158,19 @@ def test_guard_only_на_строжайшем_уровне(guard, словарь
     инн = "7707083893"
     словарь.token_for("inn", инн, base="ut", entity="E", field="ИНН")
     assert инн not in guard_only(guard, {"error": {"message": f"x {инн}"}})
+
+
+def test_finish_не_падает_если_страж_вернул_невалидный_json(врата_prod, monkeypatch):
+    """Ревью 2026-09-10 (Important, раунд правок 1): штатно страж сохраняет валидность JSON
+    у изменённого текста (F2 M1c) — заглушка имитирует нарушение этого инварианта самим стражем,
+    а не маскировщиком. `finish` обязан остаться последним рубежом (инвариант 1): вернуть текст
+    стража как есть, а не уронить JSONDecodeError мимо клиента (голое исключение теряет текст)."""
+    monkeypatch.setattr(
+        врата_prod._guard,
+        "check",
+        lambda serialized, *, mode: GuardResult(
+            text="не json{", replacements=[{"value_hint": "…", "token": "[[inn:1]]"}], warnings=[]
+        ),
+    )
+    текст = врата_prod.finish({"items": [], "warnings": []})
+    assert текст == "не json{"
