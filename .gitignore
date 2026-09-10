@@ -55,3 +55,7 @@ Thumbs.db
 
 # Рабочие каталоги исполнения планов (superpowers SDD)
 .superpowers/
+
+# Служебные каталоги: кэш hypothesis, рабочие копии агентов Claude Code
+.hypothesis/
+.claude/worktrees/
