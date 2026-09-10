@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import uuid
 from collections.abc import Mapping
 
 import uvicorn
@@ -360,6 +361,22 @@ def spawn_detached(home: pathlib.Path) -> None:
     записи — окружение родителя копируется, а не заменяется (`{**os.environ, …}`): голый словарь
     в `env=` убрал бы `PATH` и сломал разрешение `python -m odata1c` внутри виртуального
     окружения `uv`.
+
+    Windows, план M1d задача 6 раунд правок 1, находка 9 (оркестратор, живая база `trade_dev`):
+    когда родитель этого процесса сам порождён `mcp.client.stdio.stdio_client` (обычный путь
+    лаунчера под настоящим MCP-клиентом), SDK оборачивает лаунчер в Job Object с
+    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, но БЕЗ `JOB_OBJECT_LIMIT_BREAKAWAY_OK`
+    (`mcp/os/win32/utilities.py::_create_job_object`) — обычный `CreateProcess`, даже с
+    `CREATE_BREAKAWAY_FROM_JOB`, наследует членство в этом job молча (флаг без прав на отрыв
+    просто игнорируется ОС, ошибки нет — проверено оркестратором: демон стартует, но всё равно
+    гибнет при закрытии сессии клиента). Обойти можно только процессом, которого создаёт НЕ
+    CreateProcess этого дерева, а другая служба ОС — здесь это Планировщик заданий (`schtasks`):
+    задача создаётся, запускается через `/run` (сразу, не дожидаясь расписания) и тут же
+    удаляется — сам запущенный процесс от удаления определения задачи не страдает (воспроизведено
+    `probe_schtasks_survival.py`: маркер-процесс, поднятый так под управляемым Job Object
+    родителем, продолжает работать и после закрытия job). На не-Windows и при отказе Планировщика
+    заданий (служба выключена, нет прав — редко, но не невозможно) — прежний путь, `CreateProcess`
+    напрямую: под обычным родителем (не `stdio_client`) он и так переживает выход лаунчера.
     """
     журнал = home / "logs" / "daemon.log"
     журнал.parent.mkdir(parents=True, exist_ok=True)
@@ -373,8 +390,11 @@ def spawn_detached(home: pathlib.Path) -> None:
         str(home),
     ]
     окружение = {**os.environ, "PYTHONUTF8": "1"}
-    with open(журнал, "ab") as поток:
-        if sys.platform == "win32":
+
+    if sys.platform == "win32":
+        if _spawn_via_scheduled_task(home, аргументы, журнал):
+            return
+        with open(журнал, "ab") as поток:
             subprocess.Popen(
                 аргументы,
                 stdout=поток,
@@ -384,16 +404,90 @@ def spawn_detached(home: pathlib.Path) -> None:
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 close_fds=True,
             )
-        else:
-            subprocess.Popen(
-                аргументы,
-                stdout=поток,
-                stderr=поток,
-                stdin=subprocess.DEVNULL,
-                env=окружение,
-                start_new_session=True,
-                close_fds=True,
-            )
+        return
+
+    with open(журнал, "ab") as поток:
+        subprocess.Popen(
+            аргументы,
+            stdout=поток,
+            stderr=поток,
+            stdin=subprocess.DEVNULL,
+            env=окружение,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def _spawn_via_scheduled_task(
+    home: pathlib.Path, аргументы: list[str], журнал: pathlib.Path
+) -> bool:
+    """Поднять процесс через Планировщик заданий вместо `CreateProcess` этого процесса — см.
+    докстринг `spawn_detached`. `False` — schtasks недоступен или отказал (служба выключена, нет
+    прав, `PATH` не содержит `System32`): вызывающий код откатывается на обычный `CreateProcess`.
+
+    Промежуточный `.cmd`-файл (не прямая команда в `/tr`) — Планировщик заданий не умеет сам
+    перенаправлять stdout/stderr в файл, а `PYTHONUTF8=1` нужно выставить до запуска python, не
+    после (переменные окружения `/tr` не принимает вовсе). `chcp 65001` в начале — домашний
+    каталог или имя пользователя Windows может быть кириллическим, а активная кодовая страница
+    консоли Планировщика заданий по умолчанию — не utf-8; без явного `chcp` кавычки вокруг такого
+    пути `cmd.exe` иногда разбирает неверно.
+
+    Редирект `cmd.exe` (`>>`) целится в ОТДЕЛЬНЫЙ файл `daemon-launch.log`, а не в тот же
+    `daemon.log`, что и `_настроить_журнал` демона (отличие от прежнего пути через
+    `subprocess.Popen(stdout=…)`, где оба писали в один файл — так требовал бриф задачи 5).
+    Проверено исполнением: `cmd.exe` держит хендл `daemon.log` в режиме, не допускающем
+    одновременного открытия тем же путём — `logging.FileHandler` демона внутри уже запущенного
+    процесса валится `PermissionError`, а не пишет вторую половину строк вперемешку, как было
+    задокументировано для прежнего пути. Раздельные файлы дороже одним лишним местом для
+    проверки при отладке холодного старта, но не ломают сам старт демона.
+    """
+    cmd_путь = home / "logs" / "daemon-launch.cmd"
+    launch_журнал = журнал.with_name("daemon-launch.log")
+    команда = " ".join(f'"{часть}"' for часть in аргументы)
+    cmd_путь.write_text(
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "set PYTHONUTF8=1\r\n"
+        f'{команда} >> "{launch_журнал}" 2>&1\r\n',
+        encoding="utf-8",
+    )
+
+    имя_задачи = f"odata1c-daemon-{uuid.uuid4().hex[:12]}"
+    try:
+        subprocess.run(
+            [
+                "schtasks",
+                "/create",
+                "/tn",
+                имя_задачи,
+                "/tr",
+                str(cmd_путь),
+                "/sc",
+                "once",
+                "/sd",
+                "01/01/2099",
+                "/st",
+                "00:00",
+                "/f",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["schtasks", "/run", "/tn", имя_задачи], check=True, capture_output=True, timeout=10
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as ошибка:
+        _log.warning("не удалось поднять демон через Планировщик заданий: %s", ошибка)
+        return False
+    finally:
+        # Удаление определения задачи не трогает уже запущенный процесс (проверено
+        # `probe_schtasks_survival.py`) — не в try выше: важно попытаться убрать задачу даже
+        # если `/run` почему-то не подтвердил успех, чтобы не копить их между перезапусками.
+        subprocess.run(
+            ["schtasks", "/delete", "/tn", имя_задачи, "/f"], capture_output=True, timeout=10
+        )
+    return True
 
 
 def stop(home: pathlib.Path) -> bool:

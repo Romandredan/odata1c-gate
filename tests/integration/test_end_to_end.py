@@ -6,7 +6,11 @@
 Ограничение времени — по частям (reindex, запуск лаунчера с холодным стартом демона), а не одним
 `pytest.mark.timeout`: плагин `pytest-timeout` не входит в зависимости проекта, а
 `filterwarnings = ["error"]` в pyproject.toml превращает предупреждение о незарегистрированной
-метке в ошибку сбора теста. Суммарно все ожидания этого теста не превышают ~60 с.
+метке в ошибку сбора теста. Суммарно пределы этого теста — 20 + 30 + 10 = 60 с (раунд правок 1,
+находка 8: было 20 + 45 + 10 = 75 с, брифу «не дольше 60 с суммарно» не соответствовало); по
+факту прогонов на этой машине холодный старт демона (включая переход через Планировщик заданий,
+находка 9) укладывается в 4–9 с суммарно на весь тест — 30 с на блок лаунчера оставляют запас
+на порядок, не только на бумаге.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from odata1c.daemon import is_listening
 from odata1c.daemon import stop as daemon_stop
 
 ПРЕДЕЛ_REINDEX_С = 20
-ПРЕДЕЛ_ЛАУНЧЕРА_С = 45
+ПРЕДЕЛ_ЛАУНЧЕРА_С = 30
 ПРЕДЕЛ_ОСТАНОВКИ_С = 10
 
 
@@ -112,3 +116,50 @@ async def _проверить_через_лаунчер(параметры: Stdi
         )
         assert ответ_описания.is_error is False
         assert ответ_описания.content[0].text
+
+
+async def test_launcher_поднимается_на_чистом_домашнем_каталоге_без_предварительного_init(
+    tmp_path,
+):
+    """Раунд правок 1, находка 3а: команда подключения `claude mcp add odata1c -- uv run
+    --directory <репозиторий> odata1c mcp` обязана работать на машине, где `odata1c init` ни
+    разу не запускали (SPEC §2.1 п. 1 поручает создание домашнего каталога и файлов-шаблонов
+    именно лаунчеру). До правки — `load_config` внутри `run_launcher` требовал непустой
+    `gate_secret` в `daemon.yaml`, а секрет создавал только `cmd_init` или сам демон (который
+    читает порт РАНЬШЕ, чем успевает подняться) — `[config_invalid] секрет гейта не найден`.
+
+    Домашний каталог здесь ТОЛЬКО с портом в `daemon.yaml` (для изоляции от порта по умолчанию
+    и от других тестов) — ни `gate_secret`, ни `bases.yaml` этот тест сознательно не создаёт,
+    это и есть «чистая машина»."""
+    home = tmp_path / "home"
+    home.mkdir()
+    порт = _свободный_порт()
+    (home / "daemon.yaml").write_text(f"port: {порт}\n", encoding="utf-8")
+
+    параметры = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "odata1c", "--home", str(home), "mcp"],
+        env={**os.environ, "PYTHONUTF8": "1"},
+    )
+    try:
+        await asyncio.wait_for(_дождаться_handshake(параметры), timeout=ПРЕДЕЛ_ЛАУНЧЕРА_С)
+    finally:
+        if is_listening(порт):
+            daemon_stop(home)
+            предел = time.monotonic() + ПРЕДЕЛ_ОСТАНОВКИ_С
+            while is_listening(порт) and time.monotonic() < предел:
+                await asyncio.sleep(0.2)
+
+    # Лаунчер должен был досоздать то же, что и `odata1c init` (ensure_templates +
+    # ensure_gate_secret) — не только подключиться, но и оставить домашний каталог в рабочем
+    # состоянии для следующего запуска.
+    assert "gate_secret" in (home / "daemon.yaml").read_text(encoding="utf-8")
+    assert (home / "bases.yaml").exists()
+
+
+async def _дождаться_handshake(параметры: StdioServerParameters) -> None:
+    async with (
+        stdio_client(параметры) as (read, write),
+        ClientSession(read, write) as клиент,
+    ):
+        await клиент.initialize()

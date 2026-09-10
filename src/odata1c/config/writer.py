@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.resources
 import os
 import pathlib
 import secrets
@@ -15,6 +16,24 @@ import secrets
 import yaml
 
 from odata1c.config.loader import ConfigError
+
+# Общее для `cmd_init` и лаунчера (`odata1c mcp` на чистой машине — SPEC §2.1 п. 1, план M1d,
+# задача 6, раунд правок 1, находка 3а): оба должны уметь досоздать то, чего не хватает домашнему
+# каталогу, одним и тем же способом.
+ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
+
+
+def ensure_templates(home: pathlib.Path) -> None:
+    """Скопировать шаблоны настроек, которых ещё нет — идемпотентно, существующие файлы не
+    трогает. Не пишет в лог и не печатает — вызывающий код (`cmd_init`, `run_launcher`) сам
+    решает, что и куда сообщать."""
+    for имя_файла, имя_шаблона in ШАБЛОНЫ.items():
+        назначение = home / имя_файла
+        if назначение.exists():
+            continue
+        шаблон = importlib.resources.files("odata1c.templates").joinpath(имя_шаблона)
+        назначение.write_text(шаблон.read_text(encoding="utf-8"), encoding="utf-8")
+
 
 ШАБЛОН_ЗАПИСИ = """\
   {name}:

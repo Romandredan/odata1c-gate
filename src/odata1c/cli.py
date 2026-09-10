@@ -11,17 +11,20 @@ import asyncio
 import getpass
 import importlib.resources
 import pathlib
+import sys
 import time
 
+import httpx2
 import pydantic
+from mcp.shared.exceptions import MCPError
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
-from odata1c.config.models import BaseConfig
-from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.config.models import ИМЯ_БАЗЫ, BaseConfig
+from odata1c.config.writer import append_base, ensure_gate_secret, ensure_templates
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
 from odata1c.daemon import stop as daemon_stop
 from odata1c.gate.dictionary import DictionaryCorruptError
@@ -33,12 +36,17 @@ from odata1c.index.repository import IndexCorruptError
 from odata1c.launcher import run_launcher
 from odata1c.registry.registry import Registry, SessionScope
 
+# Ошибки старта лаунчера (odata1c mcp), которые cmd_mcp форматирует сама, в stderr — не через
+# общий перехват main() (тот пишет в stdout, а stdout команды mcp — канал JSON-RPC клиента;
+# раунд правок 1, находка 3б). ConfigError — свои настройки/имена баз; MCPError — демон ответил,
+# но не как MCP (чужой процесс на порту, план M1d задача 6 раунд правок 1 находка 4);
+# httpx2.HTTPError — адрес недостижим или без схемы; OSError/UnicodeError — сеть/кодировка.
+_ОШИБКИ_ЗАПУСКА_MCP = (ConfigError, MCPError, httpx2.HTTPError, OSError, UnicodeError)
+
 # Сколько ждать порт демона после spawn_detached (бриф задачи 5) — и в лаунчере (SPEC §2.1, п. 2),
 # и в этой команде: обе стороны наблюдают один и тот же холодный старт (импорт lxml/ahocorasick,
 # разбор daemon.yaml).
 ОЖИДАНИЕ_ГОТОВНОСТИ_S = 15
-
-ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,12 +198,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def cmd_init(home: pathlib.Path) -> int:
     status = ensure_home(home)
-    for имя_файла, имя_шаблона in ШАБЛОНЫ.items():
-        назначение = home / имя_файла
-        if назначение.exists():
-            continue
-        шаблон = importlib.resources.files("odata1c.templates").joinpath(имя_шаблона)
-        назначение.write_text(шаблон.read_text(encoding="utf-8"), encoding="utf-8")
+    ensure_templates(home)
     # Секрет гейта создаётся здесь, а не при чтении настроек: чтение больше ничего не пишет
     # на диск. Вызов идемпотентен — если секрет уже есть (файл существовал и до этой команды),
     # он не меняется.
@@ -380,17 +383,73 @@ def cmd_daemon_stop(home: pathlib.Path) -> int:
     return 1
 
 
+def _разобрать_bases(raw: str | None) -> list[str] | None:
+    """`--bases` в список имён баз (SPEC §2.1, раунд правок 1, находка 6, Ruling 11).
+
+    `None` — аргумент вообще не задан, видимость сессии не сужена (та же трактовка, что и у
+    `daemon.scope_from_headers` для отсутствующего заголовка). Задан, но после разбора по запятой
+    и обрезки пробелов не осталось ни одного имени (`--bases ""`, `--bases ","`, `--bases " "`) —
+    это ОШИБКА запуска, а не «видно всё» (молчаливое расширение) и не «видно ничего» (молчаливое
+    сужение до пустоты): пользователь, написавший `--bases`, явно хотел сузить видимость, и обе
+    молчаливые трактовки одинаково опасны. Каждое распознанное имя дополнительно проверяется
+    правилом `ИМЯ_БАЗЫ` (`config/models.py`) — до любого сетевого обращения: не-ASCII или иначе
+    неверное имя (например, случайно продиктованное голосом) валится `UnicodeEncodeError` внутри
+    конструктора `httpx2.AsyncClient`, а не понятной ошибкой (находка 4, проявление 3)."""
+    if raw is None:
+        return None
+    имена = [имя.strip() for имя in raw.split(",") if имя.strip()]
+    if not имена:
+        raise ConfigError(
+            f"--bases задан, но не содержит ни одного имени базы: {raw!r}",
+            hint="перечислите имена через запятую (odata1c mcp --bases ut,buh) или уберите "
+            "--bases совсем, чтобы видеть все базы",
+        )
+    for имя in имена:
+        _проверить_имя_базы(имя, "--bases")
+    return имена
+
+
+def _проверить_имя_базы(имя: str, откуда: str) -> None:
+    if not ИМЯ_БАЗЫ.match(имя):
+        raise ConfigError(
+            f"{откуда}: «{имя}» не похоже на имя базы",
+            hint="имя базы — строчные латинские буквы, цифры и подчёркивание, до 32 символов",
+        )
+
+
+def _печать_ошибки_mcp(ошибка: Exception) -> None:
+    """Одна строка в stderr — не в stdout (раунд правок 1, находка 3б): stdout команды `mcp` —
+    канал JSON-RPC клиента, человеческий текст там для клиента не сообщение, а протокольный шум."""
+    if isinstance(ошибка, ConfigError):
+        print(f"[{ошибка.code}] {ошибка}", file=sys.stderr)
+        if ошибка.hint:
+            print(f"подсказка: {ошибка.hint}", file=sys.stderr)
+        return
+    print(f"не удалось подключиться к демону 1С-шлюза: {ошибка}", file=sys.stderr)
+
+
 def cmd_mcp(home: pathlib.Path, bases: str | None, default: str | None, url: str | None) -> int:
     """`odata1c mcp [--bases a,b] [--default a] [--url URL]` (SPEC §2.2, план M1d задача 6).
 
-    Держит stdio, пока клиент (Claude Code) не отключится — обычный код 0 по завершении. Отказ
-    поднять свой демон печатается лаунчером в stderr и оформляется как `SystemExit(1)`
-    (`launcher.py::_дождаться_демона`) — этот код возврата и есть отказ команды, здесь его
-    перехватывать незачем: `SystemExit` — не `Exception`, общий перехват выше по этому файлу его
-    не ловит и не должен.
+    Держит stdio, пока клиент (Claude Code) не отключится — обычный код 0 по завершении. Все
+    ошибки этой команды — разбора `--bases`/`--default`, отказа поднять свой демон
+    (`SystemExit` из `launcher.py::_дождаться_демона`), обрыва при подключении к чужому процессу
+    на порту демона, `--url` без схемы — перехватываются ЗДЕСЬ и печатаются в stderr
+    (`_печать_ошибки_mcp`), а не общим перехватом `main()`, который пишет в stdout (раунд правок 1,
+    находки 3б, 4).
     """
-    список_баз = [имя.strip() for имя in bases.split(",") if имя.strip()] if bases else None
-    asyncio.run(run_launcher(home, bases=список_баз, default=default, url=url))
+    try:
+        список_баз = _разобрать_bases(bases)
+        if default is not None:
+            _проверить_имя_базы(default, "--default")
+        asyncio.run(run_launcher(home, bases=список_баз, default=default, url=url))
+    except SystemExit as выход:
+        # launcher.py::_дождаться_демона уже напечатал причину в stderr — этот код возврата и
+        # есть отказ команды, повторно печатать нечего.
+        return выход.code if isinstance(выход.code, int) else 1
+    except _ОШИБКИ_ЗАПУСКА_MCP as ошибка:
+        _печать_ошибки_mcp(ошибка)
+        return 1
     return 0
 
 
