@@ -8,7 +8,7 @@ import json
 import pathlib
 import sqlite3
 
-from odata1c.index.edmx import ParsedMetadata
+from odata1c.index.edmx import PARSER_VERSION, ParsedMetadata
 from odata1c.index.naming import normalize, stems
 from odata1c.index.schema import connect
 
@@ -41,12 +41,20 @@ class FoundEntity:
 @dataclasses.dataclass(slots=True)
 class EntityDescription:
     name: str
+    kind: str
     russian_kind: str
+    parent_entity: str | None
+    is_tabular_part: bool
+    is_records: bool
+    is_virtual: bool
+    virtual_kind: str | None
     key_fields: list[str]
     description_field: str | None
     fields: list[dict]
     children: list[str]
     actions: list[dict]
+    members: list[str]
+    navigations: dict[str, str]
     is_independent_register: bool
 
 
@@ -82,14 +90,16 @@ class IndexRepository:
         with self._connection:
             self._connection.execute("DELETE FROM entities")
             self._connection.execute("DELETE FROM entities_fts")
+            self._connection.execute("DELETE FROM enums")
+            self._connection.execute("DELETE FROM navigations")
             for сущность in parsed.entities:
                 имя_норм = normalize(сущность.name)
                 основы_имени = " ".join(stems(сущность.base_name))
                 курсор = self._connection.execute(
                     "INSERT INTO entities (name, kind, russian_kind, base_name, parent_entity,"
-                    " is_tabular_part, is_virtual, virtual_kind, key_fields_json,"
+                    " is_tabular_part, is_records, is_virtual, virtual_kind, key_fields_json,"
                     " description_field, has_posted, has_recorder, is_independent_register,"
-                    " norm_name, stems, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " norm_name, stems, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         сущность.name,
                         сущность.kind,
@@ -97,6 +107,7 @@ class IndexRepository:
                         сущность.base_name,
                         сущность.parent_entity,
                         int(сущность.is_tabular_part),
+                        int(сущность.is_records),
                         int(сущность.is_virtual),
                         сущность.virtual_kind,
                         json.dumps(сущность.key_fields, ensure_ascii=False),
@@ -128,8 +139,8 @@ class IndexRepository:
                     ],
                 )
                 self._connection.executemany(
-                    "INSERT INTO actions (entity_id, name, params_json, http_method, returns)"
-                    " VALUES (?,?,?,?,?)",
+                    "INSERT INTO actions (entity_id, name, params_json, http_method, returns,"
+                    " side_effecting) VALUES (?,?,?,?,?,?)",
                     [
                         (
                             entity_id,
@@ -137,10 +148,28 @@ class IndexRepository:
                             json.dumps(действие.params, ensure_ascii=False),
                             действие.http_method,
                             действие.returns,
+                            int(действие.side_effecting),
                         )
                         for действие in действия_по_сущности.get(сущность.name, [])
                     ],
                 )
+                self._connection.executemany(
+                    "INSERT INTO navigations (entity_id, name, target) VALUES (?,?,?)",
+                    [
+                        (entity_id, имя_навигации, цель)
+                        for имя_навигации, цель in сущность.navigations.items()
+                    ],
+                )
+                if сущность.kind == "Enum":
+                    self._connection.execute(
+                        "INSERT INTO enums (entity_id, members_json) VALUES (?,?)",
+                        (
+                            entity_id,
+                            json.dumps(
+                                parsed.enums.get(сущность.base_name, []), ensure_ascii=False
+                            ),
+                        ),
+                    )
                 self._connection.execute(
                     "INSERT INTO entities_fts (name, norm_name, stems) VALUES (?,?,?)",
                     (сущность.name, имя_норм, основы_имени),
@@ -148,6 +177,7 @@ class IndexRepository:
             self._set_meta("edmx_sha256", parsed.edmx_sha256)
             self._set_meta("indexed_at", момент)
             self._set_meta("entity_count", str(len(parsed.entities)))
+            self._set_meta("parser_version", PARSER_VERSION)
             if parsed.platform_hint:
                 self._set_meta("platform_hint", parsed.platform_hint)
             if parsed.unresolved_entity_sets:
@@ -210,11 +240,14 @@ class IndexRepository:
         поля = [
             dict(поле)
             for поле in self._connection.execute(
-                "SELECT name, edm_type, nullable, is_key, is_ref, is_composite, sensitivity,"
-                " sensitivity_source FROM fields WHERE entity_id = ? ORDER BY is_key DESC, name",
+                "SELECT name, edm_type, nullable, is_key, is_ref, ref_targets_json, is_composite,"
+                " sensitivity, sensitivity_source FROM fields WHERE entity_id = ?"
+                " ORDER BY is_key DESC, name",
                 (строка["id"],),
             ).fetchall()
         ]
+        for поле in поля:
+            поле["ref_targets"] = json.loads(поле.pop("ref_targets_json"))
         дети = [
             ребёнок["name"]
             for ребёнок in self._connection.execute(
@@ -224,20 +257,40 @@ class IndexRepository:
         действия = [
             dict(действие)
             for действие in self._connection.execute(
-                "SELECT name, params_json, http_method, returns FROM actions WHERE entity_id = ?",
+                "SELECT name, params_json, http_method, returns, side_effecting FROM actions"
+                " WHERE entity_id = ?",
                 (строка["id"],),
             ).fetchall()
         ]
         for действие in действия:
             действие["params"] = json.loads(действие.pop("params_json"))
+            действие["side_effecting"] = bool(действие["side_effecting"])
+        строка_перечисления = self._connection.execute(
+            "SELECT members_json FROM enums WHERE entity_id = ?", (строка["id"],)
+        ).fetchone()
+        участники = json.loads(строка_перечисления["members_json"]) if строка_перечисления else []
+        навигации = {
+            строка_навигации["name"]: строка_навигации["target"]
+            for строка_навигации in self._connection.execute(
+                "SELECT name, target FROM navigations WHERE entity_id = ?", (строка["id"],)
+            ).fetchall()
+        }
         return EntityDescription(
             name=строка["name"],
+            kind=строка["kind"],
             russian_kind=строка["russian_kind"],
+            parent_entity=строка["parent_entity"],
+            is_tabular_part=bool(строка["is_tabular_part"]),
+            is_records=bool(строка["is_records"]),
+            is_virtual=bool(строка["is_virtual"]),
+            virtual_kind=строка["virtual_kind"],
             key_fields=json.loads(строка["key_fields_json"]),
             description_field=строка["description_field"],
             fields=поля,
             children=дети,
             actions=действия,
+            members=участники,
+            navigations=навигации,
             is_independent_register=bool(строка["is_independent_register"]),
         )
 

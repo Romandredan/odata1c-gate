@@ -215,6 +215,38 @@ async def test_нераспознанные_наборы_попадают_в_р�
 
 
 @respx.mock
+async def test_смена_версии_разбора_перестраивает_индекс_без_force(tmp_path, edmx_synthetic):
+    # Задача 3 плана M1b-fix: версия разбора — часть условия «без изменений» наравне с sha256.
+    # 1) обычный реиндекс: строит индекс с текущей PARSER_VERSION;
+    # 2) в индексе вручную понижаем parser_version до "1" — имитация индекса, построенного
+    #    прежним, ещё не умевшим разбирать is_records/enums/navigations кодом;
+    # 3) повторный реиндекс того же $metadata (sha256 не изменился) без force обязан всё равно
+    #    перестроить индекс, а не отдать ветку «без изменений».
+    import sqlite3
+
+    from odata1c.index.edmx import PARSER_VERSION
+
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_synthetic))
+    _замокать_завершение_сеанса()
+    client = Client1C(база())
+
+    первый = await reindex(база(), client, tmp_path)
+    assert первый.changed is True
+
+    путь = index_path(tmp_path, "ut")
+    соединение = sqlite3.connect(путь)
+    соединение.execute("UPDATE meta SET value = ? WHERE key = 'parser_version'", ("1",))
+    соединение.commit()
+    соединение.close()
+    assert PARSER_VERSION != "1"
+
+    второй = await reindex(база(), client, tmp_path)
+    await client.close()
+
+    assert второй.changed is True
+
+
+@respx.mock
 async def test_сбой_записи_не_портит_прежний_индекс_и_не_оставляет_мусора(
     tmp_path, edmx_synthetic, monkeypatch
 ):

@@ -32,6 +32,11 @@ from odata1c.index.naming import parse_entity_name
 )
 
 
+# Версия разбора (SPEC §4.2) — повышать при любом изменении разбора, меняющем содержимое индекса
+# при том же $metadata: индекс, построенный прежней версией, перестраивается без --force
+# (см. reindex.py, _прежнее_состояние) даже если контрольная сумма документа не изменилась.
+PARSER_VERSION = "2"
+
 СОВЕТ_ПРИ_ОШИБКЕ_РАЗБОРА = (
     "проверьте, что по адресу базы опубликован именно интерфейс OData "
     "(URL оканчивается на /odata/standard.odata/), а не веб-страница — "
@@ -100,11 +105,12 @@ class ParsedMetadata:
     platform_hint: str | None = None
     unresolved_entity_sets: list[str] = dataclasses.field(default_factory=list)
     warnings: list[str] = dataclasses.field(default_factory=list)
+    enums: dict[str, list[str]] = dataclasses.field(default_factory=dict)
 
 
 def parse_edmx(data: bytes) -> ParsedMetadata:
     контрольная_сумма = hashlib.sha256(data).hexdigest()
-    типы, навигации_по_типу, связи = _разобрать_типы(data)
+    типы, навигации_по_типу, связи, перечисления = _разобрать_типы(data)
     наборы, сырые_действия, подсказка = _разобрать_контейнер(data)
     набор_по_типу = {имя_типа: имя_набора for имя_набора, имя_типа in наборы.items()}
 
@@ -173,10 +179,36 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
         )
         сущности.append(сущность)
 
+    # Перечисления (SPEC §4.2, дополнение о перечислениях, задача 3 плана M1b-fix): EnumType не
+    # сцеплен ни с одним набором данных — в описании нет ни EntitySet, ни связи поля с ним,
+    # добавляем отдельной сущностью Enum_<Имя> с пустыми полями и ключами. Занятые имена считаем
+    # от наборов — тот же набор проверяют ниже виртуальные таблицы (действия занимают имена уже
+    # с учётом перечислений).
+    занятые = set(наборы)
+    for имя_перечисления in перечисления:
+        имя_сущности = f"Enum_{имя_перечисления}"
+        if имя_сущности in занятые:
+            предупреждения.append(
+                f"перечисление {имя_перечисления} не проиндексировано: "
+                f"имя {имя_сущности} занято набором"
+            )
+            continue
+        занятые.add(имя_сущности)
+        сущности.append(
+            _собрать_сущность(
+                имя_сущности,
+                ([], []),
+                parent=None,
+                is_tabular_part=False,
+                is_records=False,
+                has_recorder=False,
+                base_name=имя_перечисления,
+            )
+        )
+
     # Действия и виртуальные таблицы (SPEC §4.2, поправка 2026-09-10): привязка — тип параметра
     # bindingParameter, атрибут EntitySet у FunctionImport в 1С не встречается.
     действия: list[ParsedAction] = []
-    занятые = set(наборы)
     for сырое in сырые_действия:
         параметры = dict(сырое["params"])
         тип_привязки = _без_пространства(параметры.pop("bindingParameter", "") or "")
@@ -249,13 +281,15 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
         platform_hint=подсказка,
         unresolved_entity_sets=нераспознанные_наборы,
         warnings=предупреждения,
+        enums=перечисления,
     )
 
 
 # Узлы схемы, разбираемые в первом проходе (_разобрать_типы) и освобождаемые сразу после разбора:
 # EntityType и ComplexType — состав полей (у ComplexType своих ключей и навигаций не бывает),
-# Association — связи для последующего разрешения целей навигаций.
-_ОСВОБОЖДАЕМЫЕ_УЗЛЫ_СХЕМЫ = frozenset({"EntityType", "ComplexType", "Association"})
+# Association — связи для последующего разрешения целей навигаций, EnumType — перечисления
+# (задача 3 плана M1b-fix): не сцеплены ни с одним набором, разбираются тем же проходом.
+_ОСВОБОЖДАЕМЫЕ_УЗЛЫ_СХЕМЫ = frozenset({"EntityType", "ComplexType", "Association", "EnumType"})
 
 
 def _разобрать_типы(
@@ -264,18 +298,21 @@ def _разобрать_типы(
     dict[str, tuple[list[ParsedField], list[str]]],
     dict[str, list[tuple[str, str, str]]],
     dict[str, dict[str, str]],
+    dict[str, list[str]],
 ]:
-    """Типы, навигации и связи — один проход по документу (SPEC §4.2, дополнение о навигациях).
+    """Типы, навигации, связи и перечисления — один проход по документу (SPEC §4.2, дополнение
+    о навигациях и о перечислениях).
 
     Возвращает: имя типа → (поля, ключевые поля) — и у `EntityType`, и у `ComplexType` (строки
     виртуальных таблиц и наборов записей); имя `EntityType` → список навигаций
     (имя свойства, имя `Relationship` без пространства имён, `ToRole`); имя `Association` →
-    {Role: имя типа конца без пространства имён}. Коллизия имён между `EntityType` и `ComplexType`
-    невозможна — одно пространство имён схемы.
+    {Role: имя типа конца без пространства имён}; имя `EnumType` → список имён `Member`.
+    Коллизия имён между `EntityType` и `ComplexType` невозможна — одно пространство имён схемы.
     """
     типы: dict[str, tuple[list[ParsedField], list[str]]] = {}
     навигации_по_типу: dict[str, list[tuple[str, str, str]]] = {}
     связи: dict[str, dict[str, str]] = {}
+    перечисления: dict[str, list[str]] = {}
     try:
         поток = etree.iterparse(io.BytesIO(data), events=("end",), recover=False, huge_tree=True)
         for _, элемент in поток:
@@ -315,13 +352,19 @@ def _разобрать_типы(
                     for конец in элемент.iter()
                     if etree.QName(конец).localname == "End"
                 }
+            elif имя_тега == "EnumType":
+                перечисления[элемент.get("Name", "")] = [
+                    член.get("Name")
+                    for член in элемент.iter()
+                    if etree.QName(член).localname == "Member"
+                ]
             if имя_тега in _ОСВОБОЖДАЕМЫЕ_УЗЛЫ_СХЕМЫ:
                 элемент.clear()
                 while элемент.getprevious() is not None:
                     del элемент.getparent()[0]
     except etree.XMLSyntaxError as exc:
         raise EdmxError(f"не удалось разобрать $metadata: {exc}") from exc
-    return типы, навигации_по_типу, связи
+    return типы, навигации_по_типу, связи, перечисления
 
 
 def _разрешить_навигации(

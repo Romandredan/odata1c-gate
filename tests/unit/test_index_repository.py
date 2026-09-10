@@ -304,3 +304,58 @@ def test_нераспознанные_наборы_попадают_в_служ�
 def test_отсутствие_нераспознанных_наборов_не_оставляет_ключ(индекс):
     # synthetic.edmx не содержит испорченных ссылок — ключ не должен появляться в meta.
     assert индекс.meta("unresolved_entity_sets") is None
+
+
+# Задача 3 плана M1b-fix: набор записей, перечисления, версия разбора — на реальном образце УТ
+# (тот же приём, что в test_index_edmx.py для наборов записей и виртуальных таблиц).
+
+
+@pytest.fixture
+def индекс_ut(tmp_path, edmx_ut_real):
+    хранилище = IndexRepository(tmp_path / "ut.sqlite")
+    хранилище.write(parse_edmx(edmx_ut_real))
+    yield хранилище
+    хранилище.close()
+
+
+def test_описание_набора_записей(индекс_ut):
+    описание = индекс_ut.describe("InformationRegister_СтоимостьТоваров_RecordType")
+    assert описание.is_records is True
+    assert описание.parent_entity == "InformationRegister_СтоимостьТоваров"
+    assert описание.is_independent_register is False
+
+
+def test_описание_виртуальной_таблицы_с_параметрами(индекс_ut):
+    описание = индекс_ut.describe("AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance")
+    assert описание.is_virtual is True
+    assert описание.virtual_kind == "Balance"
+    assert описание.parent_entity == "AccumulationRegister_РасчетыСКлиентамиПланОплат"
+    assert [д["name"] for д in описание.actions] == ["Balance"]
+    assert set(описание.actions[0]["params"]) == {"Condition", "Dimensions", "Period"}
+
+
+def test_виртуальные_таблицы_видны_у_регистра_как_дети(индекс_ut):
+    описание = индекс_ut.describe("AccumulationRegister_РасчетыСКлиентамиПланОплат")
+    assert "AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance" in описание.children
+    assert "AccumulationRegister_РасчетыСКлиентамиПланОплат_RecordType" in описание.children
+
+
+def test_перечисление_описано_значениями_и_находится_поиском(индекс_ut):
+    описание = индекс_ut.describe("Enum_ХозяйственныеОперации")
+    assert "ОплатаПоставщику" in описание.members
+    assert "Enum_ХозяйственныеОперации" in [
+        н.name for н in индекс_ut.find("хозяйственные операции")
+    ]
+
+
+def test_версия_разбора_записана(индекс_ut):
+    from odata1c.index.edmx import PARSER_VERSION
+
+    assert индекс_ut.meta("parser_version") == PARSER_VERSION
+
+
+def test_описание_содержит_навигации(индекс_ut):
+    описание = индекс_ut.describe("Document_РеализацияТоваровУслуг")
+    assert описание.navigations["Контрагент"] == "Catalog_Контрагенты"
+    ключ = next(п for п in описание.fields if п["name"] == "Контрагент_Key")
+    assert ключ["ref_targets"] == ["Catalog_Контрагенты"]

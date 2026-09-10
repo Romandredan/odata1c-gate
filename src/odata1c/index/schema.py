@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS entities (
     base_name TEXT NOT NULL,
     parent_entity TEXT,
     is_tabular_part INTEGER NOT NULL DEFAULT 0,
+    is_records INTEGER NOT NULL DEFAULT 0,
     is_virtual INTEGER NOT NULL DEFAULT 0,
     virtual_kind TEXT,
     key_fields_json TEXT NOT NULL,
@@ -46,6 +47,19 @@ CREATE TABLE IF NOT EXISTS actions (
     params_json TEXT NOT NULL DEFAULT '{}',
     http_method TEXT NOT NULL DEFAULT 'POST',
     returns TEXT,
+    side_effecting INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (entity_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS enums (
+    entity_id INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+    members_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS navigations (
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    target TEXT NOT NULL,
     PRIMARY KEY (entity_id, name)
 );
 

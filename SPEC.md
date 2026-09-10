@@ -265,14 +265,17 @@ odata1c service install | remove             необязательно: дем�
 ### 4.2 Схема `metadata.sqlite`
 
 ```text
-entities(id, name, kind, russian_kind, base_name, parent_entity, is_tabular_part, is_virtual,
-         virtual_kind, key_fields_json, description_field, has_posted, has_recorder,
+entities(id, name, kind, russian_kind, base_name, parent_entity, is_tabular_part, is_records,
+         is_virtual, virtual_kind, key_fields_json, description_field, has_posted, has_recorder,
          is_independent_register, indexed_at)
 fields(entity_id, name, edm_type, nullable, is_key, is_ref, ref_targets_json, is_composite,
        sensitivity, sensitivity_source)     -- sensitivity: inn|kpp|…|org|person|keep|null
-actions(entity_id, name, params_json, http_method, returns)
+actions(entity_id, name, params_json, http_method, returns, side_effecting)
+enums(entity_id, members_json)             -- перечисления: имя набора значений EnumType
+navigations(entity_id, name, target)       -- навигационные свойства: имя → набор-цель
 entities_fts(name, norm_name, stems)       -- FTS5 + trigram
-meta(key, value)                           -- edmx_sha256, indexed_at, entity_count, platform_hint
+meta(key, value)                           -- edmx_sha256, indexed_at, entity_count, platform_hint,
+                                            -- parser_version
 ```
 
 `kind` выводится из префикса имени: `Catalog`, `Document`, `DocumentJournal`, `Constant`,

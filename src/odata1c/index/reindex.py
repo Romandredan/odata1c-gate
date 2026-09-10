@@ -17,7 +17,7 @@ from collections.abc import Callable
 from odata1c.client1c.client import Client1C
 from odata1c.config.home import base_dir
 from odata1c.config.models import BaseConfig
-from odata1c.index.edmx import ParsedMetadata, parse_edmx
+from odata1c.index.edmx import PARSER_VERSION, ParsedMetadata, parse_edmx
 from odata1c.index.repository import IndexRepository
 
 Classifier = Callable[[str, str, str], tuple[str, str] | None]
@@ -38,6 +38,9 @@ class ReindexResult:
     # описания метаданных, а не удалённых объектов; показываем пользователю на всех ветках,
     # не только при перестройке (SPEC §4.3, требование задачи 5 «на что обратить внимание»).
     unresolved_entity_sets: list[str] = dataclasses.field(default_factory=list)
+    # Предупреждения разбора (действие не привязано, имя виртуальной таблицы или перечисления
+    # занято — см. edmx.py) — только на ветке перестройки, задача 3 плана M1b-fix.
+    warnings: list[str] = dataclasses.field(default_factory=list)
 
 
 def index_path(home: pathlib.Path, base_name: str) -> pathlib.Path:
@@ -61,7 +64,11 @@ async def reindex(
     разобрано = await asyncio.to_thread(parse_edmx, сырой)
 
     прежнее = _прежнее_состояние(путь)
-    if not force and прежнее["sha256"] == разобрано.edmx_sha256:
+    if (
+        not force
+        and прежнее["sha256"] == разобрано.edmx_sha256
+        and прежнее["parser_version"] == PARSER_VERSION
+    ):
         return ReindexResult(
             changed=False,
             entity_count=прежнее["count"],
@@ -111,6 +118,7 @@ async def reindex(
         removed_fields=sorted(f"{сущность}.{поле}" for сущность, поле in прежнее["fields"] - поля),
         new_sensitive_fields=новые_классы,
         unresolved_entity_sets=sorted(разобрано.unresolved_entity_sets),
+        warnings=list(разобрано.warnings),
     )
 
 
@@ -168,6 +176,7 @@ def _прежнее_состояние(путь: pathlib.Path) -> dict:
         "fields": set(),
         "field_sensitivity": {},
         "unresolved_entity_sets": [],
+        "parser_version": None,
     }
     if not путь.exists():
         return пусто
@@ -185,6 +194,10 @@ def _прежнее_состояние(путь: pathlib.Path) -> dict:
             "unresolved_entity_sets": (
                 json.loads(сырые_нераспознанные) if сырые_нераспознанные else []
             ),
+            # Ключ версии разбора мог не существовать вовсе (индекс построен до задачи 3
+            # плана M1b-fix) — meta() тогда вернёт None, что не совпадёт с PARSER_VERSION и
+            # заставит перестроить индекс без --force (см. условие ветки «без изменений» выше).
+            "parser_version": хранилище.meta("parser_version"),
         }
     finally:
         хранилище.close()

@@ -269,6 +269,10 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
         )
         for имя in результат.unresolved_entity_sets[:20]:
             print(f"  {имя}")
+    if результат.warnings:
+        print(f"предупреждения разбора ({len(результат.warnings)}):")
+        for предупреждение in результат.warnings[:20]:
+            print(f"  {предупреждение}")
     return 0
 
 
