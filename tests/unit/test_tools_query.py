@@ -183,6 +183,37 @@ def test_остатки_на_дату_с_условием(индекс_ut, ли�
     assert спец.timeout_s == 180
 
 
+# Раунд правок 2 (факты живой базы 1С за IIS 10, 2026-09-10): значения, попадающие в путь
+# запроса (Condition/Dimensions виртуальной таблицы, литералы ключа), не переносят `?`, `+`,
+# `\`, управляющие символы — даже закодированными процентами (IIS искажает или отклоняет их
+# раньше, чем запрос доходит до 1С). Четыре класса символов проверены и для Condition, и для
+# ключа.
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        pytest.param("Валюта_Key eq guid'00000000?0000'", id="вопрос"),
+        pytest.param("Валюта_Key eq guid'00000000+0000'", id="плюс"),
+        pytest.param("Валюта_Key eq guid'00000000\\0000'", id="слэш"),
+        pytest.param("Валюта_Key eq guid'00000000\n0000'", id="управляющий-перевод-строки"),
+        pytest.param("Валюта_Key eq guid'00000000\x7f0000'", id="управляющий-del"),
+    ],
+)
+def test_condition_с_запрещённым_символом(индекс_ut, лимиты, condition):
+    остатки = индекс_ut.describe("AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance")
+    with pytest.raises(QueryError) as ошибка:
+        build_query(
+            остатки,
+            describe=индекс_ut.describe,
+            limits=лимиты,
+            virtual_timeout_s=180,
+            params={"Period": "2026-09-01", "Condition": condition},
+        )
+    assert ошибка.value.code == "params_invalid"
+    assert "IIS" in ошибка.value.hint
+
+
 def test_неизвестный_параметр_виртуальной_таблицы(индекс_ut, лимиты):
     срез = индекс_ut.describe("InformationRegister_КурсыВалют_SliceLast")
     with pytest.raises(QueryError) as ошибка:
@@ -309,6 +340,30 @@ def test_get_составной_ключ_полный(индекс_ut, лими�
         "InformationRegister_КурсыВалют(Period=datetime'2026-01-01T00:00:00',"
         "Валюта_Key=guid'00000000-0000-0000-0000-000000000000')"
     )
+
+
+@pytest.mark.parametrize(
+    "recorder",
+    [
+        pytest.param("a?b", id="вопрос"),
+        pytest.param("a+b", id="плюс"),
+        pytest.param("a\\b", id="слэш"),
+        pytest.param("a\nb", id="управляющий-перевод-строки"),
+        pytest.param("a\x7fb", id="управляющий-del"),
+    ],
+)
+def test_ключ_с_запрещённым_символом(индекс_ut, лимиты, recorder):
+    # Recorder регистра — Edm.String (не Edm.Guid): формат odata_literal его не отклонит, значит
+    # символ должен быть пойман отдельной проверкой раунда правок 2, а не GUID-регэкспом.
+    with pytest.raises(QueryError) as ошибка:
+        build_get(
+            индекс_ut.describe("AccumulationRegister_РасчетыСКлиентамиПланОплат"),
+            {"Recorder": recorder, "Recorder_Type": "StandardODATA.Document_Y"},
+            describe=индекс_ut.describe,
+            limits=лимиты,
+        )
+    assert ошибка.value.code == "params_invalid"
+    assert "IIS" in ошибка.value.hint
 
 
 def test_литералы():
