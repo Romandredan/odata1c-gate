@@ -370,7 +370,8 @@ def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
         time.sleep(0.2)
     print(
         f"демон не ответил на порту {порт} за {ОЖИДАНИЕ_ГОТОВНОСТИ_S} с — "
-        f"проверьте журнал: {home / 'logs' / 'daemon.log'}"
+        f"проверьте журнал: {home / 'logs'} (daemon.log — сам демон, "
+        f"daemon-launch.log — запуск через Планировщик заданий)"
     )
     return 1
 

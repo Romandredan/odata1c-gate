@@ -15,19 +15,27 @@ Elicitation (запрос демона к пользователю — прот�
 за один stdio-процесс лаунчера downstream-сессия всегда одна и та же.
 
 Обрыв связи с демоном посреди сессии (раунд правок 1, находка 1) не должен ронять весь процесс
-голым traceback: каждый из семи обработчиков перехватывает исключения апстрим-вызова и отдаёт
-клиенту штатный отказ — `CallToolResult(is_error=True, ...)` для `tools/call` (SPEC §5.2: ошибка
-тула — текст, не исключение), `MCPError` для остальных операций (SDK сам сериализует его в
-JSON-RPC-ошибку — `mcp/server/runner.py`, `raise_exceptions=False`).
+голым traceback и не должен вешать вызов клиента навсегда: каждый из семи обработчиков перехватывает
+исключения апстрим-вызова и отдаёт клиенту штатный отказ — `CallToolResult(is_error=True, ...)` для
+`tools/call` (SPEC §5.2: ошибка тула — текст, не исключение), `MCPError` для остальных операций
+(SDK сам сериализует его в JSON-RPC-ошибку — `mcp/server/runner.py`, `raise_exceptions=False`).
+Обычного `try/except` вокруг апстрим-вызова для этого недостаточно: SDK обнаруживает реальный
+обрыв TCP-соединения в СОБСТВЕННОЙ фоновой задаче (`mcp/client/streamable_http.py`), а не в задаче,
+которая ждёт ответа, — поэтому вызов висит бесконечно, а исключение всплывает только при закрытии
+всей сессии. Сторожок `_с_проверкой_живости` гоняет апстрим-вызов наперегонки с периодической
+TCP-проверкой порта демона и отменяет зависший вызов, если порт перестал отвечать — подробности
+в докстринге самой функции.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import pathlib
 import sys
 import time
+import urllib.parse
 
 import anyio
 import httpx2
@@ -57,12 +65,24 @@ _log = logging.getLogger(__name__)
 # сделал бы модули взаимозависимыми.
 ОЖИДАНИЕ_ГОТОВНОСТИ_S = 15
 
+
+class _АпстримМёртв(Exception):
+    """Внутренний сигнал сторожка `_с_проверкой_живости`: TCP-порт демона перестал отвечать,
+    пока апстрим-вызов ещё не вернул результат. Это НЕ таймаут вызова — Ruling 12
+    (`task-6-fix-1.md`) прямо запрещает вводить общий таймаут ради виртуальных таблиц (легитимно
+    идут до 180 с без признаков жизни): пока порт демона слушается, вызов ждёт сколько угодно;
+    сторожок обнаруживает именно МЁРТВЫЙ процесс, от которого ответа не дождаться ни за какое
+    время (см. `_с_проверкой_живости` — почему обычный `try/except` вокруг `await` этого
+    не ловит)."""
+
+
 # Раунд правок 1, находка 1: транспортные сбои апстрима, которые обработчики прокси превращают
 # в штатный отказ, а не пропускают голым traceback. `MCPError` — демон закрыл соединение или
 # ответил протокольной ошибкой (`probe_death2.py`: `MCPError: Connection closed`);
 # `httpx2.HTTPError` — сетевой сбой самого HTTP-транспорта под streamable_http_client;
 # `anyio.BrokenResourceError/ClosedResourceError/EndOfStream` — поток апстрима закрыт или порван;
-# `TimeoutError`/`OSError` — таймаут или сбой сокета. Осознанно НЕ `Exception` целиком: ошибка в
+# `TimeoutError`/`OSError` — таймаут или сбой сокета. `_АпстримМёртв` — сторожок обнаружил мёртвый
+# TCP-порт под зависшим вызовом (см. класс выше). Осознанно НЕ `Exception` целиком: ошибка в
 # собственном коде обработчика (опечатка, дефект) не должна маскироваться под «демон недоступен».
 ОШИБКИ_АПСТРИМА: tuple[type[Exception], ...] = (
     MCPError,
@@ -72,11 +92,100 @@ _log = logging.getLogger(__name__)
     anyio.EndOfStream,
     TimeoutError,
     OSError,
+    _АпстримМёртв,
 )
 
 ДЕМОН_НЕДОСТУПЕН = (
     "демон 1С-шлюза недоступен, соединение потеряно; следующий вызов поднимет его заново"
 )
+
+# Раунд правок 1, находка 1 (повторная проверка после первичной правки): период между TCP-
+# проверками сторожка `_с_проверкой_живости`. Не связан с `ОЖИДАНИЕ_ГОТОВНОСТИ_S` (холодный старт)
+# — это обнаружение СМЕРТИ уже поднятого демона, не ожидание его запуска.
+ИНТЕРВАЛ_СТОРОЖКА_С = 1.0
+
+
+async def _демон_жив(host: str, port: int, *, timeout: float = 1.0) -> bool:
+    """Асинхронная TCP-проверка «жив ли демон» для сторожка `_с_проверкой_живости` — аналог
+    `daemon.is_listening`, но без блокировки цикла событий: тот использует синхронный
+    `socket.create_connection`, а сторожок вызывается ПАРАЛЛЕЛЬНО с апстрим-вызовом внутри того же
+    процесса лаунчера — блокировать цикл на каждой проверке нельзя."""
+    try:
+        _, писатель = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except (OSError, TimeoutError):
+        return False
+    писатель.close()
+    with contextlib.suppress(OSError):
+        await писатель.wait_closed()
+    return True
+
+
+def _host_port_из_адреса(адрес: str) -> tuple[str, int] | None:
+    """host/port демона из адреса апстрима (`daemon_url(порт)` из `daemon.yaml` или явный
+    `--url`) — сторожку `_с_проверкой_живости` нужен голый TCP-адрес, не HTTP URL целиком.
+    `None`, если хост не разобрать (адрес без hostname) — тогда сторожок не запускается вовсе,
+    поведение как до этой правки: голый `await вызов` без гонки."""
+    части = urllib.parse.urlsplit(адрес)
+    if not части.hostname:
+        return None
+    порт = части.port or (443 if части.scheme == "https" else 80)
+    return части.hostname, порт
+
+
+async def _с_проверкой_живости(
+    host_port: tuple[str, int] | None,
+    вызов,
+    *,
+    проверка_живости=_демон_жив,
+    интервал: float = ИНТЕРВАЛ_СТОРОЖКА_С,
+):
+    """Гонка апстрим-вызова против периодической TCP-проверки демона (раунд правок 1, находка 1;
+    вторая, действующая правка — первая версия ловила только исключения, брошенные СИНХРОННО
+    внутри `await upstream.call_tool(...)`, чего недостаточно для настоящего обрыва).
+
+    Почему простой `try/except` вокруг `await upstream.call_tool(...)` не работает: обрыв
+    соединения обнаруживается не в вызывающей задаче, а в СОБСТВЕННОЙ внутренней задаче
+    `streamable_http_client` (запрос POST — `mcp/client/streamable_http.py::_run_request_post`,
+    вызывается из отдельной `anyio.create_task_group()` внутри самого `streamable_http_client`),
+    и её исключение всплывает только когда закрывается ВЕСЬ `async with streamable_http_client(...)`
+    — то есть когда завершается вся сессия лаунчера целиком. До этого момента
+    `await upstream.call_tool(...)` просто висит, ничего не возвращая и не падая. Доказано
+    прогоном `probe_death2.py` на уже слитой в этот раунд правке (без сторожка): вызов после
+    смерти демона не отвечает 30+ с (испытание оборвано таймаутом пробы, реальный потолок —
+    закрытие всей сессии), а 123-строчный `ExceptionGroup` печатается лаунчером в stderr только
+    в момент закрытия stdio. Обычный `try/except` вокруг ОДНОГО `await` физически не может
+    перехватить исключение, брошенное в ДРУГОЙ задаче того же процесса.
+
+    `host_port is None` — сторожок не запускается вовсе (адрес апстрима не разобрать): поведение
+    как до этой правки, голый `await вызов`. Иначе — `вызов` и сторожок (переодическая
+    `проверка_живости`, период `интервал`) бегут в одной `anyio.create_task_group()`; кто первым
+    завершится, тот и определяет исход — успешный результат отменяет сторожок, смерть порта
+    отменяет зависший вызов и поднимает `_АпстримМёртв`. `anyio.create_task_group()` заворачивает
+    исключение единственной упавшей задачи в `BaseExceptionGroup` — разворачиваем его обратно,
+    чтобы вызывающий код (`_переслать`/`_вызвать_тул`) продолжал ловить голые типы из
+    `ОШИБКИ_АПСТРИМА`, как и раньше."""
+    if host_port is None:
+        return await вызов
+    host, port = host_port
+    исход: dict[str, object] = {}
+
+    async def _основной(группа) -> None:
+        исход["значение"] = await вызов
+        группа.cancel_scope.cancel()
+
+    async def _сторожок() -> None:
+        while True:
+            await anyio.sleep(интервал)
+            if not await проверка_живости(host, port):
+                raise _АпстримМёртв(f"TCP {host}:{port} не отвечает — демон, судя по всему, умер")
+
+    try:
+        async with anyio.create_task_group() as группа:
+            группа.start_soon(_основной, группа)
+            группа.start_soon(_сторожок)
+    except* BaseException as исключения:
+        raise исключения.exceptions[0] from None
+    return исход["значение"]
 
 
 class ProxyHolder:
@@ -87,6 +196,20 @@ class ProxyHolder:
 
     def __init__(self) -> None:
         self.session: object | None = None
+        # Раунд правок 1, находка 1 (третья правка — «замок» на сессию): выставляется первым же
+        # обработчиком, поймавшим `ОШИБКИ_АПСТРИМА`. Эмпирически (`probe_death2.py` на второй
+        # версии правки — сторожок сам по себе): ПЕРВЫЙ вызов после смерти демона сторожок ловит
+        # штатно (TCP-проверка + отмена зависшего `upstream.call_tool`), но ВТОРОЙ вызов на ТОЙ ЖЕ
+        # апстрим-сессии зависает уже без единого отклика даже от сторожка — судя по всему, после
+        # первого обрыва `streamable_http_client`/`ClientSession` остаются в необратимо сломанном
+        # состоянии (внутренняя задача `_run_request_post` первого запроса не освобождает то, от
+        # чего зависит планирование следующей). Без замка второй и все последующие вызовы висели
+        # бы снова, хотя сторожок для первого сработал безукоризненно. Замок — не таймаут
+        # выполнения (Ruling 12), а решение НЕ пытаться повторно сходить к апстриму, про который
+        # уже достоверно известно, что он сломан безвозвратно в рамках ЭТОЙ сессии лаунчера;
+        # процесс лаунчера в целом не падает и следующий отдельный запуск `odata1c mcp`
+        # (`_дождаться_демона` в начале `run_launcher`) поднимает демон заново, как обычно.
+        self.апстрим_мёртв: bool = False
 
 
 def forward_elicit(holder: ProxyHolder):
@@ -120,31 +243,63 @@ def forward_elicit(holder: ProxyHolder):
     return on_elicit
 
 
-async def _переслать(операция: str, вызов):
+async def _переслать(
+    операция: str,
+    вызов_фабрика,
+    holder: ProxyHolder,
+    host_port: tuple[str, int] | None = None,
+):
     """Общая точка вызова апстрима для операций без «штатного отказа» на уровне результата
     (`list_tools`/`list_resources`/`list_resource_templates`/`read_resource`/`list_prompts`/
     `get_prompt`): транспортный сбой (`ОШИБКИ_АПСТРИМА`) превращается в `MCPError` с понятным
     текстом — SDK сама сериализует его в JSON-RPC-ошибку клиенту (`raise_exceptions=False`,
     `mcp/server/runner.py`), голый traceback наружу не идёт. `tools/call` — отдельная функция
     (`_вызвать_тул`): там штатный отказ оформляется результатом (`is_error=True`), не исключением
-    (SPEC §5.2)."""
+    (SPEC §5.2).
+
+    `host_port` — сторожок `_с_проверкой_живости` (раунд правок 1, находка 1): без него завис
+    бы навсегда обрыв, обнаруженный не в этом `await`, а в чужой внутренней задаче SDK.
+
+    `holder.апстрим_мёртв` — «замок» на сессию (та же находка, третья правка): выставлен —
+    апстрим уже достоверно сломан, повторный `await` на нём не предпринимается вовсе (второй и
+    все последующие вызовы после первого обнаруженного обрыва сами зависают без единого отклика
+    даже от сторожка — см. докстринг `ProxyHolder`). `вызов_фабрика` — НЕ готовая корутина, а
+    вызываемый без аргументов конструктор корутины: при выставленном замке она не должна
+    создаваться вообще (иначе — `RuntimeWarning: coroutine was never awaited`, которую
+    `filterwarnings = ["error"]` в pyproject.toml превращает в ошибку теста)."""
+    if holder.апстрим_мёртв:
+        raise MCPError(code=types.INTERNAL_ERROR, message=ДЕМОН_НЕДОСТУПЕН)
     try:
-        return await вызов
+        return await _с_проверкой_живости(host_port, вызов_фабрика())
     except ОШИБКИ_АПСТРИМА as ошибка:
         _log.warning("апстрим недоступен при %s: %s: %s", операция, type(ошибка).__name__, ошибка)
+        holder.апстрим_мёртв = True
         raise MCPError(code=types.INTERNAL_ERROR, message=ДЕМОН_НЕДОСТУПЕН) from ошибка
 
 
-async def _вызвать_тул(upstream: ClientSession, params: types.CallToolRequestParams):
+async def _вызвать_тул(
+    upstream: ClientSession,
+    params: types.CallToolRequestParams,
+    holder: ProxyHolder,
+    host_port: tuple[str, int] | None = None,
+):
     """`tools/call`: штатный отказ — `CallToolResult(is_error=True, ...)`, не исключение (SPEC
     §5.2 — исключение теряет текст у клиента). Ошибка САМОГО тула демона (например, тул поднял
     исключение внутри своей логики) в исключение `call_tool` не превращается вообще — это уже
     `CallToolResult(is_error=True)`, дошедший как обычный результат; сюда попадают только
-    транспортные сбои (`ОШИБКИ_АПСТРИМА`)."""
+    транспортные сбои (`ОШИБКИ_АПСТРИМА`). `host_port`/`holder.апстрим_мёртв` — см. `_переслать`."""
+    if holder.апстрим_мёртв:
+        return types.CallToolResult(
+            is_error=True,
+            content=[types.TextContent(type="text", text=ДЕМОН_НЕДОСТУПЕН)],
+        )
     try:
-        return await upstream.call_tool(params.name, params.arguments or {})
+        return await _с_проверкой_живости(
+            host_port, upstream.call_tool(params.name, params.arguments or {})
+        )
     except ОШИБКИ_АПСТРИМА as ошибка:
         _log.warning("апстрим недоступен при tools/call: %s: %s", type(ошибка).__name__, ошибка)
+        holder.апстрим_мёртв = True
         return types.CallToolResult(
             is_error=True,
             content=[types.TextContent(type="text", text=ДЕМОН_НЕДОСТУПЕН)],
@@ -158,6 +313,7 @@ def build_proxy(
     name: str = "odata1c-mcp-launcher",
     version: str = "",
     instructions: str | None = None,
+    host_port: tuple[str, int] | None = None,
 ) -> Server:
     """Прокси лаунчера: семь обработчиков lowlevel `Server`, каждый вызывает соответствующий
     метод апстрим-сессии (демона) и возвращает его результат как есть — своей логики здесь нет
@@ -169,37 +325,57 @@ def build_proxy(
     1С (SPEC §5). `run_launcher` передаёт сюда результат `upstream.initialize()` как есть —
     прокси представляется клиенту тем же, чем демон представился прокси. Значения по умолчанию
     оставлены только ради обратной совместимости вызова без них (юнит-тесты в памяти, где
-    инструкции демона не важны)."""
+    инструкции демона не важны).
+
+    `host_port` — раунд правок 1, находка 1 (сторожок `_с_проверкой_живости`): `run_launcher`
+    передаёт сюда host/port демона, разобранные из адреса апстрима. `None` по умолчанию — тесты
+    в памяти (`InMemoryTransport`) не поднимают настоящий TCP-порт, сторожку там нечего слушать."""
 
     async def on_list_tools(ctx, params):
         holder.session = ctx.session
-        return await _переслать("tools/list", upstream.list_tools(params=params))
+        return await _переслать(
+            "tools/list", lambda: upstream.list_tools(params=params), holder, host_port
+        )
 
     async def on_call_tool(ctx, params: types.CallToolRequestParams):
         holder.session = ctx.session
-        return await _вызвать_тул(upstream, params)
+        return await _вызвать_тул(upstream, params, holder, host_port)
 
     async def on_list_resources(ctx, params):
         holder.session = ctx.session
-        return await _переслать("resources/list", upstream.list_resources(params=params))
+        return await _переслать(
+            "resources/list", lambda: upstream.list_resources(params=params), holder, host_port
+        )
 
     async def on_list_resource_templates(ctx, params):
         holder.session = ctx.session
         return await _переслать(
-            "resources/templates/list", upstream.list_resource_templates(params=params)
+            "resources/templates/list",
+            lambda: upstream.list_resource_templates(params=params),
+            holder,
+            host_port,
         )
 
     async def on_read_resource(ctx, params: types.ReadResourceRequestParams):
         holder.session = ctx.session
-        return await _переслать("resources/read", upstream.read_resource(params.uri))
+        return await _переслать(
+            "resources/read", lambda: upstream.read_resource(params.uri), holder, host_port
+        )
 
     async def on_list_prompts(ctx, params):
         holder.session = ctx.session
-        return await _переслать("prompts/list", upstream.list_prompts(params=params))
+        return await _переслать(
+            "prompts/list", lambda: upstream.list_prompts(params=params), holder, host_port
+        )
 
     async def on_get_prompt(ctx, params: types.GetPromptRequestParams):
         holder.session = ctx.session
-        return await _переслать("prompts/get", upstream.get_prompt(params.name, params.arguments))
+        return await _переслать(
+            "prompts/get",
+            lambda: upstream.get_prompt(params.name, params.arguments),
+            holder,
+            host_port,
+        )
 
     return Server(
         name,
@@ -254,7 +430,8 @@ async def _дождаться_демона(home: pathlib.Path, port: int) -> Non
         await asyncio.sleep(0.2)
     print(
         f"демон не ответил на порту {port} за {ОЖИДАНИЕ_ГОТОВНОСТИ_S} с — "
-        f"проверьте журнал: {home / 'logs' / 'daemon.log'}",
+        f"проверьте журнал: {home / 'logs'} (daemon.log — сам демон, "
+        f"daemon-launch.log — запуск через Планировщик заданий)",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -292,6 +469,7 @@ async def run_launcher(
     holder = ProxyHolder()
     таймаут = httpx2.Timeout(10, read=None)
     заголовки = scope_headers(bases, default)
+    host_port = _host_port_из_адреса(адрес)
     async with (
         httpx2.AsyncClient(headers=заголовки, timeout=таймаут) as http,
         streamable_http_client(адрес, http_client=http) as (up_read, up_write),
@@ -304,6 +482,7 @@ async def run_launcher(
             name=итог_инициализации.server_info.name,
             version=итог_инициализации.server_info.version,
             instructions=итог_инициализации.instructions,
+            host_port=host_port,
         )
         async with stdio_server() as (read, write):
             await proxy.run(read, write, proxy.create_initialization_options())

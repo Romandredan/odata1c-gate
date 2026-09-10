@@ -9,8 +9,10 @@
 заданий) — `tests/integration/test_end_to_end.py` и `test_daemon_survives_session.py`.
 """
 
+import asyncio
 import contextlib
 
+import anyio
 import httpx2
 import mcp.types as types
 import pytest
@@ -20,6 +22,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, Field
 
+from odata1c import launcher as launcher_module
 from odata1c.daemon import SCOPE_BASES_HEADER, SCOPE_DEFAULT_HEADER
 from odata1c.launcher import ProxyHolder, build_proxy, forward_elicit, scope_headers
 
@@ -95,7 +98,7 @@ class _Подключение:
 
 
 @contextlib.asynccontextmanager
-async def _подключение(*, downstream_elicit=_клиентский_elicit, elicit_wrapper=forward_elicit):
+async def _подключение(*, downstream_elicit=_клиентский_elicit, elicit_wrapper=None):
     """Собирает обе стороны прокси: апстрим-сессия к демону-заглушке (транспорт 1), прокси
     поверх неё, downstream-клиент к прокси (транспорт 2). Отдаёт `_Подключение(client, up_init)`
     — `up_init` нужен тестам точки 2 (инструкции/имя/версия), чтобы сверить их с тем, что видит
@@ -107,13 +110,21 @@ async def _подключение(*, downstream_elicit=_клиентский_eli
     привязан к конкретной задаче (`Task`) asyncio; `pytest-asyncio` выполняет шаг ДО `yield`
     и шаг ПОСЛЕ `yield` асинхронной фикстуры в разных задачах, и выход из такого cancel scope
     в другой задаче — `RuntimeError` у anyio, а не у прокси. Один тест — одна задача, поэтому
-    вход и выход остаются в одной и той же."""
+    вход и выход остаются в одной и той же.
+
+    `elicit_wrapper=None` — по умолчанию берём `launcher_module.forward_elicit` заново при
+    КАЖДОМ вызове (атрибут модуля, не значение по умолчанию параметра, связываемое один раз при
+    определении функции): значение по умолчанию параметра вычисляется в момент определения
+    функции и фиксируется навсегда — `monkeypatch.setattr(launcher_module, "forward_elicit", …)`
+    в чужом скрипте ревью (`test_mutation.py`) до такого фиксированного значения не достучится,
+    и тест находки 6 читался бы зелёным по ложной причине, даже если сама пересылка сломана."""
+    обёртка = elicit_wrapper if elicit_wrapper is not None else launcher_module.forward_elicit
     демон = _демон_заглушка()
     holder = ProxyHolder()
 
     async with (
         InMemoryTransport(демон) as (up_read, up_write),
-        ClientSession(up_read, up_write, elicitation_callback=elicit_wrapper(holder)) as upstream,
+        ClientSession(up_read, up_write, elicitation_callback=обёртка(holder)) as upstream,
     ):
         up_init = await upstream.initialize()
         # Раунд правок 1, находка 2: прокси передаёт клиенту то же имя/версию/инструкции, что
@@ -353,3 +364,139 @@ async def test_обрыв_апстрима_остальные_операции_�
             await вызов(client)
         assert "демон" in str(информация.value)
         assert "недоступен" in str(информация.value)
+
+
+# -------------------------------------------------------------------------------------------
+# Находка 1 (повторная проверка): `_ПадающийАпстрим` выше падает СИНХРОННО внутри `await` — этого
+# недостаточно, реальный обрыв обнаруживается в чужой фоновой задаче SDK, и `await
+# upstream.call_tool(...)` просто висит, не падая (доказано `probe_death2.py` на предыдущей
+# версии правки: висит 30+ с, снимается только закрытием всей сессии). Эти тесты бьют именно по
+# сторожку `_с_проверкой_живости`, напрямую, без сети и без `InMemoryTransport`.
+# -------------------------------------------------------------------------------------------
+
+
+async def test_сторожок_отменяет_зависший_навсегда_вызов_когда_порт_демона_умер():
+    """Мутационное доказательство: убери сторожок (верни `_с_проверкой_живости` к простому
+    `return await вызов` без гонки) — этот тест перестаёт получать `_АпстримМёртв` и падает по
+    `asyncio.wait_for` таймауту (2 с, а не зависает навсегда — граница нужна, чтобы регрессия
+    была явным падением теста, а не зависшим прогоном pytest)."""
+
+    async def вечно_висящий_вызов():
+        # Ровно то поведение реального `upstream.call_tool(...)` после обрыва TCP-соединения:
+        # ничего не возвращает и не падает (probe_death2.py).
+        await anyio.sleep_forever()
+
+    проверок = 0
+
+    async def умирает_со_второй_проверки(host: str, port: int) -> bool:
+        nonlocal проверок
+        проверок += 1
+        return проверок < 2  # первая проверка — демон ещё жив, вторая — уже умер
+
+    with pytest.raises(launcher_module._АпстримМёртв):
+        await asyncio.wait_for(
+            launcher_module._с_проверкой_живости(
+                ("127.0.0.1", 1),
+                вечно_висящий_вызов(),
+                проверка_живости=умирает_со_второй_проверки,
+                интервал=0.01,
+            ),
+            timeout=2.0,
+        )
+    assert проверок >= 2
+
+
+async def test_сторожок_не_мешает_успешному_вызову_при_живом_порте():
+    async def успешный_вызов():
+        await anyio.sleep(0.05)
+        return "готово"
+
+    async def порт_всегда_жив(host: str, port: int) -> bool:
+        return True
+
+    результат = await asyncio.wait_for(
+        launcher_module._с_проверкой_живости(
+            ("127.0.0.1", 1),
+            успешный_вызов(),
+            проверка_живости=порт_всегда_жив,
+            интервал=0.01,
+        ),
+        timeout=2.0,
+    )
+    assert результат == "готово"
+
+
+async def test_сторожок_без_host_port_не_включается():
+    """`host_port=None` (адрес апстрима не разобрать) — поведение как до всей правки находки 1:
+    голый `await вызов`, без гонки и без сторожка вовсе."""
+
+    async def обычный_вызов():
+        return "ok"
+
+    assert await launcher_module._с_проверкой_живости(None, обычный_вызов()) == "ok"
+
+
+async def test_сторожок_пробрасывает_синхронную_ошибку_апстрима_как_есть():
+    """Сторожок не должен маскировать «обычный» синхронный сбой (`_ПадающийАпстрим`-подобный)
+    под свой собственный тип — наружу должен уйти ИСХОДНЫЙ тип исключения (здесь — `RuntimeError`
+    учебного вызова), не `_АпстримМёртв` и не завёрнутый `BaseExceptionGroup`."""
+
+    async def падает_сразу():
+        raise RuntimeError("сбой апстрима — не про мёртвый порт")
+
+    async def порт_всегда_жив(host: str, port: int) -> bool:
+        return True
+
+    with pytest.raises(RuntimeError, match="сбой апстрима"):
+        await launcher_module._с_проверкой_живости(
+            ("127.0.0.1", 1),
+            падает_сразу(),
+            проверка_живости=порт_всегда_жив,
+            интервал=0.01,
+        )
+
+
+# -------------------------------------------------------------------------------------------
+# Находка 1 (третья правка — «замок» на сессию, `ProxyHolder.апстрим_мёртв`): реальным прогоном
+# `probe_death2.py` против уже готового сторожка обнаружено, что ВТОРОЙ вызов на той же
+# апстрим-сессии после первого обрыва зависает заново — без единого отклика даже от сторожка
+# (судя по всему, `streamable_http_client`/`ClientSession` остаются необратимо сломаны после
+# первого обрыва). Замок останавливает ЛЮБУЮ повторную попытку сходить к уже помеченному мёртвым
+# апстриму — второй и все последующие вызовы получают штатный отказ мгновенно, не трогая апстрим.
+# -------------------------------------------------------------------------------------------
+
+
+class _ПадающийОдинРаз:
+    """Апстрим, падающий РОВНО один раз — при второй попытке молча виснет навсегда
+    (`anyio.sleep_forever()`), если бы её вообще предприняли. Доказывает, что после первого
+    обнаруженного обрыва прокси больше не пытается сходить к апстриму заново в рамках этой же
+    сессии лаунчера: без замка второй вызов дошёл бы до `call_tool` и тест бы завис (снимается
+    только `asyncio.wait_for`)."""
+
+    def __init__(self) -> None:
+        self.вызовов = 0
+
+    async def call_tool(self, name, arguments):
+        self.вызовов += 1
+        if self.вызовов == 1:
+            raise httpx2.ConnectError("соединение с демоном потеряно")
+        await anyio.sleep_forever()
+
+
+async def test_после_первого_обрыва_замок_не_даёт_апстриму_дёргаться_снова():
+    апстрим = _ПадающийОдинРаз()
+    holder = ProxyHolder()
+    proxy = build_proxy(апстрим, holder)
+    async with (
+        InMemoryTransport(proxy) as (r, w),
+        ClientSession(r, w) as client,
+    ):
+        await client.initialize()
+
+        первый = await client.call_tool("что-угодно", {})
+        assert первый.is_error is True
+
+        второй = await asyncio.wait_for(client.call_tool("что-угодно", {}), timeout=2.0)
+        assert второй.is_error is True
+        # Ключевая проверка: второй вызов НЕ дошёл до апстрима — замок сработал раньше.
+        assert апстрим.вызовов == 1
