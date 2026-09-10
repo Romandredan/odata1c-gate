@@ -269,6 +269,24 @@ async def test_metadata_доходит_буквальной_строкой_не_
     assert route.calls[0].request.url.raw_path == b"/ut/odata/standard.odata/$metadata"
 
 
+@respx.mock
+async def test_пробел_в_отборе_уходит_как_percent20_а_не_плюсом():
+    """1С не знает HTML-правила «`+` в query равен пробелу»: плюс доходит до платформы буквально
+    и разбирается как операция. Проверено на живой базе (УТ 11, 8.3):
+    `$filter=ИНН+eq+'5024093941'` → 500 «Операция не разрешена в предложении "ГДЕ"», тот же отбор
+    с `%20` → 200 и данные. Отсюда `_собрать_запрос` вместо `params=` у httpx (httpx кодирует
+    пробел плюсом). Сверка байт-в-байт по `raw_path`: respx нормализует URL и `+` от `%20` как
+    цель маршрута не отличает — без этой проверки тест остался бы зелёным и с дефектом."""
+    route = respx.route(url__regex=r".*").mock(return_value=httpx.Response(200, json={"value": []}))
+    client = Client1C(база())
+    await client.get("Catalog_Контрагенты", {"$filter": "ИНН eq '5024093941'", "$top": 3})
+    await client.close()
+
+    сырой = route.calls[0].request.url.raw_path
+    assert b"%20eq%20" in сырой
+    assert b"+" not in сырой
+
+
 async def test_невалидный_url_даёт_odata_error_а_не_голое_исключение():
     """Если бы экранирование где-то обошли (или ослабили), httpx поднял бы `httpx.InvalidURL` —
     исключение, которое НЕ является подклассом `httpx.HTTPError` и без отдельного перехвата

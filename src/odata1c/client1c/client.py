@@ -45,6 +45,19 @@ def _экранировать_путь(path: str) -> str:
     return urllib.parse.quote(path, safe=_БЕЗОПАСНЫЕ_СИМВОЛЫ_ПУТИ)
 
 
+def _собрать_запрос(params: dict) -> str:
+    """Строка параметров запроса, где пробел закодирован `%20`, а не `+`.
+
+    httpx (как и `urlencode` по умолчанию) кодирует пробел плюсом — форма из HTML, где `+`
+    в query равен пробелу. 1С этого правила не знает: `+` в `$filter` доходит до платформы
+    буквально и разбирается как операция. Проверено на живой базе (УТ 11, платформа 8.3):
+    `$filter=ИНН+eq+'5024093941'` → 500 «Операция не разрешена в предложении "ГДЕ"»,
+    тот же отбор с `%20` → 200. Поэтому query собирается здесь, а не передаётся в httpx
+    аргументом `params`: готовую процентную запись httpx сохраняет как есть.
+    """
+    return urllib.parse.urlencode(params, quote_via=urllib.parse.quote, safe="")
+
+
 class Client1C:
     def __init__(self, base: BaseConfig) -> None:
         self._base = base
@@ -155,6 +168,8 @@ class Client1C:
         params = dict(params or {})
         if add_format:
             params.setdefault("$format", "json")
+        запрос = _собрать_запрос(params)
+        цель = f"{путь}?{запрос}" if запрос else путь
         headers = dict(headers or {})
         if json is not None:
             headers["Content-Type"] = "application/json"
@@ -177,8 +192,7 @@ class Client1C:
                 try:
                     response = await self._client.request(
                         method,
-                        путь,
-                        params=params,
+                        цель,
                         json=json,
                         headers=headers,
                         **параметры_запроса,
