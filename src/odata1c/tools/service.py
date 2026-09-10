@@ -150,6 +150,12 @@ class ToolService:
             _log.exception("gate.error упал при обработке ошибки тула — отдан отказ без данных")
             return _ОТКАЗ_НА_КРАЙНИЙ_СЛУЧАЙ
 
+    def _guard_error(self, code: str, message: str, hint: str = "") -> str:
+        """Ошибка тула БЕЗ гейта конкретной базы: либо база ещё не определена, либо гейт этой
+        базы не удалось построить (см. `_run`) — в обоих случаях `gate.error`/`_safe_error`
+        вызвать нечем, страж живёт на сервисе независимо от гейта (SPEC §6.8)."""
+        return guard_only(self._guard, {"error": {"code": code, "message": message, "hint": hint}})
+
     async def _run(self, scope: SessionScope, base: str | None, body, *, finisher=None) -> str:
         """Общая точка входа тулов на одну базу: разрешить базу → получить/обновить гейт →
         открыть индекс на время вызова → выполнить `body(base_config, gate, repo)` → отдать
@@ -161,12 +167,31 @@ class ToolService:
         except ConfigError as ошибка:
             # База не определена — гейта для неё нет и быть не может (нет ни политики, ни
             # известного режима): страж на строжайшем уровне, не gate.error.
-            return guard_only(
-                self._guard,
-                {"error": {"code": ошибка.code, "message": str(ошибка), "hint": ошибка.hint}},
+            return self._guard_error(ошибка.code, str(ошибка), ошибка.hint)
+
+        try:
+            гейт = self._gate_for(base_config)
+        except (ConfigError, PolicyError, IndexCorruptError) as ошибка:
+            # Критично (ревью, раунд 1): `_gate_for` конструирует `BaseGate` при первом
+            # обращении, а конструктор сам вызывает `refresh()` → `load_policy()` — на
+            # СУЩЕСТВУЮЩЕМ, но синтаксически битом policy.yaml это `PolicyError` ДО входа во
+            # второй try ниже (тот перехватывает `PolicyError` только у вызовов `refresh()`
+            # ПОСЛЕ успешного первого построения гейта). Без отдельного try этот путь ронял бы
+            # голое исключение мимо клиента MCP, а сам гейт — раз конструктор упал — не
+            # закэширован, и следующий вызов падал бы точно так же. Здесь и гейта, чтобы
+            # замаскировать сообщение через `gate.error`, ещё нет — тот же приём, что и для
+            # неопределённой базы выше: `guard_only` на страже сервиса.
+            return self._guard_error(
+                getattr(ошибка, "code", "internal"), str(ошибка), getattr(ошибка, "hint", "")
+            )
+        except Exception:
+            _log.exception(
+                "внутренняя ошибка при построении гейта базы odata1c — детали в журнале демона"
+            )
+            return self._guard_error(
+                "internal", "внутренняя ошибка шлюза, подробности в журнале демона"
             )
 
-        гейт = self._gate_for(base_config)
         репозиторий: IndexRepository | None = None
         try:
             гейт.refresh()
@@ -257,6 +282,35 @@ class ToolService:
                 return repo.describe(имя_родителя)
         return None
 
+    def _поле_защищено_по_пути(
+        self, repo: IndexRepository, gate: BaseGate, desc: EntityDescription, path: str
+    ) -> bool:
+        """Защищено ли конечное поле пути `$orderby` — путь может идти через навигацию
+        (`Контрагент/ИНН`): сортировка по такому полю раскрывает исходное значение не хуже
+        прямого (ревью, раунд 1, Minor) — `is_protected(entity, "Контрагент/ИНН")` с сущностью
+        верхнего уровня всегда возвращал бы «не защищено», потому что ключи политики —
+        `сущность.поле`, а не путь. Путь резолвится через `EntityDescription.navigations` той же
+        цепочкой, что `odata_query._обработать_expand` резолвит `$expand` — но без ограничения
+        по `limits.expand_depth`: здесь не строится запрос, а только проверяется защита.
+
+        `build_query` НЕ проверяет путь `$orderby` вообще — он копирует строку `orderby` в
+        `$orderby` как есть (в отличие от `$expand`, который и правда идёт через
+        `_обработать_expand`); это единственная проверка навигационного пути orderby во всём
+        конвейере. Нераспознанный сегмент (неизвестная навигация или сущность-цель) — отказ
+        консервативный (`True`, «защищено»): раскрывать оракул сравнения на пути, который сама
+        эта проверка не может объяснить, опаснее, чем излишне запретить сортировку."""
+        *навигации, поле = path.split("/")
+        текущая = desc
+        for сегмент in навигации:
+            цель_имя = текущая.navigations.get(сегмент)
+            if цель_имя is None:
+                return True
+            следующая = repo.describe(цель_имя)
+            if следующая is None:
+                return True
+            текущая = следующая
+        return gate.is_protected(текущая.name, поле)
+
     def _видимые_кандидаты(
         self,
         repo: IndexRepository,
@@ -294,7 +348,12 @@ class ToolService:
                 try:
                     репозиторий = IndexRepository(путь)
                 except IndexCorruptError as ошибка:
-                    строка["last_error"] = str(ошибка)
+                    # Ключ НЕ "last_error" (ревью, раунд 1, Minor): так называется поле
+                    # BaseState, которое заполняет Registry.set_error текстом OdataError на
+                    # путях реиндекса — 1С-данные. Здесь же — локальный текст IndexCorruptError
+                    # (путь к файлу и сообщение sqlite, без содержимого 1С), и разные имена не
+                    # дают их перепутать и однажды случайно вывести первое под видом второго.
+                    строка["index_error"] = str(ошибка)
                 else:
                     try:
                         репозиторий.require_current_version()
@@ -307,7 +366,7 @@ class ToolService:
                     except IndexCorruptError as ошибка:
                         # Одна база со старым индексом не должна обнулять список остальных —
                         # состояние остаётся indexed=False с пояснением, а не отказ всего тула.
-                        строка["last_error"] = str(ошибка)
+                        строка["index_error"] = str(ошибка)
                     finally:
                         репозиторий.close()
             строки.append(строка)
@@ -321,13 +380,18 @@ class ToolService:
                 f"опишите базы в {self._config.home / 'bases.yaml'} или перенесите из прежнего "
                 "сервера: odata1c base import <путь к env>"
             )
-        # Не guard_only и не gate.finish какой-то одной базы: guard_only — строжайший уровень
-        # ДЛЯ ДАННЫХ 1С у ещё не определённой базы (см. докстринг pipeline.guard_only), а здесь
-        # база у каждой строки как раз определена, и данные не из 1С — это локальные bases.yaml
-        # (label, role, gate, write) и метаданные индекса (indexed_at, entity_count). Пропустить
-        # их через страж значило бы переписать имя, которое пользователь сам выбрал для базы с
-        # отключённым гейтом (mode=off), под гейт другой базы — то есть испортить локальные
-        # данные, а не защитить чужие (ревью плана, раунд 2).
+        # Не guard_only (ревью, раунд 1, Minor — обсуждено и оставлено как есть): guard_only —
+        # строжайший уровень ДЛЯ ДАННЫХ 1С у ещё не определённой базы (см. докстринг
+        # pipeline.guard_only), а здесь база у каждой строки определена, и то, что уходит в
+        # конверт, — ТОЛЬКО локальные данные: bases.yaml (name, label, role, gate, write) и
+        # метаданные индекса (indexed_at, entity_count, index_error — текст IndexCorruptError,
+        # см. выше). Пропустить их через страж на строжайшем уровне ломает, а не защищает:
+        # доказано исполнением — label "Песочница 7707083893" у базы с gate=off после
+        # guard_only на identifiers+names превращался в "Песочница [[inn:…]]", потому что цифры
+        # совпали с уже токенизированным в словаре значением другой базы (тест
+        # test_bases_не_пропускает_локальные_данные_через_страж). BaseState.last_error
+        # (Registry.set_error, текст OdataError на путях реиндекса — уже данные 1С) сюда
+        # СОЗНАТЕЛЬНО не выводится и не должен появиться без прогона через гейт своей базы.
         return json.dumps(конверт, ensure_ascii=False)
 
     async def find_entity(
@@ -372,6 +436,14 @@ class ToolService:
             # Реализация обязана читать РЕАЛЬНУЮ структуру EntityDescription/describe(), а не
             # полагаться на бриф вслепую (решение оркестратора) — отсюда прямой проброс полей
             # через describe_tool.build, без домысливания недостающих атрибутов.
+            #
+            # `гейт._policy` — обращение к приватному атрибуту BaseGate (ревью, раунд 1, Minor):
+            # `pipeline.py` не даёт публичного доступа к `Policy`, а бриф этой задачи прямо
+            # называет `masking.effective_field_class(policy, entity, field, mode=...)` как
+            # источник класса поля для describe, и `pipeline.py` вне зоны правок задачи 4. Связ-
+            # анность осознанная, не забытая — публичный аксессор (`BaseGate.policy`/`.field_
+            # class(...)`) числится долгом следующей правки `gate/pipeline.py` (задача демона
+            # или M1e), не этой задачи.
             факты = describe_tool.build(описание, policy=гейт._policy, mode=гейт.mode)
             факты["entity"] = описание.name
             факты["base"] = base_config.name
@@ -407,7 +479,7 @@ class ToolService:
 
             if orderby:
                 for поле in orderby_fields(orderby):
-                    if гейт.is_protected(описание.name, поле):
+                    if self._поле_защищено_по_пути(репозиторий, гейт, описание, поле):
                         raise _ServiceError(
                             "params_invalid",
                             "сортировка по защищаемому полю недоступна: порядок раскрывает "

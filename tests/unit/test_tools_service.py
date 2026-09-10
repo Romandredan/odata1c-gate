@@ -194,6 +194,55 @@ async def test_сортировка_по_защищаемому_полю_зап�
     assert not маршрут.called
 
 
+async def test_сортировка_по_защищаемому_полю_через_навигацию_запрещена(сервис, respx_ut):
+    # Document_РеализацияТоваровУслуг → навигация Контрагент → Catalog_Контрагенты.ИНН (auto:
+    # inn) — путь через навигацию должен закрываться тем же запретом, что и прямое поле
+    # (ревью, раунд 1, Minor): is_protected(entity, "Контрагент/ИНН") с сущностью верхнего
+    # уровня сам по себе такой путь не резолвит и пропустил бы сортировку.
+    маршрут = respx_ut.get("Document_РеализацияТоваровУслуг").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    текст = await сервис.query(
+        SessionScope(),
+        base="ut",
+        entity="Document_РеализацияТоваровУслуг",
+        orderby="Контрагент/ИНН",
+    )
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+async def test_сортировка_по_обычному_полю_через_навигацию_разрешена(сервис, respx_ut):
+    # Контрагент/Description — org, но не inn/фис. класс, требующий строгой защиты на уровне
+    # identifiers (роль prod здесь identifiers+names — Description защищён), поэтому берём
+    # действительно незащищённое поле цели навигации: Ref_Key (идентификатор, инвариант 6).
+    маршрут = respx_ut.get("Document_РеализацияТоваровУслуг").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    текст = await сервис.query(
+        SessionScope(),
+        base="ut",
+        entity="Document_РеализацияТоваровУслуг",
+        orderby="Контрагент/Ref_Key",
+    )
+    assert "error" not in json.loads(текст)
+    assert маршрут.called
+
+
+async def test_сортировка_по_неизвестной_навигации_запрещена_консервативно(сервис, respx_ut):
+    маршрут = respx_ut.get("Document_РеализацияТоваровУслуг").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    текст = await сервис.query(
+        SessionScope(),
+        base="ut",
+        entity="Document_РеализацияТоваровУслуг",
+        orderby="НетТакойНавигации/Description",
+    )
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
 async def test_сортировка_по_обычному_полю_разрешена(сервис, respx_ut):
     маршрут = respx_ut.get("Catalog_Контрагенты").mock(
         return_value=httpx.Response(200, json={"value": []})
@@ -473,5 +522,96 @@ async def test_индекс_прежней_версии_разбора_даёт_
         текст = await служба.query(SessionScope(), base="ut", entity="Catalog_Валюты")
         ошибка = json.loads(текст)["error"]
         assert ошибка["code"] == "index_corrupt"
+    finally:
+        await служба.aclose()
+
+
+# ---------------------------------------------------------------------------------------------
+# Раунд правок 1: битый policy.yaml не должен ронять тул голым исключением (ревью, Critical).
+# `_gate_for` конструирует BaseGate лениво при первом обращении, а конструктор сам вызывает
+# refresh() → load_policy() — на СУЩЕСТВУЮЩЕМ, но синтаксически битом policy.yaml это PolicyError
+# ДО входа в try/except внутри _run (тот раньше перехватывал PolicyError только у refresh() ПОСЛЕ
+# успешного построения гейта). Гейт при неудаче конструктора не кэшируется — повторный вызов
+# обязан упасть так же штатно, а не по-другому.
+# ---------------------------------------------------------------------------------------------
+
+
+def _сломать_политику(дом):
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text("fields: {broken: [unclosed\n", encoding="utf-8")
+
+
+async def test_битая_политика_не_роняет_query(дом):
+    from odata1c.config.loader import load_config
+
+    _сломать_политику(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        текст = await служба.query(SessionScope(), base="ut", entity="Catalog_Валюты")
+        assert json.loads(текст)["error"]["code"] == "policy_invalid"
+
+        # Повтор — гейт не закэширован (конструктор упал), но ошибка та же, не голое исключение.
+        текст_повтор = await служба.query(SessionScope(), base="ut", entity="Catalog_Валюты")
+        assert json.loads(текст_повтор)["error"]["code"] == "policy_invalid"
+    finally:
+        await служба.aclose()
+
+
+async def test_битая_политика_не_роняет_get(дом):
+    from odata1c.config.loader import load_config
+
+    _сломать_политику(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        текст = await служба.get(
+            SessionScope(),
+            base="ut",
+            entity="Catalog_Контрагенты",
+            key="a103cb54-42ee-11ec-a7a0-f10ab59a067e",
+        )
+        assert json.loads(текст)["error"]["code"] == "policy_invalid"
+    finally:
+        await служба.aclose()
+
+
+async def test_битая_политика_не_роняет_describe_entity(дом):
+    from odata1c.config.loader import load_config
+
+    _сломать_политику(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        текст = await служба.describe_entity(
+            SessionScope(), base="ut", entity="Catalog_Контрагенты"
+        )
+        assert json.loads(текст)["error"]["code"] == "policy_invalid"
+    finally:
+        await служба.aclose()
+
+
+async def test_битая_политика_не_роняет_find_entity(дом):
+    from odata1c.config.loader import load_config
+
+    _сломать_политику(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        текст = await служба.find_entity(SessionScope(), base="ut", query="контрагенты")
+        assert json.loads(текст)["error"]["code"] == "policy_invalid"
+    finally:
+        await служба.aclose()
+
+
+async def test_битая_политика_не_роняет_bases(дом):
+    """bases() не строит гейт вообще (не читает policy.yaml) — битая политика её не касается;
+    тест фиксирует это явно, а не полагается на отсутствие исключения как на случайность."""
+    from odata1c.config.loader import load_config
+
+    _сломать_политику(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        текст = await служба.bases(SessionScope())
+        данные = json.loads(текст)
+        assert [б["name"] for б in данные["bases"]] == ["dev", "ut"]
     finally:
         await служба.aclose()
