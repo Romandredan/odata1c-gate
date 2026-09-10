@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import importlib.resources
 import os
 import pathlib
 import secrets
+import time
 
 import yaml
 
@@ -139,6 +141,42 @@ def append_base(path: pathlib.Path, name: str, values: dict) -> None:
         )
 
 
+@contextlib.contextmanager
+def _межпроцессный_замок(lock_path: pathlib.Path, *, таймаут: float = 10.0, интервал: float = 0.05):
+    """Простой межпроцессный замок на файловой системе: `O_CREAT | O_EXCL` атомарен и на
+    Windows, и на POSIX (в отличие от «проверить существование, потом создать» — та же болезнь
+    TOCTOU, которую замок и лечит в `ensure_gate_secret`, раунд правок 2, находка Б.3).
+
+    Просроченный замок (процесс, державший его, упал и не убрал файл сам) снимается по возрасту
+    старше `таймаут` — иначе один аварийно прерванный процесс блокировал бы вообще все
+    последующие запуски на этом домашнем каталоге навсегда."""
+    предел = time.monotonic() + таймаут
+    захвачен = False
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            захвачен = True
+            break
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                if lock_path.stat().st_mtime < time.monotonic() - таймаут:
+                    lock_path.unlink()
+                    continue
+            if time.monotonic() > предел:
+                raise TimeoutError(
+                    f"не удалось получить замок {lock_path} за {таймаут} с — другой процесс "
+                    "держит его непривычно долго"
+                ) from None
+            time.sleep(интервал)
+    try:
+        yield
+    finally:
+        if захвачен:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+
+
 def ensure_gate_secret(path: pathlib.Path) -> str:
     """Обеспечить непустой gate_secret в daemon.yaml: создать команда создания домашнего
     каталога (SPEC §6.3), не чтение настроек — см. odata1c.config.loader._load_daemon.
@@ -149,25 +187,48 @@ def ensure_gate_secret(path: pathlib.Path) -> str:
     ранее заданные параметры демона). После записи секрет читается заново с диска: если эту
     функцию вызвали одновременно два процесса, оба должны увидеть и вернуть то значение,
     которое реально осталось на диске, а не то, что каждый из них сам сгенерировал.
-    """
+
+    Раунд правок 2, находка Б.3: первая проверка «секрет уже есть?» и запись — раздельные
+    операции, между ними был зазор (TOCTOU), в который умещались два процесса, оба не видевшие
+    чужого секрета и оба дописывавшие свой — `daemon.yaml` получал 2-3 строки `gate_secret`
+    (YAML переживает дубликат ключа молча, «последний выигрывает»), а цена ошибки прямая:
+    токены гейта детерминированы от секрета (инвариант 5), расхождение после следующего
+    перезапуска демона рвёт совпадение старых токенов с новыми. Тот же временный файл
+    (`daemon.yaml.tmp`, общее ИМЯ для всех процессов на этом доме) при этом мог одновременно
+    писаться двумя процессами — `os.replace` одного натыкался на ещё не закрытый хендл другого
+    (`WinError 32`), что и обрушивало сессию, а не только плодило лишние строки секрета
+    (воспроизведено `rv_probe_two_launchers.py` ревьюера — сбой на третьей из трёх параллельных
+    попыток).
+
+    Вся критическая секция (повторная проверка + запись) теперь идёт под межпроцессным замком
+    (`_межпроцессный_замок`, файл `daemon.yaml.lock` рядом) — единственный писатель побеждает
+    гонку, остальные ждут своей очереди и, войдя в замок, видят уже записанный секрет на
+    ПЕРВОЙ же (повторной) проверке и ничего не пишут."""
     текущий = _прочитать_секрет(path)
     if текущий:
         return текущий
 
-    секрет = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
-    текст = path.read_text(encoding="utf-8") if path.exists() else ""
-    if текст and not текст.endswith("\n"):
-        текст += "\n"
-    текст += f'gate_secret: "{секрет}"\n'
+    with _межпроцессный_замок(path.with_name(path.name + ".lock")):
+        # Конкурент мог успеть дописать секрет и снять замок, пока мы его ждали — перечитать
+        # ПОД замком, а не доверять проверке снаружи (та и есть исходный TOCTOU).
+        текущий = _прочитать_секрет(path)
+        if текущий:
+            return текущий
 
-    временный = path.with_name(path.name + ".tmp")
-    временный.write_text(текст, encoding="utf-8")
-    os.replace(временный, path)
-    if os.name != "nt":
-        # На Windows chmod не управляет ACL — правами файла управляет NTFS, а не биты POSIX;
-        # реальная защита закрывается на уровне всего домашнего каталога через icacls
-        # в odata1c.config.home.ensure_home.
-        path.chmod(0o600)
+        секрет = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+        текст = path.read_text(encoding="utf-8") if path.exists() else ""
+        if текст and not текст.endswith("\n"):
+            текст += "\n"
+        текст += f'gate_secret: "{секрет}"\n'
+
+        временный = path.with_name(path.name + f".tmp-{os.getpid()}")
+        временный.write_text(текст, encoding="utf-8")
+        os.replace(временный, path)
+        if os.name != "nt":
+            # На Windows chmod не управляет ACL — правами файла управляет NTFS, а не биты POSIX;
+            # реальная защита закрывается на уровне всего домашнего каталога через icacls
+            # в odata1c.config.home.ensure_home.
+            path.chmod(0o600)
 
     return _прочитать_секрет(path) or секрет
 

@@ -361,7 +361,7 @@ def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
         print(f"демон уже слушает {daemon_url(порт)}")
         return 0
 
-    spawn_detached(home)
+    spawn_detached(home, порт)
     предел = time.monotonic() + ОЖИДАНИЕ_ГОТОВНОСТИ_S
     while time.monotonic() < предел:
         if is_listening(порт):

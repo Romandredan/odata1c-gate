@@ -22,6 +22,7 @@ import socket
 import sys
 import time
 
+import mcp.types as types
 from fake_1c import ИНН, НАЗВАНИЕ, запущенная
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -142,7 +143,7 @@ async def test_launcher_поднимается_на_чистом_домашне�
         env={**os.environ, "PYTHONUTF8": "1"},
     )
     try:
-        await asyncio.wait_for(_дождаться_handshake(параметры), timeout=ПРЕДЕЛ_ЛАУНЧЕРА_С)
+        итог = await asyncio.wait_for(_дождаться_handshake(параметры), timeout=ПРЕДЕЛ_ЛАУНЧЕРА_С)
     finally:
         if is_listening(порт):
             daemon_stop(home)
@@ -156,10 +157,23 @@ async def test_launcher_поднимается_на_чистом_домашне�
     assert "gate_secret" in (home / "daemon.yaml").read_text(encoding="utf-8")
     assert (home / "bases.yaml").exists()
 
+    # Раунд правок 2, находка 6 (повторное ревью): прежний тест находки 2 (`test_launcher.py`,
+    # «инструкции доходят до клиента») собирал прокси САМ и сам же передавал ему
+    # `instructions=up_init.instructions` — то есть проверял `build_proxy`, повторяя проводку
+    # `run_launcher`, а не саму проводку. Мутация ровно в ней (`instructions=None` вместо
+    # `итог_инициализации.instructions` на `launcher.py::run_launcher`) не красила НИ ОДИН из 35
+    # тестов трёх файлов. Здесь — настоящий stdio-подпроцесс, `итог` получен через ТУ САМУЮ
+    # проводку `run_launcher`, которую ничто в тесте не повторяет и не подделывает: имя должно
+    # быть именем ДЕМОНА («odata1c»), не именем прокси по умолчанию («odata1c-mcp-launcher», см.
+    # `build_proxy`), а текст инструкций — дословным куском `daemon.INSTRUCTIONS`.
+    assert итог.server_info.name == "odata1c"
+    assert итог.instructions is not None
+    assert "гейтом псевдонимизации" in итог.instructions
 
-async def _дождаться_handshake(параметры: StdioServerParameters) -> None:
+
+async def _дождаться_handshake(параметры: StdioServerParameters) -> types.InitializeResult:
     async with (
         stdio_client(параметры) as (read, write),
         ClientSession(read, write) as клиент,
     ):
-        await клиент.initialize()
+        return await клиент.initialize()
