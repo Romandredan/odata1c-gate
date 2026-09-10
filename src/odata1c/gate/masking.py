@@ -22,6 +22,14 @@ from odata1c.gate.tokens import CLASSES, find_tokens, overlaps_token
 КЛАССЫ_НАЗВАНИЙ = ("org", "person")
 
 
+def _ссылочный_ключ(поле: str) -> bool:
+    """Поле ссылки 1С в OData: `Ref_Key`, `<Реквизит>_Key` (GUID) и `<Реквизит>_Type` (имя
+    типа составной ссылки) — идентификатор, а не реквизит (инвариант 6). Та же проверка есть в
+    `unmasking.py`; в `field_rules.py` не вынесена, чтобы не задевать классификатор реиндекса,
+    где такие поля и так отсекаются по настоящему типу Edm."""
+    return поле == "Ref_Key" or поле.endswith(("_Key", "_Type"))
+
+
 @dataclasses.dataclass(slots=True)
 class MaskResult:
     data: object
@@ -161,7 +169,12 @@ class Masker:
         класс = self._policy.sensitivity_of(entity, field)
         if класс is None:
             класс = self._policy.custom_fields().get(field)
-        if класс is None:
+        if класс is None and not _ссылочный_ключ(field):
+            # Раунд 2 итогового ревью M1c (I2): ключи ссылок (`Сотрудник_Key`, `ФизЛицо_Key`) и
+            # типы составных ссылок (`…_Type`) — GUID и имя типа, а не реквизит (инвариант 6);
+            # запасной классификатор с типом "Edm.String" вслепую дал бы им класс person по
+            # подстроке «сотрудник»/«физлицо» и заменил GUID токеном.
+            #
             # Запасная классификация по имени поля (правка ревью, Critical): `sensitivity_of`
             # ищет класс по паре «сущность и поле» и ничего не находит для раскрытого вложенного
             # объекта — сущность, известная на этом уровне обхода, это сущность родителя
