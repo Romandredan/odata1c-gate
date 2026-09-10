@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import io
+from collections.abc import Collection
 
 from lxml import etree
 
@@ -23,6 +24,11 @@ from odata1c.index.naming import parse_entity_name
 РЕГИСТРАТОРЫ = ("Recorder", "Recorder_Key")
 НАБОР_ЗАПИСЕЙ = "RecordType"
 КЛЮЧ_ТАБЛИЧНОЙ_ЧАСТИ = frozenset({"Ref_Key", "LineNumber"})
+
+# Виды регистров — у них бывает набор записей (`_RecordType`), у остальных видов нет.
+РЕГИСТР_ВИДЫ = frozenset(
+    {"InformationRegister", "AccumulationRegister", "AccountingRegister", "CalculationRegister"}
+)
 
 
 СОВЕТ_ПРИ_ОШИБКЕ_РАЗБОРА = (
@@ -110,16 +116,39 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
         родитель = _родитель(имя_набора, наборы)
         записи = родитель is not None and родитель[1] == НАБОР_ЗАПИСЕЙ
         табличная = родитель is not None and not записи and set(поля[1]) == КЛЮЧ_ТАБЛИЧНОЙ_ЧАСТИ
-        основной = родитель[0] if записи else имя_набора
-        ключи_основного = (типы.get(наборы.get(основной, "")) or поля)[1]
+        # Раунд правок 1 (Important, инвариант 3): основной набор регистра не опубликован вовсе
+        # (родитель не найден) — имя всё равно оканчивается на `_RecordType`, и вид говорит, что
+        # это регистр. Закрываемся при неопределённости: это набор записей без родителя, а не
+        # самостоятельная (и тем самым независимая) сущность.
+        осиротевшая_запись = (
+            родитель is None
+            and имя_набора.endswith("_" + НАБОР_ЗАПИСЕЙ)
+            and parse_entity_name(имя_набора).kind in РЕГИСТР_ВИДЫ
+        )
+        if записи:
+            # Основной набор опубликован (родитель найден), но его EntityType может не
+            # резолвиться (испорченная ссылка — тот же набор уйдёт в unresolved_entity_sets).
+            # Тихая подстановка ключей самой записи вместо ключей основного набора однажды уже
+            # была причиной бага (см. ревью): регистратор родителя проверить нельзя — не выводим
+            # его отсутствие из чужих ключей, has_recorder остаётся консервативным (True).
+            тип_основного = типы.get(наборы.get(родитель[0], ""))
+            has_recorder = (
+                True
+                if тип_основного is None
+                else any(ключ in РЕГИСТРАТОРЫ for ключ in тип_основного[1])
+            )
+        elif осиротевшая_запись:
+            has_recorder = True  # инвариант 3: независимость не доказана — не независимый
+        else:
+            has_recorder = any(ключ in РЕГИСТРАТОРЫ for ключ in поля[1])
         сущности.append(
             _собрать_сущность(
                 имя_набора,
                 поля,
                 parent=родитель[0] if (записи or табличная) else None,
                 is_tabular_part=табличная,
-                is_records=записи,
-                has_recorder=any(ключ in РЕГИСТРАТОРЫ for ключ in ключи_основного),
+                is_records=записи or осиротевшая_запись,
+                has_recorder=has_recorder,
                 base_name=(
                     parse_entity_name(родитель[0]).base_name
                     if (записи or табличная)
@@ -248,7 +277,7 @@ def _без_пространства(значение: str) -> str:
     return значение.rsplit(".", 1)[-1] if значение else ""
 
 
-def _родитель(имя: str, наборы) -> tuple[str, str] | None:
+def _родитель(имя: str, наборы: Collection[str]) -> tuple[str, str] | None:
     """Самый длинный опубликованный набор P, для которого имя == P + "_" + хвост.
 
     Поиск справа налево: `Catalog_A_B_C` сначала проверяет `Catalog_A_B`, затем `Catalog_A`.

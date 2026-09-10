@@ -29,11 +29,20 @@ def обёртка_эдмкс(тело_контейнера: str) -> bytes:
     ссылающийся на несуществующий EntityType), при том что в test_index_edmx.py уже была
     обобщённая версия `_обёртка_эдмкс`, принимающая произвольное тело контейнера. Общая версия
     перенесена сюда и используется везде, где нужен нестандартный EDMX-документ."""
+    return обёртка_эдмкс_с_типами("", тело_контейнера)
+
+
+def обёртка_эдмкс_с_типами(типы_xml: str, тело_контейнера: str) -> bytes:
+    """Как `обёртка_эдмкс`, но с произвольными `EntityType` перед `EntityContainer` — для
+    сценариев с неразрешающейся или частично резолвящейся ссылкой на тип (раунд правок 1,
+    задача 1 плана M1b-fix: осиротевший набор записей регистра и родитель без резолвящегося
+    типа — инвариант 3)."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
   <edmx:DataServices m:DataServiceVersion="3.0"
                      xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
     <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
+      {типы_xml}
       <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
         {тело_контейнера}
       </EntityContainer>

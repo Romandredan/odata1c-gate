@@ -3,7 +3,7 @@
 import io
 
 import pytest
-from conftest import обёртка_эдмкс
+from conftest import обёртка_эдмкс, обёртка_эдмкс_с_типами
 
 from odata1c.index.edmx import parse_edmx
 
@@ -326,3 +326,56 @@ def test_ut_составное_строковое_поле_это_ссылка(e
         assert поля[имя].is_composite is True, имя
     assert поля["Контрагент_Type"].is_ref is False
     assert поля["НомерСчетаФактуры"].is_ref is False  # строка без пары _Type — значение
+
+
+# Раунд правок 1 по итогам ревью задачи 1 (Important): осиротевший набор записей регистра
+# (основной набор не опубликован вовсе или опубликован без резолвящегося типа) не должен
+# получать is_independent_register=True — инвариант 3, ложная независимость открывает
+# физическое удаление подчинённому регистру. Правило — закрываться при неопределённости.
+
+_ТИП_ЗАПИСЕЙ_БЕЗ_РЕГИСТРАТОРА = """
+      <EntityType Name="InformationRegister_X_RecordType">
+        <Key>
+          <PropertyRef Name="Period"/>
+          <PropertyRef Name="Измерение_Key"/>
+        </Key>
+        <Property Name="Period" Type="Edm.DateTime" Nullable="false"/>
+        <Property Name="Измерение_Key" Type="Edm.Guid" Nullable="false"/>
+      </EntityType>
+"""
+
+
+def test_осиротевший_набор_записей_не_публикуется_основной_набор():
+    # Основной набор InformationRegister_X не опубликован ни единым EntitySet — _родитель
+    # его не находит. Раньше это превращало запись в самостоятельную независимую сущность.
+    edmx = обёртка_эдмкс_с_типами(
+        _ТИП_ЗАПИСЕЙ_БЕЗ_РЕГИСТРАТОРА,
+        '<EntitySet Name="InformationRegister_X_RecordType"'
+        ' EntityType="StandardODATA.InformationRegister_X_RecordType"/>',
+    )
+    сущность = найти(parse_edmx(edmx), "InformationRegister_X_RecordType")
+    assert сущность.is_records is True
+    assert сущность.parent_entity is None
+    assert сущность.has_recorder is True  # консервативно: независимость не доказана
+    assert сущность.is_independent_register is False
+
+
+def test_родитель_опубликован_но_тип_не_резолвится_не_даёт_независимости():
+    # InformationRegister_X опубликован набором, но его EntityType в документе отсутствует —
+    # испорченная ссылка (см. test_набор_без_существующего_типа_попадает_в_нераспознанные).
+    # Регистратор родителя проверить нельзя — has_recorder не должен тихо взять ключи самой
+    # записи (у неё Recorder в ключе и так нет), а обязан остаться консервативным.
+    edmx = обёртка_эдмкс_с_типами(
+        _ТИП_ЗАПИСЕЙ_БЕЗ_РЕГИСТРАТОРА,
+        '<EntitySet Name="InformationRegister_X"'
+        ' EntityType="StandardODATA.InformationRegister_X"/>'
+        '<EntitySet Name="InformationRegister_X_RecordType"'
+        ' EntityType="StandardODATA.InformationRegister_X_RecordType"/>',
+    )
+    разобрано = parse_edmx(edmx)
+    assert "InformationRegister_X" in разобрано.unresolved_entity_sets
+    записи = найти(разобрано, "InformationRegister_X_RecordType")
+    assert записи.is_records is True
+    assert записи.parent_entity == "InformationRegister_X"
+    assert записи.has_recorder is True  # консервативно: тип родителя не резолвится
+    assert записи.is_independent_register is False
