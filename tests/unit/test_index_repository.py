@@ -309,14 +309,8 @@ def test_отсутствие_нераспознанных_наборов_не_�
 
 # Задача 3 плана M1b-fix: набор записей, перечисления, версия разбора — на реальном образце УТ
 # (тот же приём, что в test_index_edmx.py для наборов записей и виртуальных таблиц).
-
-
-@pytest.fixture
-def индекс_ut(tmp_path, edmx_ut_real):
-    хранилище = IndexRepository(tmp_path / "ut.sqlite")
-    хранилище.write(parse_edmx(edmx_ut_real))
-    yield хранилище
-    хранилище.close()
+# Фикстура индекс_ut перенесена в conftest.py (план M1d, задача 2) — используется и здесь,
+# и в test_tools_query.py.
 
 
 def test_описание_набора_записей(индекс_ut):

@@ -153,6 +153,43 @@ async def test_запись_не_повторяется():
     assert route.call_count == 1
 
 
+@respx.mock
+async def test_таймаут_одного_запроса_передаётся_в_httpx():
+    """Таймаут одного запроса (план M1d, задача 2): `get(..., timeout=…)` доходит до httpx как
+    таймаут конкретного запроса (`request.extensions["timeout"]`), а не только меняет сообщение —
+    без этого база продолжала бы ждать `timeout_s` независимо от переданного значения."""
+    route = respx.get(f"{URL}Catalog_Валюты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    client = Client1C(база())
+    await client.get("Catalog_Валюты", timeout=0.01)
+    await client.close()
+
+    assert route.calls.last.request.extensions["timeout"] == {
+        "connect": 0.01,
+        "read": 0.01,
+        "write": 0.01,
+        "pool": 0.01,
+    }
+
+
+@respx.mock
+async def test_таймаут_одного_запроса_называет_фактическое_значение_в_ошибке():
+    """Сообщение об ошибке `timeout` называет переданный таймаут запроса, а не `timeout_s` базы
+    (60 с по умолчанию) — иначе подсказка «увеличьте timeout_s» была бы верна, а число в тексте
+    ошибки нет: `odata1c_query` вызывает виртуальную таблицу с `virtual_timeout_s=180` при
+    `timeout_s` базы 60."""
+    respx.get(f"{URL}Catalog_Валюты").mock(side_effect=httpx.ReadTimeout("таймаут"))
+    client = Client1C(база())
+    with pytest.raises(OdataError) as ошибка:
+        await client.get("Catalog_Валюты", timeout=0.01)
+    await client.close()
+
+    assert ошибка.value.code == "timeout"
+    assert "0.01" in ошибка.value.message
+
+
 def test_тело_ошибки_список_не_роняет_разбор():
     ошибка = map_error(400, "[1, 2, 3]")
     assert ошибка.code == "odata_error"

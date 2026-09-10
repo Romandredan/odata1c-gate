@@ -42,8 +42,13 @@ class Client1C:
                 f"проверьте путь verify_tls в настройках базы {base.name}",
             ) from exc
 
-    async def get(self, path: str, params: dict | None = None) -> dict:
-        response = await self._request("GET", path, params=params, retry=True)
+    async def get(
+        self, path: str, params: dict | None = None, *, timeout: float | None = None
+    ) -> dict:
+        """Таймаут одного запроса (SPEC §10): по умолчанию — таймаут базы (`timeout_s`,
+        конструктор `httpx.AsyncClient`), явный `timeout=` (план M1d: виртуальные таблицы —
+        `virtual_timeout_s`) переопределяет его только для этого запроса."""
+        response = await self._request("GET", path, params=params, retry=True, timeout=timeout)
         return response.json()
 
     async def get_raw(
@@ -117,6 +122,7 @@ class Client1C:
         retry: bool,
         headers: dict | None = None,
         add_format: bool = True,
+        timeout: float | None = None,
     ) -> httpx.Response:
         params = dict(params or {})
         if add_format:
@@ -124,6 +130,14 @@ class Client1C:
         headers = dict(headers or {})
         if json is not None:
             headers["Content-Type"] = "application/json"
+        # httpx: timeout=None в вызове request() значит «без таймаута», а не «умолчание клиента» —
+        # аргумент передаётся, только когда вызывающий его явно указал (Client1C.get(timeout=…)).
+        # Без этого таймаут одного запроса нельзя было бы вообще отключить именованием None,
+        # но здесь такого сценария нет: неуказанный timeout должен использовать timeout_s базы.
+        параметры_запроса: dict = {}
+        if timeout is not None:
+            параметры_запроса["timeout"] = timeout
+        фактический_таймаут = timeout if timeout is not None else self._base.timeout_s
 
         async with self._semaphore:
             открывает_сеанс = await self._claim_session_start()
@@ -134,12 +148,17 @@ class Client1C:
             for попытка in range(попытки):
                 try:
                     response = await self._client.request(
-                        method, path, params=params, json=json, headers=headers
+                        method,
+                        path,
+                        params=params,
+                        json=json,
+                        headers=headers,
+                        **параметры_запроса,
                     )
                 except httpx.TimeoutException as exc:
                     последняя = OdataError(
                         "timeout",
-                        f"1С не ответила за {self._base.timeout_s} с",
+                        f"1С не ответила за {фактический_таймаут} с",
                         "увеличьте timeout_s базы или сузьте выборку",
                     )
                     if попытка + 1 == попытки:

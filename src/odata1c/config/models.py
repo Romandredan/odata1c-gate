@@ -47,6 +47,7 @@ class BaseConfig(BaseModel):
     role: Role = "prod"
     verify_tls: bool | str = True
     timeout_s: int = 60
+    virtual_timeout_s: int = 180
     concurrency: int = 2
     ib_session: bool = True
     write: bool = False

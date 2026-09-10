@@ -4,6 +4,10 @@ import pathlib
 
 import pytest
 
+from odata1c.config.models import Limits
+from odata1c.index.edmx import parse_edmx
+from odata1c.index.repository import IndexRepository
+
 ОБРАЗЦЫ = pathlib.Path(__file__).parent.parent / "fixtures" / "edmx"
 
 
@@ -17,6 +21,25 @@ def edmx_synthetic() -> bytes:
 def edmx_ut_real() -> bytes:
     """Урезанный реальный $metadata УТ (проба P4): структура, которую синтетика не воспроизводит."""
     return (ОБРАЗЦЫ / "ut-real.edmx").read_bytes()
+
+
+@pytest.fixture
+def индекс_ut(tmp_path, edmx_ut_real):
+    """Индекс, построенный на урезанном реальном образце УТ (проба P4).
+
+    Перенесена сюда из `test_index_repository.py` (план M1d, задача 2): построение запросов
+    (`odata_query.py`) проверяется на тех же реальных именах и структурах, что и хранилище
+    индекса, — дублировать фикстуру в каждом файле не нужно."""
+    хранилище = IndexRepository(tmp_path / "ut.sqlite")
+    хранилище.write(parse_edmx(edmx_ut_real))
+    yield хранилище
+    хранилище.close()
+
+
+@pytest.fixture
+def лимиты() -> Limits:
+    """Лимиты по умолчанию (SPEC §10) — без переопределений, если тесту не нужны другие значения."""
+    return Limits()
 
 
 def обёртка_эдмкс(тело_контейнера: str) -> bytes:
