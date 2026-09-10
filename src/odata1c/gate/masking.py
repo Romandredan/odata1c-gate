@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import dataclasses
-import re
 
 from ahocorasick_rs import AhoCorasick, MatchKind
 
@@ -15,16 +14,12 @@ from odata1c.gate.detectors import scan_value
 from odata1c.gate.dictionary import Dictionary, normalize_text_with_map
 from odata1c.gate.field_rules import classify_field, is_naming_field
 from odata1c.gate.policy import Policy
-from odata1c.gate.tokens import CLASSES, blank_tokens
+from odata1c.gate.tokens import CLASSES, GUID_RE, blank_tokens
 
 # Вырезается из ответа всегда (SPEC §5.1).
 СЛУЖЕБНЫЕ_ПОЛЯ = ("odata.metadata", "odata.type", "DataVersion")
 ДВОИЧНЫЕ_СУФФИКСЫ = ("_Base64Data", "ХранилищеЗначения")
 КЛАССЫ_НАЗВАНИЙ = ("org", "person")
-# SPEC §6.4, сноска ⁴; инвариант 6: GUID не защищается ни на одном уровне. Значение составного
-# поля (`Контрагент` + `Контрагент_Type`) для ссылки — строка GUID; класс поля по имени (org)
-# относится к примитивному значению того же поля, а не к ссылке.
-GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _ссылочный_ключ(поле: str) -> bool:
@@ -226,7 +221,10 @@ class Masker:
     ) -> str:
         if not текст:
             return текст
-        if GUID_RE.fullmatch(текст):
+        # SPEC §6.4, сноска ⁴; инвариант 6: GUID не защищается. `.strip()` — GUID фиксированной
+        # длины в строковом поле 1С приходит с хвостовыми пробелами (M1 ревью 2026-09-10); без
+        # него `" cc52…"` проваливался мимо и попадал в словарь как «название организации».
+        if GUID_RE.fullmatch(текст.strip()):
             return текст
         if класс == "keep":
             return текст
