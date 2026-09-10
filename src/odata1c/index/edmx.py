@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import io
@@ -68,6 +69,7 @@ class ParsedAction:
     params: dict[str, str]
     http_method: str
     returns: str | None = None
+    side_effecting: bool = True
 
 
 @dataclasses.dataclass(slots=True)
@@ -87,6 +89,7 @@ class ParsedEntity:
     has_recorder: bool
     is_independent_register: bool
     fields: list[ParsedField]
+    navigations: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(slots=True)
@@ -96,15 +99,18 @@ class ParsedMetadata:
     edmx_sha256: str
     platform_hint: str | None = None
     unresolved_entity_sets: list[str] = dataclasses.field(default_factory=list)
+    warnings: list[str] = dataclasses.field(default_factory=list)
 
 
 def parse_edmx(data: bytes) -> ParsedMetadata:
     контрольная_сумма = hashlib.sha256(data).hexdigest()
-    типы = _разобрать_типы(data)
-    наборы, действия, подсказка = _разобрать_контейнер(data)
+    типы, навигации_по_типу, связи = _разобрать_типы(data)
+    наборы, сырые_действия, подсказка = _разобрать_контейнер(data)
+    набор_по_типу = {имя_типа: имя_набора for имя_набора, имя_типа in наборы.items()}
 
     сущности: list[ParsedEntity] = []
     нераспознанные_наборы: list[str] = []
+    предупреждения: list[str] = []
     for имя_набора, имя_типа in наборы.items():
         поля = типы.get(имя_типа) or типы.get(имя_набора)
         if поля is None:
@@ -153,58 +159,201 @@ def parse_edmx(data: bytes) -> ParsedMetadata:
             base_name = (
                 parse_entity_name(родитель[0]).base_name if табличная else вид_набора.base_name
             )
+        сущность = _собрать_сущность(
+            имя_набора,
+            поля,
+            parent=parent,
+            is_tabular_part=табличная,
+            is_records=это_набор_записей,
+            has_recorder=has_recorder,
+            base_name=base_name,
+        )
+        сущность.navigations = _разрешить_навигации(
+            сущность.fields, навигации_по_типу.get(имя_типа, []), связи, набор_по_типу
+        )
+        сущности.append(сущность)
+
+    # Действия и виртуальные таблицы (SPEC §4.2, поправка 2026-09-10): привязка — тип параметра
+    # bindingParameter, атрибут EntitySet у FunctionImport в 1С не встречается.
+    действия: list[ParsedAction] = []
+    занятые = set(наборы)
+    for сырое in сырые_действия:
+        параметры = dict(сырое["params"])
+        тип_привязки = _без_пространства(параметры.pop("bindingParameter", "") or "")
+        набор = набор_по_типу.get(тип_привязки)
+        if набор is None:
+            предупреждения.append(
+                f"действие {сырое['name']} не привязано: тип {тип_привязки} не опубликован"
+            )
+            continue
+        результат = _тип_коллекции(сырое["returns"])
+        if сырое["side_effecting"] or результат is None:
+            действия.append(
+                ParsedAction(
+                    entity=набор,
+                    name=сырое["name"],
+                    params=параметры,
+                    http_method="POST" if сырое["side_effecting"] else "GET",
+                    returns=_без_пространства(сырое["returns"] or "") or None,
+                    side_effecting=сырое["side_effecting"],
+                )
+            )
+            continue
+        # Виртуальная таблица: имя строится от ОСНОВНОГО набора регистра — привязка к
+        # `X_RecordType` снимает суффикс (тот же принцип тождества, что у это_набор_записей выше,
+        # а не поиск по опубликованному префиксу через _родитель); parent_entity остаётся
+        # исходным набором привязки — по нему строится адрес вызова `<parent_entity>/<действие>`.
+        вид_набора_привязки = parse_entity_name(набор)
+        основной = (
+            набор.removesuffix("_" + НАБОР_ЗАПИСЕЙ)
+            if вид_набора_привязки.kind in РЕГИСТР_ВИДЫ and набор.endswith("_" + НАБОР_ЗАПИСЕЙ)
+            else набор
+        )
+        имя = f"{основной}_{сырое['name']}"
+        поля_результата = типы.get(результат)
+        if имя in занятые or поля_результата is None:
+            причина = f"имя {имя} занято" if имя in занятые else f"тип {результат} не описан"
+            предупреждения.append(
+                f"виртуальная таблица {набор}/{сырое['name']} не проиндексирована: {причина}"
+            )
+            continue
+        занятые.add(имя)
         сущности.append(
             _собрать_сущность(
-                имя_набора,
-                поля,
-                parent=parent,
-                is_tabular_part=табличная,
-                is_records=это_набор_записей,
-                has_recorder=has_recorder,
-                base_name=base_name,
+                имя,
+                (copy.deepcopy(поля_результата[0]), []),
+                parent=набор,
+                is_tabular_part=False,
+                is_records=False,
+                has_recorder=False,
+                base_name=parse_entity_name(основной).base_name,
+                is_virtual=True,
+                virtual_kind=сырое["name"],
             )
         )
+        действия.append(
+            ParsedAction(
+                entity=имя,
+                name=сырое["name"],
+                params=параметры,
+                http_method="GET",
+                returns=результат,
+                side_effecting=False,
+            )
+        )
+
     return ParsedMetadata(
         entities=сущности,
         actions=действия,
         edmx_sha256=контрольная_сумма,
         platform_hint=подсказка,
         unresolved_entity_sets=нераспознанные_наборы,
+        warnings=предупреждения,
     )
 
 
-def _разобрать_типы(data: bytes) -> dict[str, tuple[list[ParsedField], list[str]]]:
-    """Имя типа → (поля, ключевые поля). Ходим по документу один раз."""
+# Узлы схемы, разбираемые в первом проходе (_разобрать_типы) и освобождаемые сразу после разбора:
+# EntityType и ComplexType — состав полей (у ComplexType своих ключей и навигаций не бывает),
+# Association — связи для последующего разрешения целей навигаций.
+_ОСВОБОЖДАЕМЫЕ_УЗЛЫ_СХЕМЫ = frozenset({"EntityType", "ComplexType", "Association"})
+
+
+def _разобрать_типы(
+    data: bytes,
+) -> tuple[
+    dict[str, tuple[list[ParsedField], list[str]]],
+    dict[str, list[tuple[str, str, str]]],
+    dict[str, dict[str, str]],
+]:
+    """Типы, навигации и связи — один проход по документу (SPEC §4.2, дополнение о навигациях).
+
+    Возвращает: имя типа → (поля, ключевые поля) — и у `EntityType`, и у `ComplexType` (строки
+    виртуальных таблиц и наборов записей); имя `EntityType` → список навигаций
+    (имя свойства, имя `Relationship` без пространства имён, `ToRole`); имя `Association` →
+    {Role: имя типа конца без пространства имён}. Коллизия имён между `EntityType` и `ComplexType`
+    невозможна — одно пространство имён схемы.
+    """
     типы: dict[str, tuple[list[ParsedField], list[str]]] = {}
+    навигации_по_типу: dict[str, list[tuple[str, str, str]]] = {}
+    связи: dict[str, dict[str, str]] = {}
     try:
         поток = etree.iterparse(io.BytesIO(data), events=("end",), recover=False, huge_tree=True)
         for _, элемент in поток:
-            if etree.QName(элемент).localname != "EntityType":
-                continue
-            имя = элемент.get("Name")
-            ключи = [
-                ссылка.get("Name")
-                for ссылка in элемент.iter()
-                if etree.QName(ссылка).localname == "PropertyRef"
-            ]
-            поля = [
-                ParsedField(
-                    name=свойство.get("Name"),
-                    edm_type=свойство.get("Type", ""),
-                    nullable=свойство.get("Nullable", "true") == "true",
-                    is_key=свойство.get("Name") in ключи,
-                )
-                for свойство in элемент.iter()
-                if etree.QName(свойство).localname == "Property"
-            ]
-            _пометить_ссылки_и_составные(поля)
-            типы[имя] = (поля, ключи)
-            элемент.clear()
-            while элемент.getprevious() is not None:
-                del элемент.getparent()[0]
+            имя_тега = etree.QName(элемент).localname
+            if имя_тега in ("EntityType", "ComplexType"):
+                имя = элемент.get("Name")
+                ключи = [
+                    ссылка.get("Name")
+                    for ссылка in элемент.iter()
+                    if etree.QName(ссылка).localname == "PropertyRef"
+                ]
+                поля = [
+                    ParsedField(
+                        name=свойство.get("Name"),
+                        edm_type=свойство.get("Type", ""),
+                        nullable=свойство.get("Nullable", "true") == "true",
+                        is_key=свойство.get("Name") in ключи,
+                    )
+                    for свойство in элемент.iter()
+                    if etree.QName(свойство).localname == "Property"
+                ]
+                _пометить_ссылки_и_составные(поля)
+                типы[имя] = (поля, ключи)
+                if имя_тега == "EntityType":
+                    навигации_по_типу[имя] = [
+                        (
+                            навигация.get("Name", ""),
+                            _без_пространства(навигация.get("Relationship", "")),
+                            навигация.get("ToRole", ""),
+                        )
+                        for навигация in элемент.iter()
+                        if etree.QName(навигация).localname == "NavigationProperty"
+                    ]
+            elif имя_тега == "Association":
+                связи[элемент.get("Name", "")] = {
+                    конец.get("Role", ""): _без_пространства(конец.get("Type", ""))
+                    for конец in элемент.iter()
+                    if etree.QName(конец).localname == "End"
+                }
+            if имя_тега in _ОСВОБОЖДАЕМЫЕ_УЗЛЫ_СХЕМЫ:
+                элемент.clear()
+                while элемент.getprevious() is not None:
+                    del элемент.getparent()[0]
     except etree.XMLSyntaxError as exc:
         raise EdmxError(f"не удалось разобрать $metadata: {exc}") from exc
-    return типы
+    return типы, навигации_по_типу, связи
+
+
+def _разрешить_навигации(
+    поля: list[ParsedField],
+    навигации: list[tuple[str, str, str]],
+    связи: dict[str, dict[str, str]],
+    набор_по_типу: dict[str, str],
+) -> dict[str, str]:
+    """Имя навигации → набор-цель; попутно проставляет `ref_targets` парному ссылочному полю.
+
+    Связь, чья цель не опубликована набором, или `Association`, которого нет среди собранных
+    связей (урезанная публикация — SPEC §4.2, дополнение о навигациях), пропускается молча.
+    """
+    имена_полей = {поле.name: поле for поле in поля}
+    итог: dict[str, str] = {}
+    for имя, relationship, to_role in навигации:
+        концы = связи.get(relationship)
+        if концы is None:
+            continue
+        тип_цели = концы.get(to_role)
+        if тип_цели is None:
+            continue
+        цель = набор_по_типу.get(тип_цели)
+        if цель is None:
+            continue
+        итог[имя] = цель
+        for кандидат in (f"{имя}_Key", имя):
+            поле = имена_полей.get(кандидат)
+            if поле is not None:
+                поле.ref_targets = [цель]
+                break
+    return итог
 
 
 def _пометить_ссылки_и_составные(поля: list[ParsedField]) -> None:
@@ -237,9 +386,13 @@ def _пометить_ссылки_и_составные(поля: list[ParsedFi
 _ОСВОБОЖДАЕМЫЕ_УЗЛЫ_КОНТЕЙНЕРА = frozenset({"EntityType", "EntitySet", "FunctionImport"})
 
 
-def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str], list[ParsedAction], str | None]:
+def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str], list[dict], str | None]:
+    """Наборы (имя набора → имя типа без пространства имён), сырые данные `FunctionImport` и
+    подсказка платформы. Привязку действия к набору выполняет `parse_edmx`, когда уже известны
+    все наборы (SPEC §4.2, поправка 2026-09-10: привязка — тип параметра `bindingParameter`, а не
+    атрибут `EntitySet`, которого у действий 1С нет)."""
     наборы: dict[str, str] = {}
-    действия: list[ParsedAction] = []
+    сырые_действия: list[dict] = []
     подсказка: str | None = None
     try:
         поток = etree.iterparse(io.BytesIO(data), events=("end",), recover=False, huge_tree=True)
@@ -248,7 +401,7 @@ def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str],
             if имя_тега == "EntitySet":
                 наборы[элемент.get("Name")] = _без_пространства(элемент.get("EntityType", ""))
             elif имя_тега == "FunctionImport":
-                действия.append(_разобрать_действие(элемент))
+                сырые_действия.append(_сырое_действие(элемент))
             elif имя_тега == "DataServices":
                 подсказка = элемент.get(
                     "{http://schemas.microsoft.com/ado/2007/08/dataservices/metadata}"
@@ -260,25 +413,35 @@ def _разобрать_контейнер(data: bytes) -> tuple[dict[str, str],
                     del элемент.getparent()[0]
     except etree.XMLSyntaxError as exc:
         raise EdmxError(f"не удалось разобрать $metadata: {exc}") from exc
-    return наборы, действия, подсказка
+    return наборы, сырые_действия, подсказка
 
 
-def _разобрать_действие(элемент) -> ParsedAction:
-    параметры = {
-        параметр.get("Name"): параметр.get("Type", "")
+def _сырое_действие(элемент) -> dict:
+    """Сырые данные `FunctionImport` до привязки: имя, параметры (с `bindingParameter`,
+    он попадёт в фильтр уже в `parse_edmx`), признак побочного эффекта, тип результата.
+
+    Тип параметра — как в описании, без обработки: примитивные типы (`Edm.Boolean`, `Edm.String`)
+    хранятся с пространством имён `Edm`, как и `ParsedField.edm_type` в остальном модуле.
+    Пространство имён снимается только с `bindingParameter` — и только на время поиска набора
+    в `parse_edmx`, в выходные `params` действия он не попадает вовсе."""
+    параметры = [
+        (параметр.get("Name"), параметр.get("Type", ""))
         for параметр in элемент.iter()
         if etree.QName(параметр).localname == "Parameter"
+    ]
+    return {
+        "name": элемент.get("Name", ""),
+        "side_effecting": элемент.get("IsSideEffecting", "true") != "false",
+        "returns": элемент.get("ReturnType"),
+        "params": параметры,
     }
-    метод = элемент.get(
-        "{http://schemas.microsoft.com/ado/2007/08/dataservices/metadata}HttpMethod"
-    )
-    return ParsedAction(
-        entity=элемент.get("EntitySet", ""),
-        name=элемент.get("Name", ""),
-        params=параметры,
-        http_method=(метод or "POST").upper(),
-        returns=_без_пространства(элемент.get("ReturnType", "")) or None,
-    )
+
+
+def _тип_коллекции(значение: str | None) -> str | None:
+    """`Collection(StandardODATA.X)` → `X` без пространства имён; не коллекция → `None`."""
+    if not значение or not значение.startswith("Collection(") or not значение.endswith(")"):
+        return None
+    return _без_пространства(значение[len("Collection(") : -1])
 
 
 def _без_пространства(значение: str) -> str:

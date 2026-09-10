@@ -2,7 +2,6 @@
 
 import io
 
-import pytest
 from conftest import обёртка_эдмкс, обёртка_эдмкс_с_типами
 
 from odata1c.index.edmx import parse_edmx
@@ -18,7 +17,6 @@ def test_разобраны_все_наборы_сущностей(edmx_syntheti
         "InformationRegister_КурсыВалют",
         "InformationRegister_КурсыВалют_SliceLast",
         "InformationRegister_СостоянияЗаказов",
-        "AccumulationRegister_ТоварыНаСкладах_Balance",
         "AccumulationRegister_ОстаткиНаСчетах",
         "Catalog_БанковскиеСчета",
     }
@@ -87,21 +85,16 @@ def test_регистр_с_регистратором_не_независимы�
     assert состояния.is_independent_register is False
 
 
-@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
-def test_виртуальная_таблица_привязана_к_родителю(edmx_synthetic):
-    остатки = найти(parse_edmx(edmx_synthetic), "AccumulationRegister_ТоварыНаСкладах_Balance")
-    assert остатки.is_virtual is True
-    assert остатки.virtual_kind == "Balance"
-    assert остатки.parent_entity == "AccumulationRegister_ТоварыНаСкладах"
-
-
-@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
 def test_виртуальная_таблица_не_независимый_регистр(edmx_synthetic):
     # Без исключения виртуальных таблиц из признака независимого регистра сведений
     # физическое удаление записи оказалось бы разрешено там, где разрешена только
-    # пометка удаления, — см. предупреждение в брифе задачи.
+    # пометка удаления, — см. предупреждение в брифе задачи. Виртуальная таблица строится из
+    # действия SliceLast (FunctionImport, привязка bindingParameter), а не из отдельного набора
+    # с суффиксом, — задача 2 плана M1b-fix.
     срез = найти(parse_edmx(edmx_synthetic), "InformationRegister_КурсыВалют_SliceLast")
     assert срез.is_virtual is True
+    assert срез.virtual_kind == "SliceLast"
+    assert срез.parent_entity == "InformationRegister_КурсыВалют"
     assert срез.has_recorder is False
     assert срез.is_independent_register is False
 
@@ -127,15 +120,13 @@ def test_регистр_накопления_не_независимый_рег�
     assert остатки.is_independent_register is False
 
 
-@pytest.mark.skip(reason="переводится на реальную форму в задаче 2 плана M1b-fix")
 def test_действия_разобраны_с_параметрами(edmx_synthetic):
     разобрано = parse_edmx(edmx_synthetic)
-    действия = {действие.name: действие for действие in разобрано.actions}
-    assert "Document_РеализацияТоваровУслуг_Post" in действия
-    post = действия["Document_РеализацияТоваровУслуг_Post"]
+    post = next(действие for действие in разобрано.actions if действие.name == "Post")
     assert post.entity == "Document_РеализацияТоваровУслуг"
     assert post.params == {"PostingModeOperational": "Edm.Boolean"}
     assert post.http_method == "POST"
+    assert post.side_effecting is True
 
 
 def test_контрольная_сумма_устойчива(edmx_synthetic):
@@ -421,3 +412,181 @@ def test_короткий_чужой_префикс_не_становится_р
     assert записи.has_recorder is True  # консервативно: независимость не доказана
     assert записи.is_independent_register is False
     assert записи.base_name == "A_B"
+
+
+# Задача 2 плана M1b-fix: действия и виртуальные таблицы по привязке FunctionImport
+# (SPEC §4.2, поправка 2026-09-10) — на реальном образце УТ (проба P4).
+
+ДЕЙСТВИЯ_UT = {
+    ("Document_РеализацияТоваровУслуг", "Post"),
+    ("Document_РеализацияТоваровУслуг", "Unpost"),
+    ("Document_ВводОстатковРасчетовПоЭквайрингу", "Post"),
+    ("Document_ВводОстатковРасчетовПоЭквайрингу", "Unpost"),
+    ("BusinessProcess_пр_БизнесПроцессСогласованияОрдеров", "Start"),
+    ("Task_пр_ЗадачаСогласования", "ExecuteTask"),
+}
+ВИРТУАЛЬНЫЕ_UT = {
+    "AccumulationRegister_ДвиженияДенежныеСредстваКонтрагент_Turnovers": (
+        "AccumulationRegister_ДвиженияДенежныеСредстваКонтрагент"
+    ),
+    "AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance": (
+        "AccumulationRegister_РасчетыСКлиентамиПланОплат"
+    ),
+    "AccumulationRegister_РасчетыСКлиентамиПланОплат_Turnovers": (
+        "AccumulationRegister_РасчетыСКлиентамиПланОплат"
+    ),
+    "AccumulationRegister_РасчетыСКлиентамиПланОплат_BalanceAndTurnovers": (
+        "AccumulationRegister_РасчетыСКлиентамиПланОплат"
+    ),
+    "AccumulationRegister_пр_ВыпускПроукцииПоСменам_Turnovers": (
+        "AccumulationRegister_пр_ВыпускПроукцииПоСменам"
+    ),
+    "InformationRegister_пр_ОчередьДействий_SliceLast": (
+        "InformationRegister_пр_ОчередьДействий_RecordType"
+    ),
+    "InformationRegister_пр_ОчередьДействий_SliceFirst": (
+        "InformationRegister_пр_ОчередьДействий_RecordType"
+    ),
+    "InformationRegister_СтоимостьТоваров_SliceLast": (
+        "InformationRegister_СтоимостьТоваров_RecordType"
+    ),
+    "InformationRegister_СтоимостьТоваров_SliceFirst": (
+        "InformationRegister_СтоимостьТоваров_RecordType"
+    ),
+    "InformationRegister_ЖурналУчетаСчетовФактур_SliceLast": (
+        "InformationRegister_ЖурналУчетаСчетовФактур_RecordType"
+    ),
+    "InformationRegister_ЖурналУчетаСчетовФактур_SliceFirst": (
+        "InformationRegister_ЖурналУчетаСчетовФактур_RecordType"
+    ),
+    "InformationRegister_ПоследнийОбменСБанками_SliceLast": (
+        "InformationRegister_ПоследнийОбменСБанками"
+    ),
+    "InformationRegister_ПоследнийОбменСБанками_SliceFirst": (
+        "InformationRegister_ПоследнийОбменСБанками"
+    ),
+    "InformationRegister_КурсыВалют_SliceLast": "InformationRegister_КурсыВалют",
+    "InformationRegister_КурсыВалют_SliceFirst": "InformationRegister_КурсыВалют",
+    "InformationRegister_ДокументыФизическихЛиц_SliceLast": (
+        "InformationRegister_ДокументыФизическихЛиц"
+    ),
+    "InformationRegister_ДокументыФизическихЛиц_SliceFirst": (
+        "InformationRegister_ДокументыФизическихЛиц"
+    ),
+}
+
+
+def test_ut_действия_привязаны_по_типу_параметра(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    с_эффектом = {(д.entity, д.name) for д in разобрано.actions if д.side_effecting}
+    assert с_эффектом == ДЕЙСТВИЯ_UT
+    post = next(д for д in разобрано.actions if д.name == "Post")
+    assert post.params == {"PostingModeOperational": "Edm.Boolean"}
+    assert post.http_method == "POST"
+    assert разобрано.warnings == []
+
+
+def test_ut_виртуальные_таблицы_из_действий(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    виртуальные = {с.name: с for с in разобрано.entities if с.is_virtual}
+    assert {имя: с.parent_entity for имя, с in виртуальные.items()} == ВИРТУАЛЬНЫЕ_UT
+    for с in виртуальные.values():
+        assert с.virtual_kind == с.name.rsplit("_", 1)[1]
+        assert с.is_independent_register is False
+        assert с.key_fields == []
+
+
+def test_ut_поля_остатков_из_сложного_типа(edmx_ut_real):
+    остатки = найти(
+        parse_edmx(edmx_ut_real), "AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance"
+    )
+    поля = {п.name: п for п in остатки.fields}
+    assert "КОплатеBalance" in поля
+    assert поля["ОбъектРасчетов_Key"].is_ref is True
+    assert поля["ДокументПлан"].is_composite is True  # пара ДокументПлан_Type в ComplexType
+
+
+def test_ut_параметры_виртуальной_таблицы(edmx_ut_real):
+    разобрано = parse_edmx(edmx_ut_real)
+    параметры = {д.entity: д for д in разобрано.actions if not д.side_effecting}[
+        "AccumulationRegister_РасчетыСКлиентамиПланОплат_Turnovers"
+    ]
+    assert параметры.name == "Turnovers"
+    assert параметры.http_method == "GET"
+    assert set(параметры.params) == {"Condition", "Dimensions", "StartPeriod", "EndPeriod"}
+
+
+def test_занятое_имя_виртуальной_таблицы_даёт_предупреждение():
+    типы = """
+      <EntityType Name="AccumulationRegister_А"><Key><PropertyRef Name="Recorder_Key"/></Key>
+        <Property Name="Recorder_Key" Type="Edm.Guid" Nullable="false"/></EntityType>
+      <EntityType Name="AccumulationRegister_А_Balance"><Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/></EntityType>
+      <ComplexType Name="AccumulationRegister_А_BalanceRow">
+        <Property Name="СуммаBalance" Type="Edm.Decimal"/></ComplexType>"""
+    тело_контейнера = """
+        <EntitySet Name="AccumulationRegister_А" EntityType="StandardODATA.AccumulationRegister_А"/>
+        <EntitySet Name="AccumulationRegister_А_Balance"
+                   EntityType="StandardODATA.AccumulationRegister_А_Balance"/>
+        <FunctionImport Name="Balance" IsBindable="true" IsSideEffecting="false"
+            ReturnType="Collection(StandardODATA.AccumulationRegister_А_BalanceRow)">
+          <Parameter Name="bindingParameter" Type="StandardODATA.AccumulationRegister_А"/>
+        </FunctionImport>"""
+    разобрано = parse_edmx(обёртка_эдмкс_с_типами(типы, тело_контейнера))
+    assert len(разобрано.warnings) == 1
+    assert "AccumulationRegister_А/Balance" in разобрано.warnings[0]
+    assert not any(с.is_virtual for с in разобрано.entities)
+
+
+# Дополнение 2026-09-10 (шаг 7 задачи 2): навигационные связи — цель каждой навигации нужна слою
+# тулов (M1d) для автоматического $select под $expand.
+
+
+def test_ut_навигации_документа(edmx_ut_real):
+    документ = найти(parse_edmx(edmx_ut_real), "Document_РеализацияТоваровУслуг")
+    assert документ.navigations["Контрагент"] == "Catalog_Контрагенты"
+    assert документ.navigations["Отпустил"] == "Catalog_ФизическиеЛица"
+    assert (
+        документ.navigations["БанковскийСчетКонтрагента"] == "Catalog_БанковскиеСчетаКонтрагентов"
+    )
+    поля = {п.name: п for п in документ.fields}
+    assert поля["Контрагент_Key"].ref_targets == ["Catalog_Контрагенты"]
+
+
+def test_ut_навигация_набора_записей(edmx_ut_real):
+    журнал = найти(
+        parse_edmx(edmx_ut_real), "InformationRegister_ЖурналУчетаСчетовФактур_RecordType"
+    )
+    assert журнал.navigations["Продавец"] == "Catalog_Контрагенты"
+
+
+def test_ut_самоссылка(edmx_ut_real):
+    контрагенты = найти(parse_edmx(edmx_ut_real), "Catalog_Контрагенты")
+    assert контрагенты.navigations["ГоловнойКонтрагент"] == "Catalog_Контрагенты"
+
+
+def test_виртуальная_таблица_без_навигаций(edmx_ut_real):
+    # У ComplexType навигаций не бывает — виртуальная таблица их не получает вовсе.
+    остатки = найти(
+        parse_edmx(edmx_ut_real), "AccumulationRegister_РасчетыСКлиентамиПланОплат_Balance"
+    )
+    assert остатки.navigations == {}
+
+
+def test_виртуальная_таблица_не_делит_объекты_полей_с_набором(edmx_ut_real):
+    # InformationRegister_КурсыВалют — независимый регистр без выделенного RowType: результат
+    # SliceLast (Collection(...InformationRegister_КурсыВалют)) — тот же EntityType, что и у
+    # самого регистра, поэтому поля_результата в parse_edmx — тот же объект списка, что и
+    # регистр.fields. Без copy.deepcopy виртуальная таблица делила бы объекты ParsedField с
+    # набором: мутация одного (например, класс защиты, который проставляет реиндекс/гейт) была
+    # бы видна и в другом — а виртуальная таблица физически удаляется, набор — только помечается
+    # (см. предупреждение в брифе задачи 2 плана M1b-fix, шаг 5).
+    разобрано = parse_edmx(edmx_ut_real)
+    регистр = найти(разобрано, "InformationRegister_КурсыВалют")
+    срез = найти(разобрано, "InformationRegister_КурсыВалют_SliceLast")
+    поля_регистра = {п.name: п for п in регистр.fields}
+    поля_среза = {п.name: п for п in срез.fields}
+    общее_имя = next(iter(set(поля_регистра) & set(поля_среза)))
+    assert поля_регистра[общее_имя] is not поля_среза[общее_имя]
+    поля_среза[общее_имя].is_composite = not поля_среза[общее_имя].is_composite
+    assert поля_регистра[общее_имя].is_composite != поля_среза[общее_имя].is_composite

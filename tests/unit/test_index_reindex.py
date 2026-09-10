@@ -32,7 +32,7 @@ async def test_первый_реиндекс_строит_индекс(tmp_path,
     await client.close()
 
     assert результат.changed is True
-    assert результат.entity_count == 9
+    assert результат.entity_count == 8
     assert index_path(tmp_path, "ut").exists()
     assert "Catalog_Контрагенты" in результат.added_entities
 
@@ -60,7 +60,7 @@ async def test_принудительный_реиндекс_перестраи�
     await client.close()
 
     assert результат.changed is True
-    assert результат.entity_count == 9
+    assert результат.entity_count == 8
 
 
 @respx.mock
@@ -175,7 +175,7 @@ async def test_повреждённый_метаданные_не_ломают_�
     from odata1c.index.repository import IndexRepository
 
     хранилище = IndexRepository(index_path(tmp_path, "ut"))
-    assert len(хранилище.entity_names()) == 9  # старый индекс уцелел
+    assert len(хранилище.entity_names()) == 8  # старый индекс уцелел
     хранилище.close()
 
 
@@ -272,5 +272,5 @@ async def test_сбой_записи_не_портит_прежний_индек
     assert путь.stat().st_size == размер_до
 
     хранилище = IndexRepository(путь)
-    assert len(хранилище.entity_names()) == 9  # прежний индекс по-прежнему читается
+    assert len(хранилище.entity_names()) == 8  # прежний индекс по-прежнему читается
     хранилище.close()

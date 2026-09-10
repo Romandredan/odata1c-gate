@@ -52,16 +52,6 @@
         <Property Name="Курс" Type="Edm.Decimal" Nullable="true"/>
       </EntityType>
 
-      <EntityType Name="InformationRegister_КурсыВалют_SliceLast">
-        <Key>
-          <PropertyRef Name="Period"/>
-          <PropertyRef Name="Валюта_Key"/>
-        </Key>
-        <Property Name="Period" Type="Edm.DateTime" Nullable="false"/>
-        <Property Name="Валюта_Key" Type="Edm.Guid" Nullable="false"/>
-        <Property Name="Курс" Type="Edm.Decimal" Nullable="true"/>
-      </EntityType>
-
       <EntityType Name="InformationRegister_СостоянияЗаказов">
         <Key>
           <PropertyRef Name="Recorder"/>
@@ -74,16 +64,10 @@
         <Property Name="Состояние" Type="Edm.String" Nullable="true"/>
       </EntityType>
 
-      <EntityType Name="AccumulationRegister_ТоварыНаСкладах_Balance">
-        <Key><PropertyRef Name="Номенклатура_Key"/></Key>
-        <Property Name="Номенклатура_Key" Type="Edm.Guid" Nullable="false"/>
-        <Property Name="Склад_Key" Type="Edm.Guid" Nullable="true"/>
-        <Property Name="ВНаличииBalance" Type="Edm.Decimal" Nullable="true"/>
-      </EntityType>
-
       <!-- Невиртуальный регистр накопления с ключом из одних измерений (без Recorder среди
-           ключей) — правка по итогам финального ревью M1b (Important, задача 3). Единственный
-           регистр другого вида в образце (_Balance выше) отсекается через is_virtual, поэтому
+           ключей) — правка по итогам финального ревью M1b (Important, задача 3). Единственная
+           виртуальная таблица образца (InformationRegister_КурсыВалют_SliceLast, строится
+           действием SliceLast ниже) — регистра сведений, отсекается через is_virtual, поэтому
            мутация «признак независимого регистра сведений → признак вида, оканчивающегося на
            „регистр“» не ловилась ни одним тестом. Эта сущность — не типовой факт из реального
            $metadata (в 1С регистр накопления обычно связан с регистратором), а минимальный
@@ -116,23 +100,24 @@
                    EntityType="StandardODATA.Document_РеализацияТоваровУслуг_Товары"/>
         <EntitySet Name="InformationRegister_КурсыВалют"
                    EntityType="StandardODATA.InformationRegister_КурсыВалют"/>
-        <EntitySet Name="InformationRegister_КурсыВалют_SliceLast"
-                   EntityType="StandardODATA.InformationRegister_КурсыВалют_SliceLast"/>
         <EntitySet Name="InformationRegister_СостоянияЗаказов"
                    EntityType="StandardODATA.InformationRegister_СостоянияЗаказов"/>
-        <EntitySet Name="AccumulationRegister_ТоварыНаСкладах_Balance"
-                   EntityType="StandardODATA.AccumulationRegister_ТоварыНаСкладах_Balance"/>
         <EntitySet Name="AccumulationRegister_ОстаткиНаСчетах"
                    EntityType="StandardODATA.AccumulationRegister_ОстаткиНаСчетах"/>
         <EntitySet Name="Catalog_БанковскиеСчета" EntityType="StandardODATA.Catalog_БанковскиеСчета"/>
-        <FunctionImport Name="Document_РеализацияТоваровУслуг_Post"
-                        ReturnType="StandardODATA.Document_РеализацияТоваровУслуг"
-                        EntitySet="Document_РеализацияТоваровУслуг" m:HttpMethod="POST">
-          <Parameter Name="PostingModeOperational" Type="Edm.Boolean" Mode="In"/>
+        <FunctionImport Name="Post" IsBindable="true" IsSideEffecting="true">
+          <Parameter Name="bindingParameter" Type="StandardODATA.Document_РеализацияТоваровУслуг"/>
+          <Parameter Name="PostingModeOperational" Type="Edm.Boolean"/>
         </FunctionImport>
-        <FunctionImport Name="Document_РеализацияТоваровУслуг_Unpost"
-                        ReturnType="StandardODATA.Document_РеализацияТоваровУслуг"
-                        EntitySet="Document_РеализацияТоваровУслуг" m:HttpMethod="POST"/>
+        <FunctionImport Name="Unpost" IsBindable="true" IsSideEffecting="true">
+          <Parameter Name="bindingParameter" Type="StandardODATA.Document_РеализацияТоваровУслуг"/>
+        </FunctionImport>
+        <FunctionImport Name="SliceLast" IsBindable="true" IsSideEffecting="false"
+                        ReturnType="Collection(StandardODATA.InformationRegister_КурсыВалют)">
+          <Parameter Name="bindingParameter" Type="StandardODATA.InformationRegister_КурсыВалют"/>
+          <Parameter Name="Condition" Type="Edm.String"/>
+          <Parameter Name="Period" Type="Edm.DateTime"/>
+        </FunctionImport>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>

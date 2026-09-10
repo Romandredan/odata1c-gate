@@ -18,7 +18,7 @@ def индекс(tmp_path, edmx_synthetic):
 
 
 def test_записаны_все_сущности(индекс):
-    assert len(индекс.entity_names()) == 9
+    assert len(индекс.entity_names()) == 8
     assert "Catalog_Контрагенты" in индекс.entity_names()
 
 
@@ -183,7 +183,7 @@ def test_описание_сущности(индекс):
 def test_описание_показывает_действия(индекс):
     описание = индекс.describe("Document_РеализацияТоваровУслуг")
     имена_действий = {действие["name"] for действие in описание.actions}
-    assert "Document_РеализацияТоваровУслуг_Post" in имена_действий
+    assert "Post" in имена_действий
 
 
 def test_описание_неизвестной_сущности(индекс):
@@ -223,12 +223,12 @@ def test_класс_поля_промах_по_несуществующему_п
 
 def test_контрольная_сумма_сохраняется(индекс, edmx_synthetic):
     assert индекс.meta("edmx_sha256") == parse_edmx(edmx_synthetic).edmx_sha256
-    assert индекс.meta("entity_count") == "9"
+    assert индекс.meta("entity_count") == "8"
 
 
 def test_повторная_запись_не_дублирует(индекс, edmx_synthetic):
     индекс.write(parse_edmx(edmx_synthetic))
-    assert len(индекс.entity_names()) == 9
+    assert len(индекс.entity_names()) == 8
 
 
 def test_повторная_запись_не_копит_мусор_в_полнотекстовой_таблице(индекс, edmx_synthetic):
@@ -241,7 +241,7 @@ def test_повторная_запись_не_копит_мусор_в_полн�
     индекс.write(parse_edmx(edmx_synthetic))
     индекс.write(parse_edmx(edmx_synthetic))
     строк_в_fts = индекс._connection.execute("SELECT COUNT(*) FROM entities_fts").fetchone()[0]
-    assert строк_в_fts == len(индекс.entity_names()) == 9
+    assert строк_в_fts == len(индекс.entity_names()) == 8
 
 
 def test_порог_отсекает_совпадение_только_по_общему_префиксу_вида(индекс):
