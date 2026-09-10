@@ -642,6 +642,7 @@ source = { editable = "." }
 dependencies = [
     { name = "ahocorasick-rs" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "lxml" },
     { name = "mcp" },
     { name = "pydantic" },
@@ -668,6 +669,7 @@ dev = [
 requires-dist = [
     { name = "ahocorasick-rs", specifier = ">=0.22" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "httpx2", specifier = ">=2.12" },
     { name = "keyring", marker = "extra == 'keyring'", specifier = ">=25.0" },
     { name = "lxml", specifier = ">=5.2" },
     { name = "mcp", specifier = ">=2.2" },

@@ -30,6 +30,7 @@ from odata1c.gate.service import classifier_for, open_dictionary, policy_path, r
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
 from odata1c.index.repository import IndexCorruptError
+from odata1c.launcher import run_launcher
 from odata1c.registry.registry import Registry, SessionScope
 
 # Сколько ждать порт демона после spawn_detached (бриф задачи 5) — и в лаунчере (SPEC §2.1, п. 2),
@@ -110,6 +111,19 @@ def main(argv: list[str] | None = None) -> int:
     daemon_подкоманды = daemon_parser.add_subparsers(dest="действие")
     daemon_подкоманды.add_parser("stop", help="остановить демон по daemon.pid", parents=[домашний])
 
+    mcp_parser = команды.add_parser(
+        "mcp",
+        help="лаунчер: stdio-прокси демону (подключение к Claude Code)",
+        parents=[домашний],
+    )
+    mcp_parser.add_argument(
+        "--bases", help="видимые сессии базы через запятую (иначе видны все базы)"
+    )
+    mcp_parser.add_argument("--default", help="база по умолчанию для этой сессии")
+    mcp_parser.add_argument(
+        "--url", help="адрес демона явно (иначе daemon_url из порта daemon.yaml)"
+    )
+
     reveal = команды.add_parser(
         "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
     )
@@ -143,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_daemon_stop(home)
         if args.команда == "daemon":
             return cmd_daemon(home, args.foreground)
+        if args.команда == "mcp":
+            return cmd_mcp(home, args.bases, args.default, args.url)
         if args.команда == "reveal":
             return cmd_reveal(home, args.token, base=args.base, field=args.field)
     except (
@@ -362,6 +378,20 @@ def cmd_daemon_stop(home: pathlib.Path) -> int:
         return 0
     print(f"демон не запущен: {home / 'daemon.pid'} не найден")
     return 1
+
+
+def cmd_mcp(home: pathlib.Path, bases: str | None, default: str | None, url: str | None) -> int:
+    """`odata1c mcp [--bases a,b] [--default a] [--url URL]` (SPEC §2.2, план M1d задача 6).
+
+    Держит stdio, пока клиент (Claude Code) не отключится — обычный код 0 по завершении. Отказ
+    поднять свой демон печатается лаунчером в stderr и оформляется как `SystemExit(1)`
+    (`launcher.py::_дождаться_демона`) — этот код возврата и есть отказ команды, здесь его
+    перехватывать незачем: `SystemExit` — не `Exception`, общий перехват выше по этому файлу его
+    не ловит и не должен.
+    """
+    список_баз = [имя.strip() for имя in bases.split(",") if имя.strip()] if bases else None
+    asyncio.run(run_launcher(home, bases=список_баз, default=default, url=url))
+    return 0
 
 
 def cmd_reveal(
