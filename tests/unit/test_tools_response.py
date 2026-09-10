@@ -75,13 +75,28 @@ def test_strip_убирает_все_формы_служебных_ключей_
         "odata.count": "3",
         "odata.nextLink": "n",
         "Файл@odata.mediaReadLink": "u",
-        "ХранилищеЗначенияДанные": "b",
+        "ДанныеХранилищеЗначения": "b",
         "Товары": [
             {"odata.type": "t", "Номенклатура@navigationLinkUrl": "x", "Количество": 2},
             {"DataVersion": "v", "Цена": 10},
         ],
     }
     assert strip_service(сырой) == {"Товары": [{"Количество": 2}, {"Цена": 10}]}
+
+
+def test_strip_двоичные_поля_по_суффиксу_а_не_по_вхождению():
+    # Раунд правок 1: «ЕстьХранилищеЗначенияКартинки» — законный булев реквизит, вырезать его
+    # нельзя; двоичное поле узнаётся по суффиксу, как в gate/masking.py::ДВОИЧНЫЕ_СУФФИКСЫ.
+    сырой = {
+        "ЕстьХранилищеЗначенияКартинки": True,
+        "КартинкаХранилищеЗначения": "b",
+        "Фото_Base64Data": "…",
+        "Base64DataОписание": "текст",
+    }
+    assert strip_service(сырой) == {
+        "ЕстьХранилищеЗначенияКартинки": True,
+        "Base64DataОписание": "текст",
+    }
 
 
 def test_strip_не_трогает_скаляры_и_обычные_ключи():
@@ -184,6 +199,41 @@ def test_fit_result_берёт_skip_из_аргумента_когда_стра�
     подогнано = fit_result(конверт, 600, skip=30)
     assert подогнано["has_more"] is True
     assert подогнано["next_skip"] == 30 + len(подогнано["items"])
+
+
+def test_fit_result_пропускает_запись_которая_не_помещается_даже_одна():
+    # Раунд правок 1: иначе items=[] при next_skip == skip — клиент, листающий по next_skip,
+    # зацикливается на той же записи.
+    конверт = {
+        "items": [{"t": "x" * 500}, {"t": "y"}],
+        "has_more": False,
+        "next_skip": None,
+        "count": 2,
+        "warnings": ["прежнее"],
+    }
+    подогнано = fit_result(конверт, 300, skip=100)
+    assert подогнано["items"] == [] and подогнано["count"] == 0
+    assert подогнано["has_more"] is True
+    assert подогнано["next_skip"] == 101 and подогнано["next_skip"] > 100
+    assert подогнано["warnings"] == [
+        "прежнее",
+        "запись 100 не помещается в лимит result_chars (300 симв.) и пропущена — сузьте select",
+    ]
+    assert len(json.dumps(подогнано, ensure_ascii=False)) <= 300
+
+
+def test_fit_result_пропуск_записи_без_skip_считает_смещение_нулём():
+    конверт = {
+        "items": [{"t": "x" * 500}],
+        "has_more": False,
+        "next_skip": None,
+        "count": 1,
+        "warnings": [],
+    }
+    подогнано = fit_result(конверт, 300)
+    assert подогнано["items"] == [] and подогнано["has_more"] is True
+    assert подогнано["next_skip"] == 1 and подогнано["next_skip"] > 0
+    assert "запись 0 не помещается" in подогнано["warnings"][0]
 
 
 def test_fit_result_в_пределах_лимита_возвращает_конверт_как_есть():
