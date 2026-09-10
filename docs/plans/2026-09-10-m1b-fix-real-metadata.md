@@ -41,7 +41,7 @@
 | `src/odata1c/index/edmx.py` | родитель по списку наборов, наборы записей, регистратор, составные строки; действия по `bindingParameter`; виртуальные таблицы; перечисления; `PARSER_VERSION` | 1, 2, 3 |
 | `tests/fixtures/edmx/synthetic.edmx` | убраны выдуманные виртуальные наборы; действия в реальной форме | 2 |
 | `tests/unit/test_index_edmx.py`, `test_index_naming.py` | переписаны тесты структуры; новые — на `ut-real.edmx` | 1, 2, 3 |
-| `src/odata1c/index/schema.py`, `repository.py` | `is_records`, таблица `enums`, `parser_version`, расширенный `describe` | 3 |
+| `src/odata1c/index/schema.py`, `repository.py` | `is_records`, таблицы `enums` и `navigations`, `parser_version`, расширенный `describe` | 3 |
 | `src/odata1c/index/reindex.py`, `src/odata1c/cli.py` | перестройка при смене версии разбора; предупреждения разбора | 3 |
 | `tests/unit/test_index_repository.py`, `test_index_reindex.py` | новые проверки | 3 |
 | `src/odata1c/gate/field_rules.py`, `masking.py` | `номерсчетафактур` не `acc`; GUID не токенизируется | 4 |
@@ -699,6 +699,44 @@ git add src/odata1c/index/edmx.py tests/fixtures/edmx/synthetic.edmx tests/unit/
 git commit -m "fix: действия и виртуальные таблицы по привязке FunctionImport"
 ```
 
+- [ ] **Шаг 7 (дополнение 2026-09-10): навигационные связи**
+
+Слой тулов (M1d) строит автоматический `$select` для `$expand` и показывает, куда ведёт ссылка, —
+ему нужна цель каждой навигации. Разбор делается здесь же, в том же проходе, чтобы не заходить в
+разборщик третий раз.
+
+`ParsedEntity` получает поле `navigations: dict[str, str] = dataclasses.field(default_factory=dict)`
+(имя навигационного свойства → имя набора-цели). В проходе типов для каждого `EntityType` собрать
+`NavigationProperty` (`Name`, `Relationship` без пространства имён, `ToRole`); собрать все
+`Association`: имя → `{Role: тип конца без пространства имён}`. После сборки наборов:
+цель = набор, чей `EntityType` равен типу конца `ToRole`; связь, чья цель не опубликована или
+`Association` не найдена, пропускается молча (урезанная публикация — норма). Полю-ссылке, парному
+навигации (`<Имя>_Key` либо составное `<Имя>`), выставить `ref_targets = [цель]`.
+
+Тесты на реальном образце:
+
+```python
+def test_ut_навигации_документа(edmx_ut_real):
+    документ = найти(parse_edmx(edmx_ut_real), "Document_РеализацияТоваровУслуг")
+    assert документ.navigations["Контрагент"] == "Catalog_Контрагенты"
+    assert документ.navigations["Отпустил"] == "Catalog_ФизическиеЛица"
+    assert документ.navigations["БанковскийСчетКонтрагента"] == "Catalog_БанковскиеСчетаКонтрагентов"
+    поля = {п.name: п for п in документ.fields}
+    assert поля["Контрагент_Key"].ref_targets == ["Catalog_Контрагенты"]
+
+
+def test_ut_навигация_набора_записей(edmx_ut_real):
+    журнал = найти(parse_edmx(edmx_ut_real), "InformationRegister_ЖурналУчетаСчетовФактур_RecordType")
+    assert журнал.navigations["Продавец"] == "Catalog_Контрагенты"
+
+
+def test_ut_самоссылка(edmx_ut_real):
+    контрагенты = найти(parse_edmx(edmx_ut_real), "Catalog_Контрагенты")
+    assert контрагенты.navigations["ГоловнойКонтрагент"] == "Catalog_Контрагенты"
+```
+
+Виртуальные таблицы навигаций не получают (у `ComplexType` их нет) — `navigations == {}`.
+
 ---
 
 ### Задача 3: хранилище — набор записей, перечисления, версия разбора
@@ -855,6 +893,32 @@ CREATE TABLE IF NOT EXISTS enums (
 uv run ruff format src tests && uv run ruff check . && uv run pytest -q
 git add src/odata1c/index/ src/odata1c/cli.py tests/unit/ SPEC.md
 git commit -m "feat: индекс хранит наборы записей, перечисления и версию разбора"
+```
+
+- [ ] **Шаг 6 (дополнение 2026-09-10): навигации в хранилище**
+
+`schema.py`: таблица
+
+```sql
+CREATE TABLE IF NOT EXISTS navigations (
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    target TEXT NOT NULL,
+    PRIMARY KEY (entity_id, name)
+);
+```
+
+`repository.write` пишет `ParsedEntity.navigations`; `DELETE FROM navigations` вместе с прочими.
+`EntityDescription.navigations: dict[str, str]`; `describe` заполняет. `ref_targets_json` у полей
+уже пишется — после задачи 2 он непуст. Версия разбора остаётся `"2"` (одно повышение на план).
+SPEC §4.2, блок схемы: строка `navigations(entity_id, name, target)`.
+
+```python
+def test_описание_содержит_навигации(индекс_ut):
+    описание = индекс_ut.describe("Document_РеализацияТоваровУслуг")
+    assert описание.navigations["Контрагент"] == "Catalog_Контрагенты"
+    ключ = next(п for п in описание.fields if п["name"] == "Контрагент_Key")
+    assert json.loads(ключ["ref_targets_json"]) == ["Catalog_Контрагенты"]  # или поле ref_targets, если describe его разбирает
 ```
 
 ---
