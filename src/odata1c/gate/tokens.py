@@ -59,6 +59,11 @@ def normalize_value(type_: str, value: str) -> str:
     одно значение с разным написанием — один токен. Написание с исходным регистром при этом не
     теряется: словарь (`gate/dictionary.py`) хранит его отдельно, в вариантах по базе и полю, и
     именно его возвращает `reveal()` при обратной подмене.
+
+    Поправка 2026-09-10 (M1b-fix, задача 4): для `org`/`person` «ё» приравнивается к «е». В
+    тексте «ё» часто пишут как «е»; без свёртки «ООО Василёк» и «ООО Василек» получали два
+    токена, их варианты для стража после свёртки совпадали, становились неоднозначными
+    (`Dictionary.name_variants`) — и страж не заменял ни одно написание.
     """
     if type_ in ТОЛЬКО_ЦИФРЫ:
         return re.sub(r"\D", "", value)
@@ -71,7 +76,7 @@ def normalize_value(type_: str, value: str) -> str:
     if type_ == "addr":
         return " ".join(value.split())
     if type_ in ("org", "person"):
-        return " ".join(value.split()).lower()
+        return " ".join(value.split()).lower().replace("ё", "е")
     return value.strip()
 
 
