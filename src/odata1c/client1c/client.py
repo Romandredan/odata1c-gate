@@ -54,8 +54,12 @@ def _собрать_запрос(params: dict) -> str:
     `$filter=ИНН+eq+'5024093941'` → 500 «Операция не разрешена в предложении "ГДЕ"»,
     тот же отбор с `%20` → 200. Поэтому query собирается здесь, а не передаётся в httpx
     аргументом `params`: готовую процентную запись httpx сохраняет как есть.
+
+    Значения по контракту `QuerySpec.params` — строки (`dict[str, str]`); `doseq=True` оставлен
+    для совпадения с прежним поведением httpx на случай, если когда-нибудь придёт список:
+    без него в query уехал бы `repr` списка, а не повторённый ключ.
     """
-    return urllib.parse.urlencode(params, quote_via=urllib.parse.quote, safe="")
+    return urllib.parse.urlencode(params, doseq=True, quote_via=urllib.parse.quote, safe="")
 
 
 class Client1C:
