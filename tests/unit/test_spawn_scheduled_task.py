@@ -6,12 +6,17 @@
 - находка Б.2 (Important): имя `.cmd`-файла было общим для всех сессий на одном домашнем
   каталоге — две сессии, стартующие одновременно, дрались за файл.
 
+Раунд правок 3, пункт 3 (находка Б.4 ревьюера): кавычка или перевод строки в значении переменной
+окружения вырывались из строки `set "имя=значение"`, и остаток строки `cmd.exe` выполнял как
+самостоятельную команду.
+
 Реальный `schtasks`/сеть здесь не нужны — `subprocess.run` и `is_listening` подменены, тест
 детерминированный и быстрый (не полагается на удачное совпадение времени двух настоящих
 процессов, как интеграционные пробы ревью)."""
 
 from __future__ import annotations
 
+import pathlib
 import subprocess
 import sys
 import threading
@@ -71,6 +76,64 @@ def test_порт_слушается_но_pid_чужой_не_считается
         home, [sys.executable, "-m", "odata1c", "daemon"], home / "logs" / "daemon.log", 12345
     )
     assert итог is False
+
+
+def _тело_cmd(home, monkeypatch, порт: int = 12345) -> str:
+    """Прогнать `_spawn_via_scheduled_task` и вернуть содержимое сгенерированного `.cmd`.
+
+    Снимок берётся на вызове `/create` (тем же способом, что и в тесте про два файла ниже): к
+    моменту возврата функция свой `.cmd` уже удаляет."""
+    снимок: list[str] = []
+
+    def fake_run(*args, **kwargs):
+        if "/tr" in args[0]:
+            путь = args[0][args[0].index("/tr") + 1].strip('"')
+            снимок.append(pathlib.Path(путь).read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon_module, "is_listening", lambda port, timeout=0.5: True)
+    daemon_module._spawn_via_scheduled_task(
+        home, [sys.executable, "-m", "odata1c", "daemon"], home / "logs" / "daemon.log", порт
+    )
+    return снимок[0]
+
+
+def test_кавычка_в_значении_переменной_окружения_не_вырывается_из_set(tmp_path, monkeypatch):
+    """Раунд правок 3, пункт 3 (находка Б.4): значение вида `x" & <команда> & rem ` закрывало
+    кавычку `set` и превращало остаток строки в самостоятельную команду `cmd.exe` — ревьюер
+    воспроизвёл выполнение посторонней команды маркером. Такое значение не переносится вовсе."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "daemon.pid").write_text("1", encoding="utf-8")
+    маркер = tmp_path / "ПОСТОРОННЯЯ_КОМАНДА.txt"
+    monkeypatch.setenv("SSL_CERT_FILE", f'x" & echo вырвались > "{маркер}" & rem ')
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:3128")
+
+    тело = _тело_cmd(home, monkeypatch)
+
+    assert "SSL_CERT_FILE" not in тело, f"значение с кавычкой переносить нельзя: {тело!r}"
+    assert str(маркер) not in тело
+    # Соседняя безобидная переменная от этого не страдает — пропускается ровно одна.
+    assert 'set "HTTPS_PROXY=http://proxy.example.test:3128"' in тело
+    # Каждая строка `set` остаётся одной командой: кавычек в ней ровно две.
+    for строка in тело.splitlines():
+        if строка.startswith("set "):
+            assert строка.count('"') in (0, 2), f"строка set разорвана кавычкой: {строка!r}"
+
+
+def test_перевод_строки_в_значении_переменной_окружения_не_переносится(tmp_path, monkeypatch):
+    """Вторая половина того же: перевод строки рвёт `.cmd` и без всякой кавычки — всё, что после
+    него, `cmd.exe` выполнит как следующую команду."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "daemon.pid").write_text("1", encoding="utf-8")
+    monkeypatch.setenv("NO_PROXY", "localhost\r\nstart calc.exe")
+
+    тело = _тело_cmd(home, monkeypatch)
+
+    assert "NO_PROXY" not in тело
+    assert "calc.exe" not in тело
 
 
 def test_две_одновременные_сессии_не_делят_один_cmd_файл(tmp_path, monkeypatch):
