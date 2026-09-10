@@ -1,7 +1,7 @@
 """Командная строка odata1c (SPEC §3.5).
 
-В этой задаче реализованы init, base list и base test; остальные команды добавляются
-следующими задачами и планами.
+В этой задаче реализованы init, base list, base test, daemon и daemon stop; остальные команды
+добавляются следующими задачами и планами.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import asyncio
 import getpass
 import importlib.resources
 import pathlib
+import time
 
 import pydantic
 
@@ -21,6 +22,8 @@ from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret
+from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
+from odata1c.daemon import stop as daemon_stop
 from odata1c.gate.dictionary import DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
@@ -28,6 +31,11 @@ from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
 from odata1c.index.repository import IndexCorruptError
 from odata1c.registry.registry import Registry, SessionScope
+
+# Сколько ждать порт демона после spawn_detached (бриф задачи 5) — и в лаунчере (SPEC §2.1, п. 2),
+# и в этой команде: обе стороны наблюдают один и тот же холодный старт (импорт lxml/ahocorasick,
+# разбор daemon.yaml).
+ОЖИДАНИЕ_ГОТОВНОСТИ_S = 15
 
 ШАБЛОНЫ = {"bases.yaml": "bases.example.yaml", "daemon.yaml": "daemon.example.yaml"}
 
@@ -91,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
     show = policy_sub.add_parser("show", help="показать политику базы", parents=[домашний])
     show.add_argument("name", help="имя базы")
 
+    daemon_parser = команды.add_parser(
+        "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
+    )
+    daemon_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="работать в текущем процессе (без этого — порождает фоновый процесс и ждёт порт)",
+    )
+    daemon_подкоманды = daemon_parser.add_subparsers(dest="действие")
+    daemon_подкоманды.add_parser("stop", help="остановить демон по daemon.pid", parents=[домашний])
+
     reveal = команды.add_parser(
         "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
     )
@@ -120,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_reindex(home, args.name, args.force)
         if args.команда == "policy" and args.подкоманда == "show":
             return cmd_policy_show(home, args.name)
+        if args.команда == "daemon" and getattr(args, "действие", None) == "stop":
+            return cmd_daemon_stop(home)
+        if args.команда == "daemon":
+            return cmd_daemon(home, args.foreground)
         if args.команда == "reveal":
             return cmd_reveal(home, args.token, base=args.base, field=args.field)
     except (
@@ -129,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         IndexCorruptError,
         PolicyError,
         DictionaryCorruptError,
+        DaemonError,
     ) as ошибка:
         # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать
         # $metadata), IndexCorruptError (файл индекса повреждён — reindex открывает прежний
@@ -137,9 +161,10 @@ def main(argv: list[str] | None = None) -> int:
         # гейта — не SQLite или повреждён; правка по итогам ревью задачи 9: раньше эти два
         # класса были объявлены с тем же протоколом code/hint, что и остальные, но не попадали
         # в общий перехват — команды policy show и reveal роняли голый traceback вместо
-        # понятного сообщения) — разные классы, но у всех есть code и hint, и str() на всех даёт
-        # человекочитаемое сообщение (Exception.__init__ получает его же); одно место
-        # форматирования вместо шести копий.
+        # понятного сообщения) и DaemonError (план M1d, задача 5: порт демона уже занят) —
+        # разные классы, но у всех есть code и hint, и str() на всех даёт человекочитаемое
+        # сообщение (Exception.__init__ получает его же); одно место форматирования вместо
+        # шести копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")
@@ -291,6 +316,52 @@ def cmd_policy_show(home: pathlib.Path, name: str) -> int:
     print(f"# {путь}")
     print(путь.read_text(encoding="utf-8"))
     return 0
+
+
+def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
+    """`odata1c daemon [--foreground]` (SPEC §2.2, бриф плана M1d задачи 5).
+
+    `--foreground`: работать в текущем процессе — `asyncio.run(serve(...))` держит консоль,
+    Ctrl+C отменяет корутину и даёт `serve()` остановить uvicorn штатно (`finally` внутри неё).
+    Без `--foreground`: тот же `python -m odata1c daemon --foreground` отдельным процессом
+    (`spawn_detached`), эта команда лишь ждёт готовность порта до 15 с и возвращает управление —
+    сама она демон не держит, поэтому дважды `ensure_home`/`ensure_gate_secret` не проблема:
+    и здесь (чтобы прочитать порт из daemon.yaml до того, как дочерний процесс его создаст на
+    пустом домашнем каталоге), и внутри `serve()` — обе стороны идемпотентны.
+    """
+    ensure_home(home)
+    ensure_gate_secret(home / "daemon.yaml")
+    if foreground:
+        asyncio.run(serve(home))
+        return 0
+
+    config = load_config(home)
+    _печать_предупреждений(config)
+    порт = config.daemon.port
+    if is_listening(порт):
+        print(f"демон уже слушает {daemon_url(порт)}")
+        return 0
+
+    spawn_detached(home)
+    предел = time.monotonic() + ОЖИДАНИЕ_ГОТОВНОСТИ_S
+    while time.monotonic() < предел:
+        if is_listening(порт):
+            print(f"демон запущен: {daemon_url(порт)}")
+            return 0
+        time.sleep(0.2)
+    print(
+        f"демон не ответил на порту {порт} за {ОЖИДАНИЕ_ГОТОВНОСТИ_S} с — "
+        f"проверьте журнал: {home / 'logs' / 'daemon.log'}"
+    )
+    return 1
+
+
+def cmd_daemon_stop(home: pathlib.Path) -> int:
+    if daemon_stop(home):
+        print("демон остановлен")
+        return 0
+    print(f"демон не запущен: {home / 'daemon.pid'} не найден")
+    return 1
 
 
 def cmd_reveal(
