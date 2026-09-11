@@ -49,7 +49,14 @@ from odata1c.index.repository import (
     IndexCorruptError,
     IndexRepository,
 )
-from odata1c.recipes.model import Recipe, RecipeBook, RecipeError, load_recipes, recipes_path
+from odata1c.recipes.model import (
+    Recipe,
+    RecipeBook,
+    RecipeError,
+    load_recipes,
+    recipes_path,
+    template_hint,
+)
 from odata1c.recipes.render import probe as probe_recipe
 from odata1c.recipes.render import render as render_recipe
 from odata1c.registry.registry import Registry, SessionScope
@@ -1229,7 +1236,7 @@ class ToolService:
                 raise RecipeError(
                     "recipe_unknown",
                     f"рецепт «{name}» у базы «{base_config.name}» не описан",
-                    self._подсказка_рецептов(книга),
+                    self._подсказка_рецептов(base_config, книга),
                 )
 
             описание = self._resolve_entity(репозиторий, гейт, рецепт.entity)
@@ -1379,11 +1386,7 @@ class ToolService:
             "recipes": [],
         }
         if book is None:
-            конверт["hint"] = (
-                f"у базы «{base.name}» нет файла рецептов "
-                f"({recipes_path(self._config.home, base)}); шаблон копируется командой "
-                "odata1c base add --recipes ut|bp|zup"
-            )
+            конверт["hint"] = self._подсказка_рецептов(base, book)
             return конверт
 
         скрытые = self._скрытые(repo, gate)
@@ -1433,7 +1436,7 @@ class ToolService:
             конверт["recipes"].append(строка)
         подсказки: list[str] = []
         if not конверт["recipes"] and not скрыто_рецептов:
-            подсказки.append("файл рецептов базы пуст")
+            подсказки.append(self._подсказка_рецептов(base, book))
         elif repo is None:
             подсказки.append(
                 f"база «{base.name}» не проиндексирована: применимость рецептов неизвестна — "
@@ -1458,12 +1461,18 @@ class ToolService:
             конверт["hint"] = "; ".join(подсказки)
         return конверт
 
-    @staticmethod
-    def _подсказка_рецептов(book: RecipeBook | None) -> str:
+    def _подсказка_рецептов(self, base: BaseConfig, book: RecipeBook | None) -> str:
+        """Подсказка о рецептах базы — одного вида во всех ветках (находка П4 приёмки через
+        настоящие инструменты): нет файла, файл пуст, рецепт не найден в пустой книге. Раньше
+        первая ветка называла путь и команду, вторая — только «файл рецептов базы пуст», третья —
+        команду без пути; команда `base add --recipes` у уже описанной базы вдобавок не работает.
+        Теперь каждая называет файл базы и откуда скопировать шаблон (`recipes.template_hint`)."""
+        путь = recipes_path(self._config.home, base)
         if book is None:
-            return "у базы нет файла рецептов: odata1c base add --recipes ut|bp|zup"
-        имена = ", ".join(book.recipes) or "ни одного"
-        return f"рецепты базы: {имена}"
+            return f"у базы «{base.name}» нет файла рецептов; {template_hint(путь)}"
+        if not book.recipes:
+            return f"файл рецептов базы «{base.name}» пуст; {template_hint(путь)}"
+        return f"рецепты базы: {', '.join(book.recipes)}"
 
     async def resource_recipes(self, scope: SessionScope, base: str) -> str:
         """Ресурс `odata1c://recipes/{base}` — список рецептов базы в читаемом виде (SPEC §8).

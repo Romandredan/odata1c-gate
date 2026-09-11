@@ -637,6 +637,59 @@ async def test_список_без_файла_рецептов_даёт_подс
     assert "recipes.yaml" in ответ["hint"]
 
 
+def _шаблоны_поставки() -> str:
+    import importlib.resources
+
+    return str(importlib.resources.files("odata1c.templates.recipes"))
+
+
+def _подсказка_ведёт_к_шаблону(подсказка: str, файл) -> None:
+    """Подсказка называет файл рецептов базы и то, откуда взять шаблон поставки: команда
+    `base add --recipes` у уже описанной базы не работает («база уже описана»), поэтому одного её
+    упоминания мало (находка П4)."""
+    assert str(файл) in подсказка
+    assert _шаблоны_поставки() in подсказка
+    assert "ut.yaml" in подсказка and "скопируйте" in подсказка
+
+
+async def test_пустой_файл_рецептов_подсказывает_путь_и_шаблон(сервис, дом):
+    """Находка П4: у базы, добавленной без `--recipes`, файл пуст, а подсказка «файл рецептов
+    базы пуст» не говорила ни где он, ни что в него положить."""
+    файл = дом / "bases" / "ut" / "recipes.yaml"
+    файл.write_text("version: 1\nrecipes: {}\n", encoding="utf-8")
+
+    ответ = json.loads(await сервис.recipe(SessionScope()))
+
+    assert ответ["recipes"] == []
+    _подсказка_ведёт_к_шаблону(ответ["hint"], файл)
+
+
+async def test_без_файла_рецептов_подсказка_того_же_вида(сервис, дом):
+    файл = дом / "bases" / "ut" / "recipes.yaml"
+    файл.unlink()
+
+    ответ = json.loads(await сервис.recipe(SessionScope()))
+
+    _подсказка_ведёт_к_шаблону(ответ["hint"], файл)
+
+
+async def test_неизвестный_рецепт_у_пустой_книги_подсказывает_шаблон(сервис, дом):
+    файл = дом / "bases" / "ut" / "recipes.yaml"
+    файл.write_text("version: 1\nrecipes: {}\n", encoding="utf-8")
+
+    ошибка = json.loads(await сервис.recipe(SessionScope(), name="partners"))["error"]
+
+    assert ошибка["code"] == "recipe_unknown"
+    _подсказка_ведёт_к_шаблону(ошибка["hint"], файл)
+
+
+def test_отсутствующий_файл_рецептов_подсказывает_шаблон(tmp_path):
+    файл = tmp_path / "нет.yaml"
+    with pytest.raises(RecipeError) as отказ:
+        load_recipes(файл)
+    _подсказка_ведёт_к_шаблону(отказ.value.hint, файл)
+
+
 async def test_неизвестный_рецепт_отвечает_recipe_unknown(сервис):
     ответ = json.loads(await сервис.recipe(SessionScope(), name="нет-такого"))
     assert ответ["error"]["code"] == "recipe_unknown"

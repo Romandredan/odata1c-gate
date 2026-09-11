@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import pathlib
 import re
 from typing import Literal
@@ -284,6 +285,24 @@ def recipes_path(home: pathlib.Path, base: BaseConfig) -> pathlib.Path:
     return путь if путь.is_absolute() else home / путь
 
 
+def template_hint(path: pathlib.Path) -> str:
+    """Как положить в файл рецептов базы шаблон поставки — одна подсказка на все случаи, когда
+    рецептов нет: файла нет, файл пуст, рецепт с таким именем не описан в пустой книге (находка
+    П4 приёмки через настоящие инструменты, 2026-09-12).
+
+    Прежние подсказки советовали `odata1c base add --recipes ut|bp|zup`, но у УЖЕ описанной базы
+    эта команда отказывает («база уже описана»), а отдельной команды «положить рецепты» нет.
+    Поэтому подсказка называет файл базы и каталог шаблонов в установленном пакете, откуда его
+    скопировать; путь каталога берётся у самого пакета, а не собирается вручную, — при запуске
+    через `uvx` он лежит в кэше `uv`, и угадать его владелец не сможет."""
+    каталог = importlib.resources.files("odata1c.templates.recipes")
+    return (
+        f"положите в {path} шаблон поставки: скопируйте туда ut.yaml, bp.yaml или zup.yaml "
+        f"(УТ, БП, ЗУП) из {каталог}; новой базе то же делает odata1c base add <имя> "
+        "--recipes ut|bp|zup"
+    )
+
+
 def load_recipes(path: pathlib.Path) -> RecipeBook:
     """Прочитать `recipes.yaml`. Любая ошибка файла — `RecipeError` с кодом `config_invalid`
     (SPEC §5.2, поправка 2026-09-08: код для ошибок файлов настроек)."""
@@ -292,7 +311,7 @@ def load_recipes(path: pathlib.Path) -> RecipeBook:
         raise RecipeError(
             "config_invalid",
             f"файл рецептов не найден: {путь}",
-            "скопируйте шаблон: odata1c base add --recipes ut|bp|zup",
+            template_hint(путь),
         )
     try:
         данные = yaml.safe_load(путь.read_text(encoding="utf-8"))
