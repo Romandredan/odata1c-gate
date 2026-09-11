@@ -374,7 +374,7 @@ def test_параметр_с_двумя_разными_полями_отклон
 """,
         )
     assert отказ.value.code == "config_invalid"
-    assert "разными полями" in отказ.value.message
+    assert "сравнивается по-разному" in отказ.value.message
 
 
 def test_условие_без_видимого_поля_отклоняется(tmp_path):
@@ -390,20 +390,44 @@ def test_условие_без_видимого_поля_отклоняется(
     assert отказ.value.code == "config_invalid"
 
 
-def test_поле_параметра_видно_и_слева_и_внутри_функции(tmp_path):
+def test_поле_и_вид_сравнения_параметра_опознаются(tmp_path):
     р = рецепт(
         tmp_path,
         """    entity: Catalog_Проба
     params:
       инн: { type: string }
       кусок: { type: string }
+      начало: { type: string }
+      с_даты: { type: datetime }
     filter:
       - ИНН eq {инн}
       - substringof({кусок}, НаименованиеПолное)
+      - startswith(Комментарий, {начало})
+      - Дата ge {с_даты}
 """,
     )
-    assert р.param_field("инн") == "ИНН"
-    assert р.param_field("кусок") == "НаименованиеПолное"
+    assert (р.param_field("инн"), р.param_comparison("инн")) == ("ИНН", "eq")
+    assert (р.param_field("кусок"), р.param_comparison("кусок")) == (
+        "НаименованиеПолное",
+        "substring",
+    )
+    assert (р.param_field("начало"), р.param_comparison("начало")) == ("Комментарий", "substring")
+    assert (р.param_field("с_даты"), р.param_comparison("с_даты")) == ("Дата", "ordered")
+
+
+def test_параметр_с_разным_видом_сравнения_отклоняется(tmp_path):
+    with pytest.raises(RecipeError) as отказ:
+        рецепт(
+            tmp_path,
+            """    entity: Catalog_Проба
+    params:
+      значение: { type: string }
+    filter:
+      - ИНН eq {значение}
+      - substringof({значение}, ИНН)
+""",
+        )
+    assert отказ.value.code == "config_invalid"
 
 
 def test_битый_файл_рецептов_config_invalid(tmp_path):
@@ -482,6 +506,38 @@ async def test_список_рецептов_помечает_непримени
     ]
     assert по_имени["missing"]["applicable"] is False
     assert по_имени["missing"]["hint"]
+
+
+async def test_список_на_непроиндексированной_базе_не_отказывает(сервис, дом):
+    """Список рецептов лежит в файле, а не в индексе: на свежей базе он должен читаться, просто
+    без пометки применимости."""
+    index_path(дом, "ut").unlink()
+    ответ = json.loads(await сервис.recipe(SessionScope()))
+    assert {строка["name"] for строка in ответ["recipes"]} == {"partners", "plan", "missing"}
+    assert all(строка["applicable"] is None for строка in ответ["recipes"])
+    assert "не проиндексирована" in ответ["hint"]
+
+
+async def test_рецепт_с_параметрами_на_обычной_сущности_неприменим(сервис, дом):
+    """`virtual` у невиртуальной сущности — рецепт, который не выполнится никогда: список обязан
+    сказать об этом сразу, а не отдать отказ построителя запроса при вызове."""
+    (дом / "bases" / "ut" / "recipes.yaml").write_text(
+        """
+version: 1
+recipes:
+  кривой:
+    title: Параметры таблицы у справочника
+    entity: Catalog_Контрагенты
+    params:
+      период: { type: datetime, required: true }
+    virtual:
+      Period: "{период}"
+""",
+        encoding="utf-8",
+    )
+    ответ = json.loads(await сервис.recipe(SessionScope()))
+    assert ответ["recipes"][0]["applicable"] is False
+    assert "не виртуальная таблица" in ответ["recipes"][0]["hint"]
 
 
 async def test_список_без_файла_рецептов_даёт_подсказку(сервис, дом):
@@ -585,6 +641,72 @@ async def test_битый_файл_рецептов_не_роняет_тул(с�
     (дом / "bases" / "ut" / "recipes.yaml").write_text("recipes: [не словарь]\n", encoding="utf-8")
     ответ = json.loads(await сервис.recipe(SessionScope(), name="partners"))
     assert ответ["error"]["code"] == "config_invalid"
+
+
+async def _рецепт_на_условии(
+    дом, условие: str, тип: str = "string", сущность: str = "Catalog_Контрагенты"
+):
+    (дом / "bases" / "ut" / "recipes.yaml").write_text(
+        f"""
+version: 1
+recipes:
+  проба:
+    title: Проба
+    entity: {сущность}
+    params:
+      значение: {{ type: {тип} }}
+    filter: {условие}
+    select: [Ref_Key]
+""",
+        encoding="utf-8",
+    )
+
+
+async def test_упорядоченное_сравнение_с_защищаемым_полем_запрещено(сервис, дом):
+    """Правило `unmasking._обработать_сравнение` действует и в рецепте: по непрозрачному значению
+    нельзя сравнивать «больше-меньше», а перебором границ оно раскрывается. Запрет не зависит от
+    того, токен передан или открытое значение."""
+    await _рецепт_на_условии(дом, "ИНН gt {значение}")
+    токен = await токен_инн(сервис, ИНН)
+    ответ = json.loads(
+        await сервис.recipe(SessionScope(), name="проба", params={"значение": токен})
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert "упорядоченное" in ответ["error"]["message"]
+
+
+async def test_поиск_по_вхождению_на_защищаемом_классе_запрещён(сервис, дом, respx_ut):
+    """Открытый образец на поле класса inn — посимвольный подбор значения (правило F1 M1c).
+    Через рецепт он не должен проходить так же, как не проходит через filter."""
+    await _рецепт_на_условии(дом, "substringof({значение}, ИНН)")
+    ответ = json.loads(
+        await сервис.recipe(SessionScope(), name="проба", params={"значение": "7707"})
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert "вхождению" in ответ["error"]["message"]
+
+
+async def test_поиск_по_вхождению_названия_разрешён(сервис, дом, respx_ut):
+    """…а по названию организации — разрешён: `org` и `person` из правила исключены (поиск по
+    части названия — рабочий сценарий), и рецепт повторяет ровно это поведение."""
+    await _рецепт_на_условии(дом, "substringof({значение}, Description)")
+    respx_ut.get("Catalog_Контрагенты").mock(return_value=httpx.Response(200, json={"value": []}))
+    ответ = json.loads(
+        await сервис.recipe(SessionScope(), name="проба", params={"значение": "Ромаш"})
+    )
+    assert "error" not in ответ
+    assert "substringof('Ромаш', Description)" in _адрес(respx_ut)
+
+
+async def test_открытая_дата_рождения_запрещена(сервис, дом):
+    await _рецепт_на_условии(
+        дом, "ДатаРождения eq {значение}", тип="datetime", сущность="Catalog_ФизическиеЛица"
+    )
+    ответ = json.loads(
+        await сервис.recipe(SessionScope(), name="проба", params={"значение": "1980-05-01"})
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert "dob" in ответ["error"]["message"]
 
 
 async def test_ресурс_рецептов_отдаёт_читаемый_список(сервис):

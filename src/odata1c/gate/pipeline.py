@@ -16,7 +16,8 @@ from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import Masker, MaskResult, effective_field_class
 from odata1c.gate.policy import load_policy
-from odata1c.gate.unmasking import Unmasker
+from odata1c.gate.tokens import parse_token
+from odata1c.gate.unmasking import ИМЕНОВАННЫЕ_КЛАССЫ, GateError, Unmasker
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
 # по политике конкретной базы нет, поэтому страж проверяет по максимально строгому уровню —
@@ -78,11 +79,18 @@ class BaseGate:
     def is_hidden(self, entity: str) -> bool:
         return self._policy.is_hidden(entity)
 
+    def field_class(self, entity: str, field: str) -> str | None:
+        """Эффективный класс поля по текущей политике и уровню гейта. Публичный доступ к тому,
+        что до сих пор брали через приватную `_policy` (долг, отмеченный в `tools/service.py`
+        при задаче 4): слою тулов класс нужен не только ответом «защищено или нет» — от самого
+        класса зависят анти-оракульные правила (`org`/`person` ищутся по подстроке, `dob` не
+        сравнивается с открытым литералом)."""
+        return effective_field_class(self._policy, entity, field, mode=self.mode)
+
     def is_protected(self, entity: str, field: str) -> bool:
         """Класс поля — что-то, кроме «не защищён» (`None`), «оставить как есть» (`keep`) или
         «только сканировать значение» (`scan`, значение целиком не заменяется по классу поля)."""
-        класс = effective_field_class(self._policy, entity, field, mode=self.mode)
-        return класс not in (None, "keep", "scan")
+        return self.field_class(entity, field) not in (None, "keep", "scan")
 
     def inbound_filter(self, expression: str, *, entity: str) -> str:
         if self.mode == "off":
@@ -93,6 +101,58 @@ class BaseGate:
         if self.mode == "off":
             return text
         return self._unmasker.value(text, entity=entity, field=field)
+
+    def inbound_param(self, value, *, entity: str, field: str, comparison: str):
+        """Значение параметра рецепта (SPEC §8) — обратная подмена ПЛЮС анти-оракульные правила,
+        которые на пути `query` держит разбор `$filter` (`inbound_filter`).
+
+        Рецепт эти правила обойти не должен: текст условия там доверенный (файл владельца
+        машины), а вот ЗНАЧЕНИЕ приходит от модели, и именно значение — рабочий инструмент
+        перебора. Три правила повторяют `unmasking._обработать_сравнение`/`_обработать_вызов`
+        дословно, по классу поля, с которым параметр сравнивается (`comparison`: `eq` —
+        равенство/неравенство, `ordered` — сравнение по величине, `substring` — поиск вхождения):
+
+        1. упорядоченное сравнение с защищаемым полем запрещено всегда, даже токеном: по
+           непрозрачному значению нельзя осмысленно сравнивать «больше-меньше», а перебором
+           границ оно раскрывается;
+        2. открытое (не целый токен) значение для поля класса `dob` запрещено: пространство дат
+           рождения мало и перебирается за сотни запросов;
+        3. открытый образец поиска по вхождению запрещён для защищаемых классов, кроме названий
+           и ФИО (`org`, `person`) — их поиск по части названия остаётся рабочим сценарием, для
+           прочих классов это посимвольный подбор значения.
+
+        На уровне `off` гейт не работает вовсе — значение уходит как есть, как и в остальных
+        `inbound_*`.
+        """
+        if self.mode == "off":
+            return value
+        класс = self.field_class(entity, field) if field else None
+        защищено = класс not in (None, "keep", "scan")
+        if защищено:
+            if comparison == "ordered":
+                raise GateError(
+                    "filter_syntax",
+                    f"упорядоченное сравнение запрещено для поля «{field}» класса {класс}: "
+                    "сравнивать по величине непрозрачные значения бессмысленно",
+                    "рецепт должен сравнивать защищаемое поле только через eq/ne",
+                )
+            целиком = parse_token(value) if isinstance(value, str) else None
+            if not целиком:
+                if класс == "dob":
+                    raise GateError(
+                        "filter_syntax",
+                        f"поле «{field}» класса dob сравнивается с открытым значением: "
+                        "перебором дат рождения значение раскрывается",
+                        "передайте токен из ответа целиком",
+                    )
+                if comparison == "substring" and класс not in ИМЕНОВАННЫЕ_КЛАССЫ:
+                    raise GateError(
+                        "filter_syntax",
+                        f"поиск по вхождению запрещён для поля «{field}» класса {класс}: "
+                        "образец не является токеном целиком",
+                        "передайте токен из ответа целиком — поиск станет точным сравнением",
+                    )
+        return self.inbound_value(value, entity=entity, field=field)
 
     def inbound_key(self, key, *, entity: str):
         if self.mode == "off":

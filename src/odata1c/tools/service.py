@@ -180,7 +180,9 @@ def _рецепты_markdown(конверт: dict) -> str:
         if рецепт["description"]:
             строки.append(рецепт["description"])
         строки.append(f"Сущность: `{рецепт['entity']}`")
-        if not рецепт["applicable"]:
+        # Строго `is False`: `None` — «применимость неизвестна, базы нет в индексе», и объявлять
+        # такой рецепт неприменимым нельзя (подсказка про реиндекс стоит у всего перечня).
+        if рецепт["applicable"] is False:
             строки.append(f"**Неприменим к этой базе**: {рецепт.get('hint', '')}")
         if рецепт["params"]:
             строки.append("")
@@ -803,7 +805,7 @@ class ToolService:
         async def тело(base_config, гейт, репозиторий):
             книга = self._книга_рецептов(base_config)
             if not name:
-                return self._список_рецептов(base_config, гейт, репозиторий, книга)
+                return self._перечислить(base_config, гейт, книга)
 
             рецепт = книга.recipes.get(name) if книга is not None else None
             if рецепт is None:
@@ -831,7 +833,11 @@ class ToolService:
                 extra={"recipe": name, "title": рецепт.title},
             )
 
-        return await self._run(scope, base, тело)
+        # Индекс открывает не `_run`, а сам перечень (`_перечислить`): на НЕПРОИНДЕКСИРОВАННОЙ
+        # базе `_open_index` отказал бы кодом `entity_unknown` и вместо списка рецептов модель
+        # получила бы «база не проиндексирована» — при том что список рецептов от индекса не
+        # зависит, от него зависит только пометка применимости.
+        return await self._run(scope, base, тело, with_index=bool(name))
 
     def _книга_рецептов(self, base: BaseConfig) -> RecipeBook | None:
         """Рецепты базы; `None` — файла нет вовсе (это не ошибка: рецепты необязательны).
@@ -849,6 +855,13 @@ class ToolService:
     ) -> dict:
         """Значения параметров рецепта после обратной подмены (токен → реальное значение).
 
+        Подмена идёт через `gate.inbound_param`, а не `inbound_value`: вместе со значением гейту
+        передаётся поле и вид сравнения из условия рецепта, и он применяет те же анти-оракульные
+        правила, что держит разбор `$filter` у `query` (упорядоченное сравнение с защищаемым
+        полем, открытая дата рождения, открытый образец поиска по вхождению). Без этого рецепт
+        стал бы обходом правил, которые обычный отбор соблюдает: текст условия в рецепте
+        доверенный, но значение к нему подставляет модель.
+
         Незаявленные имена проходят сюда нетронутыми — о них отказывает `render` кодом
         `recipe_param`; раскрывать токен для параметра, которого у рецепта нет, незачем, и отказ
         `token_unknown` вместо `recipe_param` только запутал бы вызывающего.
@@ -862,24 +875,44 @@ class ToolService:
         готовые = {}
         for сырое_имя, значение in params.items():
             имя = str(сырое_имя)
-            if isinstance(значение, str) and имя in recipe.params:
-                значение = gate.inbound_value(
-                    значение, entity=entity, field=recipe.param_field(имя)
+            if имя in recipe.params:
+                значение = gate.inbound_param(
+                    значение,
+                    entity=entity,
+                    field=recipe.param_field(имя),
+                    comparison=recipe.param_comparison(имя),
                 )
             готовые[имя] = значение
         return готовые
+
+    def _перечислить(self, base: BaseConfig, gate: BaseGate, book: RecipeBook | None) -> dict:
+        """Перечень рецептов с индексом базы, если он есть: непроиндексированная база — не повод
+        отказывать в списке, применимость в этом случае просто неизвестна."""
+        try:
+            репозиторий = self._open_index(base)
+        except _ServiceError:
+            репозиторий = None
+        try:
+            return self._список_рецептов(base, gate, репозиторий, book)
+        finally:
+            if репозиторий is not None:
+                репозиторий.close()
 
     def _список_рецептов(
         self,
         base: BaseConfig,
         gate: BaseGate,
-        repo: IndexRepository,
+        repo: IndexRepository | None,
         book: RecipeBook | None,
     ) -> dict:
         """Перечень рецептов базы с параметрами и пометкой применимости (SPEC §8): сущность
-        рецепта может отсутствовать в базе (шаблон УТ на базе БП) или быть скрыта политикой —
-        такой рецепт помечается `applicable: false` с подсказкой, а не молча остаётся в списке
-        наравне с рабочими."""
+        рецепта может отсутствовать в базе (шаблон УТ на базе БП), быть скрыта политикой или не
+        быть виртуальной таблицей, хотя рецепт задаёт её параметры — такой рецепт помечается
+        `applicable: false` с подсказкой, а не молча остаётся в списке наравне с рабочими.
+
+        `repo is None` — база ещё не проиндексирована: сами рецепты видны (они лежат в файле, а
+        не в индексе), но применимость неизвестна — `applicable: null` и подсказка про реиндекс.
+        """
         конверт: dict = {
             "base": base.name,
             "role": base.role,
@@ -909,17 +942,38 @@ class ToolService:
                     }
                     for имя_параметра, параметр in рецепт.params.items()
                 ],
-                "applicable": True,
+                "applicable": True if repo is not None else None,
             }
-            if gate.is_hidden(рецепт.entity):
+            описание = (
+                None
+                if repo is None or gate.is_hidden(рецепт.entity)
+                else repo.describe(рецепт.entity)
+            )
+            if repo is None:
+                pass  # применимость неизвестна: индекса нет, сверять имя сущности не с чем
+            elif gate.is_hidden(рецепт.entity):
                 строка["applicable"] = False
                 строка["hint"] = f"сущность {рецепт.entity} скрыта политикой гейта"
-            elif repo.describe(рецепт.entity) is None:
+            elif описание is None:
                 строка["applicable"] = False
                 строка["hint"] = self._entity_hint(repo, gate, рецепт.entity)
+            elif рецепт.virtual and not описание.is_virtual:
+                # Иначе рецепт числился бы применимым, а при вызове отказывал бы `build_query`
+                # («параметры виртуальной таблицы переданы для обычной сущности»): список должен
+                # говорить о выполнимости правду, а не сверять одно только имя сущности.
+                строка["applicable"] = False
+                строка["hint"] = (
+                    f"сущность {рецепт.entity} не виртуальная таблица регистра, а рецепт задаёт "
+                    "её параметры (virtual)"
+                )
             конверт["recipes"].append(строка)
         if not конверт["recipes"]:
             конверт["hint"] = "файл рецептов базы пуст"
+        elif repo is None:
+            конверт["hint"] = (
+                f"база «{base.name}» не проиндексирована: применимость рецептов неизвестна — "
+                "вызовите odata1c_reindex(base)"
+            )
         return конверт
 
     @staticmethod
