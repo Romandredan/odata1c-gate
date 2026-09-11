@@ -297,7 +297,9 @@ def _прочитать_pid_файл(pid_файл: pathlib.Path) -> str | None:
         return None
 
 
-def _записать_pid_файл(pid_файл: pathlib.Path, pid: int, *, попыток: int = 10, пауза: float = 0.02):
+def _записать_pid_файл(
+    pid_файл: pathlib.Path, pid: int, *, попыток: int = 10, пауза: float = 0.02
+) -> None:
     """Записать `daemon.pid` атомарно: временный файл своего процесса и `os.replace`.
 
     Раунд правок 4, пункт 2 (находка Б.7): обычный `write_text` — это «усечь, потом записать»,
