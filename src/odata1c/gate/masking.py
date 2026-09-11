@@ -307,10 +307,16 @@ class Masker:
         if класс == "keep":
             return текст
         if класс and класс not in ("scan",) and (класс in CLASSES or класс.startswith("custom:")):
-            замаскированные.append(field)
-            return self._dictionary.token_for(
+            # `masked_fields` заполняется ПО ФАКТУ замены, а не до неё (Ruling 20, пункт 4):
+            # раньше имя поля дописывалось раньше вызова словаря и от результата не зависело —
+            # значение, которое словарь вернул как есть, числилось замаскированным. Список должен
+            # говорить правду: поле в нём — значит реального значения в ответе нет.
+            замена = self._dictionary.token_for(
                 класс, текст, base=self._base, entity=entity, field=field
             )
+            if замена != текст:
+                замаскированные.append(field)
+            return замена
 
         обработанное = self._заменить_известные_названия(текст, entity=entity, field=field)
         обработанное = self._заменить_найденные_реквизиты(

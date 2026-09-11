@@ -113,7 +113,7 @@ def связка(*, base: str = "ut") -> typing.Iterator[Связка]:
                 обратно=Unmasker(
                     словарь,
                     base=base,
-                    field_class=lambda сущность, поле: КЛАССЫ_ПОЛЕЙ.get(поле),
+                    field_class=lambda сущность, поле, *, strict=False: КЛАССЫ_ПОЛЕЙ.get(поле),
                 ),
                 страж=Guard(словарь),
             )
