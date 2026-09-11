@@ -14,7 +14,7 @@ import pathlib
 from odata1c.config.models import BaseConfig
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
-from odata1c.gate.masking import Masker, MaskResult, effective_field_class
+from odata1c.gate.masking import Masker, MaskResult, Resolve, effective_field_class
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.unmasking import Unmasker
@@ -147,8 +147,19 @@ class BaseGate:
             return key
         return self._unmasker.key(key, entity=entity, strict=strict, revealed=revealed)
 
-    def mask(self, data, *, entity: str, strict: bool = False) -> MaskResult:
-        return self._masker.mask(data, entity=entity, strict=strict)
+    def mask(self, data, *, entity: str, resolve: Resolve, strict: bool = False) -> MaskResult:
+        """`resolve` — резолвер «сущность и ключ ответа → сущность вложенного объекта» (итоговое
+        ревью M1d, C1). Аргумент обязателен, а не с умолчанием `None`: маскировка раскрытого
+        через `$expand` объекта по политике чужой сущности и есть тот дефект, который здесь
+        чинится, — отказ типа делает пропуск невозможным, в том числе у тулов, которых ещё нет.
+        Тот же приём, что с `revealed` у `inbound_*` (задача N1 M1d).
+
+        Скрытость сущности маскировщику передаёт сам гейт (`is_hidden`): вложенный объект
+        скрытой сущности изымается из ответа — второй рубеж к обрезке `$expand` в запросе, для
+        того что 1С отдаёт без спроса (табличные части)."""
+        return self._masker.mask(
+            data, entity=entity, resolve=resolve, hidden=self.is_hidden, strict=strict
+        )
 
     def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:
         """Обратная замена раскрытого по СЫРОМУ тексту от 1С — до всех преобразований

@@ -13,7 +13,7 @@ import urllib.parse
 import httpx
 import pytest
 import respx
-from conftest import ЗНАЧЕНИЯ_КЛАССОВ, эхо_отбора
+from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_навигаций, эхо_отбора
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -495,7 +495,7 @@ def respx_ut():
 
 async def токен_инн(служба: ToolService, инн: str) -> str:
     гейт = служба._gate_for(служба._config.bases["ut"])
-    return гейт.mask({"ИНН": инн}, entity="Catalog_Контрагенты").data["ИНН"]
+    return гейт.mask({"ИНН": инн}, entity="Catalog_Контрагенты", resolve=без_навигаций).data["ИНН"]
 
 
 async def _токен_класса(служба: ToolService, класс: str) -> tuple[str, str]:

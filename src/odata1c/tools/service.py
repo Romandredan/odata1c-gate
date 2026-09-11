@@ -29,6 +29,7 @@ from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
+from odata1c.gate.masking import ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ, Resolve
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.policy import PolicyError
 from odata1c.gate.revealed import RevealedValues
@@ -189,6 +190,13 @@ _ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА = (
 # запрещён отдельно и раньше (`_проверить_путь`); остальные — законный хвост пути, но
 # переименовывать по ним ответ нельзя: `{"$count": 42}` вместо `{"value": 42}` — искажение.
 _СИСТЕМНЫЕ_СЕГМЕНТЫ = frozenset({"$value", "$count", "$ref", "$links", "$skiptoken", "$batch"})
+
+
+def _без_повторов(предупреждения: list[str]) -> list[str]:
+    """Порядок сохранён, повторы убраны: предупреждение об изъятой по политике связи приходит с
+    двух сторон сразу — от обрезки `$expand` в запросе и от изъятия объекта из ответа (см.
+    `masking.ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ`), а модели оно нужно один раз."""
+    return list(dict.fromkeys(предупреждения))
 
 
 def _скаляром(значение):
@@ -526,6 +534,88 @@ class ToolService:
                 return repo.describe(имя_родителя)
         return None
 
+    def _навигации(self, repo: IndexRepository) -> Resolve:
+        """Резолвер «сущность и ключ ответа → сущность вложенного объекта» для маскировки
+        (итоговое ревью M1d, C1): раскрытый через `$expand` объект и строка табличной части
+        обрабатываются по политике своей сущности (SPEC §6.5), а не той, что наверху.
+
+        Два источника, оба из индекса, а не из списка имён (список имён навигаций — гонка, в
+        которой у настоящей УТ уже есть `КлиентКонтрагент`, `Курьер`, `Сборщик`, `Отпустил`):
+        `navigations` знает цель навигации точно, а табличная часть навигацией не приходит вовсе
+        (проба P4) — она дочерняя сущность с именем `<родитель>_<ключ>` (`children`).
+
+        Описания кэшируются на вызов: обход ответа спрашивает резолвер на каждый вложенный
+        объект каждой записи выборки, а `describe` — это несколько запросов к SQLite."""
+        кэш: dict[str, EntityDescription | None] = {}
+
+        def описание(имя: str) -> EntityDescription | None:
+            if имя not in кэш:
+                кэш[имя] = repo.describe(имя)
+            return кэш[имя]
+
+        def резолвер(entity: str, key: str) -> str | None:
+            текущая = описание(entity)
+            if текущая is None:
+                return None
+            цель = текущая.navigations.get(key)
+            if цель is not None:
+                return цель
+            дочерняя = f"{entity}_{key}"
+            return дочерняя if дочерняя in текущая.children else None
+
+        return резолвер
+
+    def _обрезать_expand(
+        self,
+        repo: IndexRepository,
+        gate: BaseGate,
+        описание: EntityDescription | None,
+        пути: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Пути `$expand`, ведущие к скрытой сущности, вырезаются из запроса (SPEC §6.9, строка
+        1068: «`hide: true` … `$expand` на неё обрезается»).
+
+        Способ отказа — именно обрезание, а не `entity_hidden`: код ошибки сообщил бы модели о
+        существовании скрытой сущности, чего `_resolve_entity` сознательно избегает. Обрезка
+        видна в ответе предупреждением, но без имени сущности и без имени навигации — иначе
+        предупреждение вернуло бы ровно тот факт, ради сокрытия которого делается обрезка.
+
+        Путь обрезается ЦЕЛИКОМ, а не до последнего разрешённого звена: `А/Б` со скрытой `Б`
+        нельзя спасти, оставив `А`.
+
+        Звено, которого индекс не знает (неизвестная навигация, цель вне индекса), проверить на
+        скрытость нечем — то же правило, что у `_цель_пути`: там, где у владельца есть правила
+        `hide`, неразрешённое звено не обслуживается; где скрывать нечего, оно уходит в 1С как
+        есть. У `query`/`get` до этого случая дело обычно не доходит — построитель запроса
+        отклоняет неизвестную навигацию своей ошибкой, — но на `raw_get` он штатный.
+        """
+        оставленные: list[str] = []
+        обрезано = False
+        for путь in пути:
+            if self._скрыт_путь_раскрытия(repo, gate, описание, путь):
+                обрезано = True
+            else:
+                оставленные.append(путь)
+        предупреждения = [ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ] if обрезано else []
+        return оставленные, предупреждения
+
+    def _скрыт_путь_раскрытия(
+        self,
+        repo: IndexRepository,
+        gate: BaseGate,
+        описание: EntityDescription | None,
+        путь: str,
+    ) -> bool:
+        текущая = описание
+        for сегмент in путь.split("/"):
+            цель = текущая.navigations.get(сегмент) if текущая is not None else None
+            if цель is None:
+                return gate.has_hidden_entities()
+            if gate.is_hidden(цель):
+                return True
+            текущая = repo.describe(цель)
+        return False
+
     def _поле_защищено_по_пути(
         self, repo: IndexRepository, gate: BaseGate, desc: EntityDescription, path: str
     ) -> bool:
@@ -615,9 +705,15 @@ class ToolService:
                         репозиторий.close()
             строки.append(строка)
 
+        # Умолчание объявляется, только если оно видимо сессии (Important итогового ревью M1d):
+        # суженной сессии сообщалось `default: "ut"` — имя базы вне её области видимости, — а
+        # любой вызов без явного `base` отвечал ей `base_unknown`. Объявленное умолчание должно
+        # быть либо рабочим, либо не объявляться вовсе; заодно имя чужой базы не называется.
+        умолчание = scope.default or self._config.default
+        видимые = {строка["name"] for строка in строки}
         конверт: dict = {
             "bases": строки,
-            "default": scope.default or self._config.default,
+            "default": умолчание if умолчание in видимые else None,
         }
         if not строки:
             конверт["hint"] = (
@@ -805,6 +901,7 @@ class ToolService:
         `extra` — поля конверта сверх общих (`recipe`, `title` у рецепта): добавляются ДО `items`,
         чтобы не мешать `fit_result` выбрасывать записи при подгонке под лимит.
         """
+        раскрытия, обрезка = self._обрезать_expand(репозиторий, гейт, описание, _как_список(expand))
         spec = build_query(
             описание,
             describe=репозиторий.describe,
@@ -812,7 +909,7 @@ class ToolService:
             virtual_timeout_s=base_config.virtual_timeout_s,
             filter=filter,
             select=select,
-            expand=expand,
+            expand=раскрытия,
             orderby=orderby,
             top=top,
             skip=skip,
@@ -835,7 +932,7 @@ class ToolService:
 
         записи, всего = items_of(сырой_ответ)
         записи = strip_service(записи, keep_data_version="DataVersion" in _как_список(select))
-        маска = гейт.mask(записи, entity=описание.name)
+        маска = гейт.mask(записи, entity=описание.name, resolve=self._навигации(репозиторий))
         усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
 
         конверт = {
@@ -847,7 +944,7 @@ class ToolService:
             **page_info(count=len(записи), total=всего, top=spec.top, skip=spec.skip),
             "items": усечённые,
             "masked_fields": маска.masked_fields,
-            "warnings": [*spec.warnings, *маска.warnings],
+            "warnings": _без_повторов([*spec.warnings, *обрезка, *маска.warnings]),
         }
         return fit_result(конверт, self._config.daemon.limits.result_chars, skip=spec.skip)
 
@@ -865,13 +962,16 @@ class ToolService:
             описание = self._resolve_entity(репозиторий, гейт, entity)
             реальный_ключ = гейт.inbound_key(key, entity=описание.name, revealed=раскрытое)
 
+            раскрытия, обрезка = self._обрезать_expand(
+                репозиторий, гейт, описание, _как_список(expand)
+            )
             spec = build_get(
                 описание,
                 реальный_ключ,
                 describe=репозиторий.describe,
                 limits=self._config.daemon.limits,
                 select=select,
-                expand=expand,
+                expand=раскрытия,
             )
 
             клиент = self._client_for(base_config)
@@ -885,7 +985,7 @@ class ToolService:
 
             записи, _ = items_of(сырой_ответ)
             записи = strip_service(записи, keep_data_version="DataVersion" in _как_список(select))
-            маска = гейт.mask(записи, entity=описание.name)
+            маска = гейт.mask(записи, entity=описание.name, resolve=self._навигации(репозиторий))
             усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
 
             конверт = {
@@ -895,7 +995,7 @@ class ToolService:
                 "gate": гейт.mode,
                 "item": усечённые[0] if усечённые else None,
                 "masked_fields": маска.masked_fields,
-                "warnings": маска.warnings,
+                "warnings": _без_повторов([*обрезка, *маска.warnings]),
             }
             return fit_result(конверт, self._config.daemon.limits.result_chars)
 
@@ -1320,7 +1420,9 @@ class ToolService:
         async def тело(base_config, гейт, репозиторий, раскрытое):
             очищенный = _проверить_путь(path)
             цель = self._цель_пути(репозиторий, гейт, очищенный)
-            параметры = self._подготовить_параметры(репозиторий, гейт, query, цель, раскрытое)
+            параметры, обрезка = self._подготовить_параметры(
+                репозиторий, гейт, query, цель, раскрытое
+            )
 
             клиент = self._client_for(base_config)
             сырой = await клиент.get(очищенный, параметры or None, scrub=гейт.scrubber(раскрытое))
@@ -1341,10 +1443,15 @@ class ToolService:
                 записи, keep_data_version="DataVersion" in параметры.get("$select", "")
             )
             записи = _восстановить_имя_поля(записи, цель.field)
-            маска = гейт.mask(записи, entity=цель.entity, strict=not цель.resolved)
+            маска = гейт.mask(
+                записи,
+                entity=цель.entity,
+                resolve=self._навигации(репозиторий),
+                strict=not цель.resolved,
+            )
             усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
 
-            предупреждения = list(маска.warnings)
+            предупреждения = _без_повторов([*обрезка, *маска.warnings])
             if not цель.resolved:
                 предупреждения.append(_ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА)
 
@@ -1525,8 +1632,9 @@ class ToolService:
         query: dict | None,
         цель: _ЦельПути,
         revealed: RevealedValues,
-    ) -> dict[str, str]:
-        """Параметры запроса `raw_get`: проверка, приведение к строкам, обратная подмена токенов.
+    ) -> tuple[dict[str, str], list[str]]:
+        """Параметры запроса `raw_get`: проверка, приведение к строкам, обратная подмена токенов,
+        обрезка `$expand` по политике. Возвращает пару «параметры, предупреждения».
 
         Токен разворачивается в реальное значение только в `$filter` (`gate.inbound_filter`) —
         там гейт знает синтаксис и разбирает выражение лексером. В остальных параметрах стоят
@@ -1540,7 +1648,7 @@ class ToolService:
         сущности отклонялся, а на сущности вне индекса уходил в 1С — двоичный поиск по названию.
         """
         if query is None:
-            return {}
+            return {}, []
         if not isinstance(query, dict):
             raise _ServiceError("params_invalid", "query должен быть словарём «параметр: значение»")
 
@@ -1601,7 +1709,46 @@ class ToolService:
                         "params_invalid",
                         "сортировка по защищаемому полю недоступна: порядок раскрывает значения",
                     )
-        return готовые
+
+        обрезка = self._проверить_expand_сырого(repo, gate, цель, готовые)
+        return готовые, обрезка
+
+    def _проверить_expand_сырого(
+        self,
+        repo: IndexRepository,
+        gate: BaseGate,
+        цель: _ЦельПути,
+        готовые: dict[str, str],
+    ) -> list[str]:
+        """`$expand` у `raw_get`: лимит глубины и обрезка скрытых целей (итоговое ревью M1d, C2).
+
+        `raw_get` копировал параметр в запрос дословно — то есть мимо обеих проверок, которые
+        `query`/`get` проходят через построитель запроса. Это ровно та «вторая дверь к той же
+        структуре», про которую записан урок этапа: покрытия по классам мало, нужно покрытие по
+        путям, которыми данные приходят.
+
+        Глубина — отказ (как у построителя запроса: лимит владельца, а не политика гейта, и
+        молчаливое урезание пути сделало бы ответ не тем, о чём просили); скрытая цель —
+        обрезка (см. `_обрезать_expand`)."""
+        сырой = готовые.get("$expand")
+        if not сырой:
+            return []
+        пути = [часть.strip() for часть in сырой.split(",") if часть.strip()]
+        предел = self._config.daemon.limits.expand_depth
+        for путь in пути:
+            if len(путь.split("/")) > предел:
+                raise _ServiceError(
+                    "params_invalid",
+                    f"$expand «{путь}» глубже лимита {предел}",
+                    f"сократите путь раскрытия до {предел} сегментов",
+                )
+        описание = repo.describe(цель.entity) if цель.resolved else None
+        оставленные, предупреждения = self._обрезать_expand(repo, gate, описание, пути)
+        if оставленные:
+            готовые["$expand"] = ",".join(оставленные)
+        else:
+            готовые.pop("$expand")
+        return предупреждения
 
     @staticmethod
     def _уточнить_404(ошибка: OdataError) -> None:
