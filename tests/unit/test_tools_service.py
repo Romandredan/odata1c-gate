@@ -1083,6 +1083,227 @@ async def test_reindex_не_называет_дочернюю_сущность_�
     assert "Document_РеализацияТоваровУслуг" not in текст
 
 
+def _дописать_скрытие(дом, *имена: str) -> None:
+    """`entities.<имя>: {hide: true}` в конец политики базы ut — ручной раздел, реиндекс его
+    не трогает. В отличие от `_скрыть_сущность` сохраняет текст файла как есть."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    правила = "".join(f"  {имя}: {{hide: true}}\n" for имя in имена)
+    путь.write_text(путь.read_text(encoding="utf-8") + "entities:\n" + правила, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("скрыто", "потомки"),
+    [
+        # Скрытый объект выпал из конфигурации целиком — вместе со своей табличной частью.
+        ("Catalog_СерииНоменклатуры", ["Catalog_СерииНоменклатуры_ДополнительныеРеквизиты"]),
+        # То же на регистре, и поддерево здесь в два поколения: срезы — дети набора записей,
+        # а не самого регистра (Ruling 30).
+        (
+            "InformationRegister_СтоимостьТоваров",
+            [
+                "InformationRegister_СтоимостьТоваров_RecordType",
+                "InformationRegister_СтоимостьТоваров_SliceFirst",
+                "InformationRegister_СтоимостьТоваров_SliceLast",
+            ],
+        ),
+        # Скрытый объект остался, из конфигурации убрали только его табличную часть.
+        ("Catalog_Контрагенты", ["Catalog_Контрагенты_КонтактнаяИнформация"]),
+    ],
+)
+async def test_reindex_не_называет_удалённых_потомков_скрытой_сущности(
+    сервис, respx_ut, edmx_synthetic, дом, скрыто, потомки
+):
+    """Раунд правок 2 по `stop()` и журналу, пункт 1: разница реиндекса называла скрытую
+    сущность через имена её УДАЛЁННЫХ потомков — имя ребёнка содержит имя родителя целиком.
+
+    Поддерево скрытых бралось только из НОВОГО индекса, а удалённого ребёнка там по определению
+    нет. Прошлый вывод «отобрать нечем» был неверен: родство удалённых знает ПРЕЖНИЙ индекс, и он
+    цел до замены файла. Три случая — ровно воспроизведения ревьюера (старый индекс — урезанный
+    настоящий УТ, новое описание — синтетическое): два объекта выпали целиком, у третьего убрана
+    только табличная часть. Сторож прошлого раунда был зелёным лишь потому, что у выбранного им
+    `Catalog_Валюты` в образце нет ни одного потомка.
+
+    Непустоту разницы доказывает соседний удалённый `Catalog_Валюты`, которого никто не скрывал:
+    без него тест прошёл бы и на отборе «показывать нечего»."""
+    прежний = IndexRepository(index_path(дом, "ut"))
+    try:
+        assert set(потомки) <= прежний.descendants([скрыто]), "образец не тот: потомков нет"
+    finally:
+        прежний.close()
+    _дописать_скрытие(дом, скрыто)
+    сервис._gates.clear()  # политика перечитывается по mtime, а тест меняет её в ту же секунду
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert данные["changed"] is True
+    assert "Catalog_Валюты" in данные["removed_entities"], (
+        "разница пуста — тест не проверил бы и полное отсутствие отбора"
+    )
+    assert скрыто not in текст, f"имя скрытой сущности ушло модели: {данные['removed_entities']}"
+    assert данные["removed_entities_total"] == len(данные["removed_entities"])
+
+
+async def test_reindex_берёт_родство_из_прежнего_индекса_и_при_смене_версии_разбора(
+    сервис, respx_ut, edmx_synthetic, дом
+):
+    """Второй спусковой крючок той же утечки, названный ревьюером: смена `PARSER_VERSION` при
+    обновлении пакета перестраивает индекс, и прежний файл — файл ПРЕЖНЕЙ версии разбора.
+
+    Открывать его проверкой версии (`_open_index` → `require_current_version`) значит отказать
+    именно в этом сценарии и остаться с поддеревом из одного нового индекса. Прежний индекс
+    читается так же, как его читает `reindex._прежнее_состояние`, — без проверки версии: нужны
+    только имена и `parent_entity`."""
+    from odata1c.index.schema import connect
+
+    соединение = connect(index_path(дом, "ut"))
+    with соединение:
+        соединение.execute("UPDATE meta SET value = 'устаревшая' WHERE key = 'parser_version'")
+    соединение.close()
+    _дописать_скрытие(дом, "InformationRegister_СтоимостьТоваров")
+    сервис._gates.clear()
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert данные["changed"] is True
+    assert "Catalog_Валюты" in данные["removed_entities"]
+    assert "InformationRegister_СтоимостьТоваров" not in текст
+
+
+async def test_reindex_не_печатает_разницу_если_родство_скрытых_не_прочитано(
+    сервис, respx_ut, edmx_synthetic, дом, monkeypatch
+):
+    """Отказ закрытый, а не открытый (ревью раунда 5, «Инварианты»): прежде неудача чтения
+    поддерева оставляла от отбора одни корни запрета — и все потомки скрытых проходили в ответ.
+    Отбор с заведомо неполным набором хуже, чем никакой выдачи: имена в разнице не показываются
+    вовсе, а предупреждение говорит, почему. Количество при этом тоже не называется — ни в
+    `*_total`, ни в тексте предупреждения."""
+    import sqlite3
+
+    def отказ(self, names):
+        raise sqlite3.OperationalError("no such column: parent_entity")
+
+    monkeypatch.setattr(IndexRepository, "descendants", отказ)
+    _дописать_скрытие(дом, "Catalog_СерииНоменклатуры")
+    сервис._gates.clear()
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert данные["changed"] is True
+    assert "Catalog_СерииНоменклатуры" not in текст
+    for ключ in ("added_entities", "removed_entities", "new_sensitive_fields"):
+        assert данные[ключ] == [] and данные[f"{ключ}_total"] == 0, ключ
+    from odata1c.tools.service import ПРЕДУПРЕЖДЕНИЕ_РАЗНИЦА_НЕ_ПОКАЗАНА
+
+    assert ПРЕДУПРЕЖДЕНИЕ_РАЗНИЦА_НЕ_ПОКАЗАНА in данные["warnings"], данные["warnings"]
+
+
+async def test_reindex_не_называет_скрытую_сущность_в_предупреждениях_разбора(
+    сервис, respx_ut, edmx_synthetic, дом
+):
+    """Находка 3 ревью раунда 5: предупреждения разбора `$metadata` печатались в ответе как
+    есть, а в них — имена наборов («виртуальная таблица `{набор}/{имя}` не проиндексирована»).
+
+    Два повреждённых действия: одно привязано к скрытому регистру, другое — к видимому. Первое
+    обязано пропасть (вместо него — одна строка без числа), второе — остаться: отбор не должен
+    превращаться в «не показывать предупреждений вовсе»."""
+    from odata1c.tools.service import ПРЕДУПРЕЖДЕНИЕ_СКРЫТЫХ_РАЗБОРА
+
+    битые = (
+        '<FunctionImport Name="SliceFirst" IsBindable="true" IsSideEffecting="false"\n'
+        '  ReturnType="Collection(StandardODATA.НетТакогоТипа)">\n'
+        '  <Parameter Name="bindingParameter"'
+        ' Type="StandardODATA.InformationRegister_КурсыВалют"/>\n'
+        "</FunctionImport>\n"
+        '<FunctionImport Name="Balance" IsBindable="true" IsSideEffecting="false"\n'
+        '  ReturnType="Collection(StandardODATA.НетТакогоТипа)">\n'
+        '  <Parameter Name="bindingParameter"'
+        ' Type="StandardODATA.AccumulationRegister_ОстаткиНаСчетах"/>\n'
+        "</FunctionImport>\n"
+    )
+    текст_edmx = edmx_synthetic.decode("utf-8").replace(
+        "</EntityContainer>", битые + "</EntityContainer>"
+    )
+    разобрано = parse_edmx(текст_edmx.encode("utf-8"))
+    assert any("InformationRegister_КурсыВалют" in с for с in разобрано.warnings), (
+        "образец не тот: предупреждения о скрытом регистре нет"
+    )
+    _дописать_скрытие(дом, "InformationRegister_КурсыВалют")
+    сервис._gates.clear()
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=текст_edmx.encode("utf-8"))
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert "КурсыВалют" not in текст, данные["warnings"]
+    assert any("AccumulationRegister_ОстаткиНаСчетах" in с for с in данные["warnings"])
+    assert данные["warnings"].count(ПРЕДУПРЕЖДЕНИЕ_СКРЫТЫХ_РАЗБОРА) == 1
+
+
+async def test_reindex_не_сообщает_о_смене_классов_только_у_скрытых_полей(
+    сервис, respx_ut, edmx_ut_real, дом
+):
+    """Строка «классы полей изменились» зависела от НЕОТОБРАННОГО списка: если сменились классы
+    только у полей скрытой сущности, список в ответе пуст, а строка сообщала, что у скрытого что-то
+    поменялось. Условие — по тому же отобранному списку, что и сам ответ."""
+    from odata1c.index.schema import connect
+
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+    # Первый прогон проставляет классы всем полям (индекс дома построен без классификатора).
+    первый = json.loads(await сервис.reindex(SessionScope(), base="ut", force=True))
+    assert первый["new_sensitive_fields_total"] > 0
+    соединение = connect(index_path(дом, "ut"))
+    with соединение:
+        соединение.execute(
+            "UPDATE fields SET sensitivity = NULL WHERE entity_id = "
+            "(SELECT id FROM entities WHERE name = 'Catalog_Контрагенты')"
+        )
+    соединение.close()
+    _дописать_скрытие(дом, "Catalog_Контрагенты")
+    сервис._gates.clear()
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut", force=True))
+
+    assert данные["changed"] is True
+    assert данные["new_sensitive_fields"] == []
+    assert not any("классы полей изменились" in с for с in данные["warnings"]), данные["warnings"]
+
+
+async def test_reindex_без_скрытых_показывает_разницу_и_при_отказе_чтения_родства(
+    сервис, respx_ut, edmx_synthetic, monkeypatch
+):
+    """Обратный сторож закрытого отказа: там, где владелец ничего не скрывал, отбирать нечего,
+    индекс для родства не нужен, и разница показывается целиком."""
+    import sqlite3
+
+    def отказ(self, names):
+        raise sqlite3.OperationalError("no such column: parent_entity")
+
+    monkeypatch.setattr(IndexRepository, "descendants", отказ)
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert "Catalog_СерииНоменклатуры_ДополнительныеРеквизиты" in данные["removed_entities"]
+
+
 async def test_reindex_пересобирает_политику_и_гейт_её_видит(сервис, respx_ut, edmx_ut_real, дом):
     """После перестройки индекса политика пересобрана И гейт её перечитал.
 
