@@ -2404,6 +2404,33 @@ async def test_get_токен_в_ключе_не_раскрывается(сер
     assert not маршрут.called
 
 
+@pytest.mark.parametrize("класс", sorted(ЗНАЧЕНИЯ_КЛАССОВ))
+@pytest.mark.parametrize("форма", ["guid'{}'", "GUID'{}'"], ids=["guid", "GUID"])
+@pytest.mark.parametrize("expand", [None, ["Партнер"]], ids=["путь", "отбор"])
+async def test_get_токен_в_обёртке_guid_не_раскрывается(сервис, respx_ut, класс, форма, expand):
+    """П5 живой приёмки: ключ в форме OData `guid'…'` теперь принимается — обёртку снимает
+    `odata_literal`, то есть уже ПОСЛЕ обратной подмены. Обёртка не должна становиться обходом
+    запрета на токен в ключе: `guid'[[inn:…]]'` — токен, смешанный с текстом, и отклоняется
+    `inbound_key` до построения запроса, на обоих маршрутах `get` (путь к объекту и отбор при
+    `expand`). Реальное значение не попадает ни в ответ, ни в запрос к 1С."""
+    маршрут = respx_ut.get(url__regex=r".*Catalog_.*").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    токен, значение = _токен_класса(сервис, класс)
+
+    текст = await сервис.get(
+        SessionScope(),
+        base="ut",
+        entity="Catalog_Контрагенты",
+        key=форма.format(токен),
+        expand=expand,
+    )
+
+    assert json.loads(текст)["error"]["code"] == "token_partial"
+    assert значение not in текст
+    assert not маршрут.called
+
+
 async def test_get_настоящий_ключ_по_прежнему_работает(сервис, respx_ut):
     """Парный разрешающий случай: запрет на токен в ключе не должен ломать обычный `get`."""
     respx_ut.get(url__regex=r".*Catalog_.*").mock(
