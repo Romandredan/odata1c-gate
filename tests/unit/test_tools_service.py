@@ -1098,3 +1098,273 @@ async def test_resource_index_непроиндексированной_базы(
     ошибка = json.loads(await сервис.resource_index(SessionScope(), "dev"))["error"]
 
     assert ошибка["code"] == "entity_unknown"
+
+
+# =============================================================================================
+# Раунд правок 1: утечка названий через raw_get на пути, не разрешимом по индексу
+#
+# Четыре формы атаки, воспроизведённые ревьюером на поддельной 1С. Общая причина одна:
+# `_цель_пути` при неразрешимом пути открывался вместо того, чтобы закрыться, а запасной
+# классификатор (`classify_field(..., names_for=set())`) выключает ровно тот слой, который
+# защищает Description, НаименованиеПолное и ФИО. Ответ при этом выглядел успешным:
+# masked_fields ["ИНН"], guard_replaced нет, «ООО Ромашка» открытым текстом.
+#
+# `Catalog_Партнеры` для этих тестов выбран не случайно: этой сущности НЕТ в фикстуре
+# `ut-real.edmx`, но она стоит в `field_rules.DEFAULT_NAMES_FOR` — то есть при живом индексе её
+# Description был бы классом org, и разница «есть сущность в индексе / нет» видна начисто.
+# =============================================================================================
+
+ЗАПИСЬ_ПАРТНЁРА = {
+    "Ref_Key": ССЫЛКА,
+    "Description": "ООО Ромашка",
+    "НаименованиеПолное": "Общество с ограниченной ответственностью «Ромашка»",
+    "ИНН": ИНН,
+}
+
+
+async def test_raw_get_вне_индекса_маскирует_названия(сервис, respx_ut):
+    """Форма (а): набор, которого нет в индексе, — заявленный сценарий самого `raw_get`."""
+    respx_ut.get("Catalog_Партнеры").mock(
+        return_value=httpx.Response(200, json={"value": [ЗАПИСЬ_ПАРТНЁРА]})
+    )
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path="Catalog_Партнеры")
+    данные = json.loads(текст)
+
+    assert "Ромашка" not in текст
+    assert {"Description", "НаименованиеПолное", "ИНН"} <= set(данные["masked_fields"])
+    assert not any("guard_replaced" in п for п in данные["warnings"])
+    assert any("вне индекса" in п for п in данные["warnings"])
+    assert данные["items"][0]["Ref_Key"] == ССЫЛКА  # инвариант 6: ссылка не тронута
+
+
+async def test_raw_get_неразрешимая_навигация_маскирует_названия(сервис, respx_ut):
+    """Форма (б): сегмент в середине пути индексу неизвестен — раньше разбор молча
+    останавливался на документе, и запись контрагента маскировалась классами документа."""
+    respx_ut.get(url__regex=r".*Document_.*").mock(
+        return_value=httpx.Response(200, json=ЗАПИСЬ_ПАРТНЁРА)
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path=f"Document_РеализацияТоваровУслуг(guid'{ССЫЛКА}')/Партнер",
+    )
+    данные = json.loads(текст)
+
+    assert "Ромашка" not in текст
+    assert {"Description", "НаименованиеПолное"} <= set(данные["masked_fields"])
+    assert any("вне индекса" in п for п in данные["warnings"])
+
+
+async def test_raw_get_примитивное_свойство_маскирует_реквизит(сервис, respx_ut):
+    """Форма (в): ответ на примитивное свойство — `{"value": <скаляр>}`, имя поля в ответе не
+    приходит вовсе, оно стоит в пути. Без восстановления имени из пути 10-значный ИНН не
+    распознаётся детектором (ему нужно слово «ИНН» рядом) и уходит открытым."""
+    respx_ut.get(url__regex=r".*Catalog_.*").mock(
+        return_value=httpx.Response(200, json={"odata.metadata": "…", "value": ИНН})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path=f"Catalog_Контрагенты(guid'{ССЫЛКА}')/ИНН"
+    )
+    данные = json.loads(текст)
+
+    assert ИНН not in текст
+    assert "ИНН" in данные["masked_fields"]
+
+
+async def test_raw_get_сортировка_по_названию_вне_индекса_запрещена(сервис, respx_ut):
+    """Форма (г): оракул порядка. Запрет на сортировку по защищаемому полю снимался ровно там,
+    где снималась маска, — на сущности вне индекса."""
+    маршрут = respx_ut.get("Catalog_Партнеры").mock(
+        return_value=httpx.Response(200, json={"value": [ЗАПИСЬ_ПАРТНЁРА]})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path="Catalog_Партнеры", query={"$orderby": "Description"}
+    )
+
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+async def test_raw_get_вне_индекса_не_маскирует_лишнего(сервис, respx_ut):
+    """Инвариант 6: суммы, количества, даты, GUID, коды и номера документов не защищаются ни на
+    каком уровне — избыточное срабатывание строгой политики такой же дефект, как пропуск."""
+    запись = {
+        "Ref_Key": ССЫЛКА,
+        "Date": "2026-01-15T00:00:00",
+        "Number": "ТД-004512",
+        "Code": "00-000123",
+        "СуммаДокумента": "125000.50",
+        "Количество": "17",
+    }
+    respx_ut.get("Document_НетТакого").mock(
+        return_value=httpx.Response(200, json={"value": [запись]})
+    )
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path="Document_НетТакого")
+    данные = json.loads(текст)
+
+    assert данные["items"][0] == запись
+    assert данные["masked_fields"] == []
+
+
+async def test_raw_get_имя_в_чужом_регистре_не_обходит_запрет(сервис, respx_ut, дом):
+    """Форма (д): имя набора в другом регистре. Индекс и `entities.hide` сверяют имя точным
+    сравнением — если публикация 1С к регистру нечувствительна, запрет обходится одной буквой."""
+    маршрут = respx_ut.get(url__regex=r".*atalog_.*").mock(
+        return_value=httpx.Response(200, json={"value": [ЗАПИСЬ_ПАРТНЁРА]})
+    )
+    _скрыть_сущность(дом, "Catalog_Контрагенты")
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path="catalog_Контрагенты")
+
+    assert json.loads(текст)["error"]["code"] == "entity_hidden"
+    assert not маршрут.called
+
+
+async def test_raw_get_известная_сущность_без_предупреждения(сервис, respx_ut):
+    """Контрольный прогон: на разрешённом пути строгой политики нет и предупреждения тоже —
+    иначе «вне индекса» в предупреждениях означало бы просто «всегда»."""
+    respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": [{"Description": "ООО Ромашка"}]})
+    )
+
+    данные = json.loads(await сервис.raw_get(SessionScope(), base="ut", path="Catalog_Контрагенты"))
+
+    assert not any("вне индекса" in п for п in данные["warnings"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Ruling 19: токен, выданный базой, работает и после смены класса поля
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_токен_переживает_смену_класса_поля(сервис, respx_ut, edmx_ut_real, дом):
+    """Класс поля входит в HMAC токена, а реиндекс переписывает раздел `auto` политики — то же
+    значение после реиндекса отдаётся другим токеном. Токен, который модель получила от шлюза
+    десять минут назад, обязан продолжать работать: иначе `odata1c_reindex` и фоновая проверка
+    ломают сессию молча и посреди работы.
+    """
+    import yaml
+
+    from odata1c.gate.service import policy_path
+
+    токен = await токен_названия(сервис, "Ромашка")
+    assert токен.startswith("[[org:")
+
+    # Класс того же поля меняется: org → person (ручной раздел; реиндекс его сохранит).
+    путь = policy_path(дом, "ut")
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8")) or {}
+    политика.setdefault("fields", {})["Catalog_Контрагенты.Description"] = "person"
+    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+    await сервис.reindex(SessionScope(), base="ut", force=True)
+
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    текст = await сервис.query(
+        SessionScope(),
+        base="ut",
+        entity="Catalog_Контрагенты",
+        filter=f"Description eq '{токен}'",
+    )
+
+    assert "error" not in json.loads(текст)
+    assert "Ромашка" in маршрут.calls.last.request.url.params["$filter"]
+
+
+async def test_чужой_токен_в_поле_другого_класса_по_прежнему_отклонён(сервис, respx_ut):
+    """Послабление Ruling 19 именное: оно касается токена, выданного ЭТОЙ базой для ЭТОГО поля.
+    Токен из другого поля в чужом поле — это оракул сравнения, и он остаётся отказом."""
+    токен = await токен_инн(сервис, ИНН)
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+
+    текст = await сервис.query(
+        SessionScope(),
+        base="ut",
+        entity="Catalog_Контрагенты",
+        filter=f"Description eq '{токен}'",
+    )
+
+    assert json.loads(текст)["error"]["code"] == "token_type_mismatch"
+    assert not маршрут.called
+
+
+async def test_reindex_предупреждает_о_смене_классов(сервис, respx_ut, edmx_synthetic):
+    """Смена классов меняет токены новых ответов: одно и то же значение до и после реиндекса
+    приходит разными токенами. Утечки нет, но модель должна знать, почему токен «поменялся»."""
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert данные["new_sensitive_fields_total"] > 0
+    assert any("токен" in п for п in данные["warnings"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Замечания ревью: форма ответа-списка, $select списком, сужение index_busy
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_raw_get_список_отдаёт_поля_страницы(сервис, respx_ut):
+    """Бриф: «ответ — как у `query`/`get` по форме». Без `has_more`/`next_skip` модель не
+    отличает «это всё» от «есть ещё» и ставит `$skip` наугад."""
+    respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(
+            200, json={"odata.count": "150", "value": [{"Ref_Key": ССЫЛКА}] * 2}
+        )
+    )
+
+    данные = json.loads(
+        await сервис.raw_get(
+            SessionScope(),
+            base="ut",
+            path="Catalog_Контрагенты",
+            query={"$top": 2, "$skip": 10, "$inlinecount": "allpages"},
+        )
+    )
+
+    assert данные["count"] == 2 and данные["total"] == 150
+    assert данные["has_more"] is True and данные["next_skip"] == 12
+
+
+async def test_raw_get_select_списком(сервис, respx_ut):
+    """`query` принимает `select` и списком, и строкой; у `raw_get` список отклонялся как
+    «значение должно быть строкой или числом»."""
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path="Catalog_Контрагенты",
+        query={"$select": ["Ref_Key", "Description"]},
+    )
+
+    assert "error" not in json.loads(текст)
+    assert маршрут.calls.last.request.url.params["$select"] == "Ref_Key,Description"
+
+
+async def test_index_busy_не_подменяет_прочие_отказы_в_правах(сервис, respx_ut, monkeypatch):
+    """`PermissionError` бывает не только от занятого файла: нет прав на домашний каталог,
+    каталог только для чтения. Ответ «повторите через несколько секунд» на такое заставит
+    владельца повторять вызов бесконечно."""
+
+    async def отказ_в_правах(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("odata1c.tools.service.rebuild_index", отказ_в_правах)
+
+    ошибка = json.loads(await сервис.reindex(SessionScope(), base="ut"))["error"]
+
+    assert ошибка["code"] == "internal"

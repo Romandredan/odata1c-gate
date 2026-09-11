@@ -79,18 +79,25 @@ class BaseGate:
     def is_hidden(self, entity: str) -> bool:
         return self._policy.is_hidden(entity)
 
-    def field_class(self, entity: str, field: str) -> str | None:
+    def field_class(self, entity: str, field: str, *, strict: bool = False) -> str | None:
         """Эффективный класс поля по текущей политике и уровню гейта. Публичный доступ к тому,
         что до сих пор брали через приватную `_policy` (долг, отмеченный в `tools/service.py`
         при задаче 4): слою тулов класс нужен не только ответом «защищено или нет» — от самого
         класса зависят анти-оракульные правила (`org`/`person` ищутся по подстроке, `dob` не
-        сравнивается с открытым литералом)."""
-        return effective_field_class(self._policy, entity, field, mode=self.mode)
+        сравнивается с открытым литералом).
 
-    def is_protected(self, entity: str, field: str) -> bool:
+        `strict` — сущность не подтверждена индексом (см. `masking.effective_field_class`): тот
+        же строгий взгляд, что и у маскировки (Ruling 18)."""
+        return effective_field_class(self._policy, entity, field, mode=self.mode, strict=strict)
+
+    def is_protected(self, entity: str, field: str, *, strict: bool = False) -> bool:
         """Класс поля — что-то, кроме «не защищён» (`None`), «оставить как есть» (`keep`) или
-        «только сканировать значение» (`scan`, значение целиком не заменяется по классу поля)."""
-        return self.field_class(entity, field) not in (None, "keep", "scan")
+        «только сканировать значение» (`scan`, значение целиком не заменяется по классу поля).
+
+        `strict` пробрасывается в `field_class`: иначе запрет на оракул порядка (`$orderby` по
+        защищаемому полю) снимался бы ровно там, где снимается маска, — на сущности вне индекса
+        (форма (г) ревью 2026-09-11)."""
+        return self.field_class(entity, field, strict=strict) not in (None, "keep", "scan")
 
     def inbound_filter(self, expression: str, *, entity: str) -> str:
         if self.mode == "off":
@@ -159,8 +166,8 @@ class BaseGate:
             return key
         return self._unmasker.key(key, entity=entity)
 
-    def mask(self, data, *, entity: str) -> MaskResult:
-        return self._masker.mask(data, entity=entity)
+    def mask(self, data, *, entity: str, strict: bool = False) -> MaskResult:
+        return self._masker.mask(data, entity=entity, strict=strict)
 
     def finish(self, envelope: dict) -> str:
         """Сериализация ответа тула (`ensure_ascii=False` — страж должен видеть кириллицу как

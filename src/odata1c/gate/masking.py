@@ -30,11 +30,23 @@ def _ссылочный_ключ(поле: str) -> bool:
     return поле == "Ref_Key" or поле.endswith(("_Key", "_Type"))
 
 
-def _базовый_класс_поля_политики(policy: Policy, entity: str, field: str) -> str | None:
+def _базовый_класс_поля_политики(
+    policy: Policy, entity: str, field: str, *, strict: bool = False
+) -> str | None:
     """Класс поля до понижения по уровню (SPEC §6.4): ручной/авто-раздел политики, затем свой
     класс по имени поля, затем запасная классификация по имени поля независимо от сущности —
     тело перенесено из `Masker._базовый_класс_поля` без изменений (M1d, задача 1), чтобы им же
-    пользовалась и обратная подмена через `effective_field_class`."""
+    пользовалась и обратная подмена через `effective_field_class`.
+
+    `strict=True` — сущность, о которой политика ничего не знает и знать не может: путь
+    `raw_get` не разрешился по индексу (Ruling 18, раунд правок 1 задачи 7 M1d). Тогда слой
+    «наименование/ФИО у сущности из `names_for`» включается для ЭТОЙ сущности, вместо того чтобы
+    быть выключенным (`names_for=set()`, см. длинное обоснование ниже). Неизвестность трактуется
+    в строгую сторону: пока сущность не в индексе, отличить «Description склада» от «Description
+    контрагента» нечем, и открывать название дороже, чем замаскировать лишнее. Ручные разделы
+    политики при этом главнее (`sensitivity_of` спрашивается раньше и `keep` возвращает как
+    есть), а инвариант 6 держит сам `classify_field`: ссылки, коды, номера и нестроковые типы он
+    не классифицирует ни при каком `names_for`."""
     класс = policy.sensitivity_of(entity, field)
     if класс is None:
         класс = policy.custom_fields().get(field)
@@ -59,7 +71,17 @@ def _базовый_класс_поля_политики(policy: Policy, entity:
         # запасной классификацией сознательно не пользуется — `names_for=set()` делает
         # проверку принадлежности сущности к names_for заведомо ложной и отключает только
         # этот слой, не два первых.
-        найдено = classify_field(entity, field, "Edm.String", names_for=set())
+        #
+        # Ровно это выключение и стало дырой в `raw_get` (Critical ревью 2026-09-11): когда
+        # сущности нет в индексе, первые два слоя оставляют ИНН защищённым, а третий, то есть
+        # единственный, который защищает `Description`/`НаименованиеПолное`/ФИО, выключен —
+        # и название организации уходило открытым текстом при `masked_fields: ["ИНН"]`.
+        # Оговорка про «Представление» выше остаётся верной для ИЗВЕСТНОЙ сущности (там
+        # разметка полей есть и запасной слой не нужен), поэтому включается он только под
+        # `strict`.
+        найдено = classify_field(
+            entity, field, "Edm.String", names_for={entity} if strict else set()
+        )
         if найдено is not None:
             класс = найдено[0]
     return класс
@@ -74,12 +96,18 @@ def _понизить_класс_названия_по_уровню(класс: 
     return класс
 
 
-def effective_field_class(policy: Policy, entity: str, field: str, *, mode: str) -> str | None:
+def effective_field_class(
+    policy: Policy, entity: str, field: str, *, mode: str, strict: bool = False
+) -> str | None:
     """Эффективный класс поля с учётом понижения классов названий ниже верхнего уровня защиты
     (SPEC §6.2, §6.4) — ровно логика нынешних `Masker._базовый_класс_поля` + `Masker._класс_поля`
     (M1d, задача 1). Общая точка правды для прямой подмены (`Masker`), обратной (`Unmasker` через
-    `pipeline.BaseGate.refresh`) и вопроса «поле защищено?» (`BaseGate.is_protected`)."""
-    класс = _базовый_класс_поля_политики(policy, entity, field)
+    `pipeline.BaseGate.refresh`) и вопроса «поле защищено?» (`BaseGate.is_protected`).
+
+    `strict` — см. `_базовый_класс_поля_политики`. Понижение по уровню применяется и в строгом
+    режиме: на `identifiers` названия не защищаются по замыслу (SPEC §6.2), и строгость касается
+    неизвестности сущности, а не выбранного владельцем уровня."""
+    класс = _базовый_класс_поля_политики(policy, entity, field, strict=strict)
     if класс in ("keep", None, "scan"):
         return класс
     return _понизить_класс_названия_по_уровню(класс, mode=mode)
@@ -107,12 +135,19 @@ class Masker:
         self._названия_автомат: AhoCorasick | None = None
         self._названия_варианты: dict[str, str] = {}
 
-    def mask(self, data, *, entity: str) -> MaskResult:
+    def mask(self, data, *, entity: str, strict: bool = False) -> MaskResult:
+        """`strict=True` — сущность не подтверждена индексом (путь `raw_get` не разрешился,
+        Ruling 18): включается слой названий/ФИО для этой сущности и принудительный поиск
+        реквизитов по значению, независимо от `scan_free_text` политики. Разметки полей у такой
+        сущности нет вовсе, и отключать вдобавок поиск по значению значит остаться совсем без
+        защиты."""
         замаскированные: list[str] = []
         предупреждения: list[str] = []
         if self._mode == "off":
             return MaskResult(data=data, masked_fields=[], warnings=[])
-        результат = self._обойти(data, entity=entity, замаскированные=замаскированные)
+        результат = self._обойти(
+            data, entity=entity, замаскированные=замаскированные, strict=strict
+        )
         return MaskResult(
             data=результат, masked_fields=sorted(set(замаскированные)), warnings=предупреждения
         )
@@ -139,6 +174,7 @@ class Masker:
         замаскированные: list[str],
         field: str = "",
         класс_контейнера: str | None = None,
+        strict: bool = False,
     ):
         """`класс_контейнера` — класс родительского поля-контейнера, если это org/person
         (правка ревью, 2026-09-09): раскрытый вложенный объект под полем «Контрагент» — это и
@@ -158,16 +194,24 @@ class Masker:
                 # (правка ревью, защитный случай: штатный ответ платформы такой формы не отдаёт,
                 # но раз ключ — тоже строка, реквизит в нём ищется точно так же, как в значении).
                 новый_ключ = self._обработать_строку(
-                    ключ, entity=entity, field=ключ, класс=None, замаскированные=замаскированные
+                    ключ,
+                    entity=entity,
+                    field=ключ,
+                    класс=None,
+                    замаскированные=замаскированные,
+                    strict=strict,
                 )
                 if isinstance(вложенное, str):
-                    класс = self._класс_вложенного_поля(entity, ключ, класс_контейнера)
+                    класс = self._класс_вложенного_поля(
+                        entity, ключ, класс_контейнера, strict=strict
+                    )
                     результат[новый_ключ] = self._обработать_строку(
                         вложенное,
                         entity=entity,
                         field=ключ,
                         класс=класс,
                         замаскированные=замаскированные,
+                        strict=strict,
                     )
                 else:
                     результат[новый_ключ] = self._обойти(
@@ -175,7 +219,8 @@ class Masker:
                         entity=entity,
                         замаскированные=замаскированные,
                         field=ключ,
-                        класс_контейнера=self._базовый_класс_названия(entity, ключ),
+                        класс_контейнера=self._базовый_класс_названия(entity, ключ, strict=strict),
+                        strict=strict,
                     )
             return результат
         if isinstance(значение, list):
@@ -186,6 +231,7 @@ class Masker:
                     замаскированные=замаскированные,
                     field=field,
                     класс_контейнера=класс_контейнера,
+                    strict=strict,
                 )
                 for элемент in значение
             ]
@@ -195,14 +241,19 @@ class Masker:
             # Раньше такая строка проходила насквозь без проверки (правка ревью, критично: слой
             # тулов будет вызывать `mask()` и для таких форм ответа тоже, тихо возвращать
             # незащищённые данные нельзя).
-            класс = self._класс_вложенного_поля(entity, field, класс_контейнера)
+            класс = self._класс_вложенного_поля(entity, field, класс_контейнера, strict=strict)
             return self._обработать_строку(
-                значение, entity=entity, field=field, класс=класс, замаскированные=замаскированные
+                значение,
+                entity=entity,
+                field=field,
+                класс=класс,
+                замаскированные=замаскированные,
+                strict=strict,
             )
         return значение
 
     def _класс_вложенного_поля(
-        self, entity: str, field: str, класс_контейнера: str | None
+        self, entity: str, field: str, класс_контейнера: str | None, *, strict: bool = False
     ) -> str | None:
         """Класс строкового поля с учётом наследования от контейнера (см. `_обойти`): внутри
         объекта, лежащего под полем-организацией/лицом, поле наименования/представления/ФИО
@@ -211,24 +262,26 @@ class Masker:
         (правка ревью: раскрытие названия/ФИО не должно обходить понижение уровня)."""
         if класс_контейнера is not None and is_naming_field(field):
             return self._понизить_класс_названия(класс_контейнера)
-        return self._класс_поля(entity, field)
+        return self._класс_поля(entity, field, strict=strict)
 
-    def _базовый_класс_названия(self, entity: str, field: str) -> str | None:
+    def _базовый_класс_названия(
+        self, entity: str, field: str, *, strict: bool = False
+    ) -> str | None:
         """Класс поля-контейнера без понижения по уровню — только если это org/person; иначе
         `None` (наследовать нечего). Вычисляется тем же путём, что и `_класс_поля`, но до
         понижения — понижение при наследовании применяется отдельно, к вложенному полю."""
-        класс = self._базовый_класс_поля(entity, field)
+        класс = self._базовый_класс_поля(entity, field, strict=strict)
         return класс if класс in КЛАССЫ_НАЗВАНИЙ else None
 
-    def _базовый_класс_поля(self, entity: str, field: str) -> str | None:
+    def _базовый_класс_поля(self, entity: str, field: str, *, strict: bool = False) -> str | None:
         """Тело вынесено в модульную `_базовый_класс_поля_политики` (M1d, задача 1) — используется
         и здесь, и в `effective_field_class` для обратной подмены."""
-        return _базовый_класс_поля_политики(self._policy, entity, field)
+        return _базовый_класс_поля_политики(self._policy, entity, field, strict=strict)
 
-    def _класс_поля(self, entity: str, field: str) -> str | None:
+    def _класс_поля(self, entity: str, field: str, *, strict: bool = False) -> str | None:
         """Тело — `effective_field_class` (M1d, задача 1): тот же эффективный класс, которым
         пользуется `pipeline.BaseGate` для `is_protected` и для `Unmasker`."""
-        return effective_field_class(self._policy, entity, field, mode=self._mode)
+        return effective_field_class(self._policy, entity, field, mode=self._mode, strict=strict)
 
     def _понизить_класс_названия(self, класс: str | None) -> str | None:
         return _понизить_класс_названия_по_уровню(класс, mode=self._mode)
@@ -242,6 +295,7 @@ class Masker:
         класс: str | None,
         замаскированные: list[str],
         force_scan: bool = False,
+        strict: bool = False,
     ) -> str:
         if not текст:
             return текст
@@ -260,7 +314,7 @@ class Masker:
 
         обработанное = self._заменить_известные_названия(текст, entity=entity, field=field)
         обработанное = self._заменить_найденные_реквизиты(
-            обработанное, entity=entity, field=field, force=force_scan
+            обработанное, entity=entity, field=field, force=force_scan or strict
         )
         if обработанное != текст:
             замаскированные.append(field)
