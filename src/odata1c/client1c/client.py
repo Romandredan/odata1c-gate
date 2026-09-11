@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import json as json_mod
 import urllib.parse
 from collections.abc import Callable
 
@@ -45,6 +45,23 @@ _БЕЗОПАСНЫЕ_СИМВОЛЫ_ПУТИ = "/():,='$"
 
 def _экранировать_путь(path: str) -> str:
     return urllib.parse.quote(path, safe=_БЕЗОПАСНЫЕ_СИМВОЛЫ_ПУТИ)
+
+
+def _тело_текстом(response: httpx.Response) -> str:
+    """Тело ответа как текст, прочитанный из байтов по правилам OData, а не по заголовку.
+
+    JSON в OData — UTF-8 по спецификации, но публикация 1С за IIS может объявить в
+    `Content-Type` другую кодировку (`charset=windows-1251`). `response.text` доверяет заголовку,
+    и тогда кириллица приходит кракозябрами: их не узнаёт ни один слой защиты — набор раскрытого,
+    маскировщик и страж ищут точные вхождения, — а получатель восстанавливает исходный текст
+    одним `encode('cp1251').decode('utf-8')`. То есть неверный заголовок кодировки обходит гейт
+    целиком. Найдено ревью N1 (M1d); свойство не этого раунда, а общее и давнее.
+
+    `errors="replace"` — на случай тела, которое и правда не UTF-8: получить испорченные символы
+    лучше, чем уронить разбор; невалидные байты становятся U+FFFD и точным вхождением уже не
+    притворяются.
+    """
+    return response.content.decode("utf-8", errors="replace")
 
 
 def _собрать_запрос(params: dict) -> str:
@@ -110,9 +127,8 @@ class Client1C:
         response = await self._request(
             "GET", path, params=params, retry=True, timeout=timeout, scrub=scrub
         )
-        if scrub is None:
-            return response.json()
-        return json.loads(scrub(response.text))
+        тело = _тело_текстом(response)
+        return json_mod.loads(scrub(тело) if scrub is not None else тело)
 
     async def get_raw(
         self,
@@ -134,11 +150,11 @@ class Client1C:
 
     async def post(self, path: str, json: dict) -> dict:
         response = await self._request("POST", path, json=json, retry=False)
-        return response.json() if response.content else {}
+        return json_mod.loads(_тело_текстом(response)) if response.content else {}
 
     async def patch(self, path: str, json: dict) -> dict:
         response = await self._request("PATCH", path, json=json, retry=False)
-        return response.json() if response.content else {}
+        return json_mod.loads(_тело_текстом(response)) if response.content else {}
 
     async def delete(self, path: str) -> None:
         await self._request("DELETE", path, retry=False)
@@ -260,7 +276,7 @@ class Client1C:
                     if response.status_code >= 400:
                         if открывает_сеанс:
                             await self._release_session_claim()
-                        тело = response.text
+                        тело = _тело_текстом(response)
                         # Обратная замена раскрытого — ДО map_error (Ruling 25): он берёт
                         # `body.strip()[:500]`, когда тело не разбирается как odata.error
                         # (страница веб-сервера, XML-ошибка), и обрезает значение посередине.

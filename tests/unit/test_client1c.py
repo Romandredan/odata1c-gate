@@ -1,6 +1,7 @@
 """Клиент 1С: формирование запроса, сеанс, семафор, перевод ошибок."""
 
 import asyncio
+import json
 import urllib.parse
 from unittest import mock
 
@@ -267,6 +268,53 @@ async def test_metadata_доходит_буквальной_строкой_не_
     await client.close()
 
     assert route.calls[0].request.url.raw_path == b"/ut/odata/standard.odata/$metadata"
+
+
+@respx.mock
+async def test_тело_читается_как_utf8_вопреки_заголовку_кодировки():
+    """Тело JSON по спецификации OData — UTF-8; объявленная в заголовке кодировка может ей
+    противоречить (публикация 1С за IIS с настроенным `charset=windows-1251`). Если читать по
+    заголовку, значение приходит кракозябрами: его не узнаёт ни набор раскрытого, ни маскировщик,
+    ни страж — все три слоя ищут точные вхождения, — а получатель восстанавливает исходный текст
+    одним `encode('cp1251').decode('utf-8')`. Найдено ревью N1 (M1d) на пути гейта, но свойство
+    общее и старше его: решается чтением байтов, а не доверием заголовку."""
+    тело = json.dumps({"value": [{"Description": "ООО «Ромашка»"}]}, ensure_ascii=False)
+    respx.route(url__regex=r".*").mock(
+        return_value=httpx.Response(
+            200,
+            content=тело.encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=windows-1251"},
+        )
+    )
+    client = Client1C(база())
+    ответ = await client.get("Catalog_Контрагенты")
+    await client.close()
+
+    assert ответ["value"][0]["Description"] == "ООО «Ромашка»"
+
+
+@respx.mock
+async def test_ошибка_читается_как_utf8_вопреки_заголовку_кодировки():
+    """Тот же случай на пути ошибки: текст платформы доходит до `map_error` (и до обратной замены
+    раскрытого) читаемым, а не в чужой кодировке."""
+    сообщение = "Поле Контрагент не найдено"
+    тело = json.dumps(
+        {"odata.error": {"code": "6", "message": {"lang": "ru", "value": сообщение}}},
+        ensure_ascii=False,
+    )
+    respx.route(url__regex=r".*").mock(
+        return_value=httpx.Response(
+            400,
+            content=тело.encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=windows-1251"},
+        )
+    )
+    client = Client1C(база())
+    with pytest.raises(OdataError) as ошибка:
+        await client.get("Catalog_Контрагенты")
+    await client.close()
+
+    assert сообщение in str(ошибка.value)
 
 
 @respx.mock
