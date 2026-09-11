@@ -31,6 +31,7 @@ from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.policy import PolicyError
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
 from odata1c.gate.unmasking import GateError
 from odata1c.index.edmx import EdmxError
@@ -327,9 +328,19 @@ class ToolService:
 
     # -- общий конвейер вызова тула -------------------------------------------------------
 
-    def _safe_error(self, gate: BaseGate, code: str, message: str, hint: str = "") -> str:
+    def _safe_error(
+        self,
+        gate: BaseGate,
+        code: str,
+        message: str,
+        hint: str = "",
+        revealed: RevealedValues | None = None,
+    ) -> str:
+        """`revealed` — набор раскрытого в этом вызове (задача N1 M1d). Путь ошибки нуждается
+        в нём не меньше успешного, а по сути больше: 1С повторяет выражение отбора в тексте
+        ошибки, и раскрытое значение возвращается модели именно здесь."""
         try:
-            return gate.error(code, message, hint)
+            return gate.error(code, message, hint, revealed)
         except Exception:
             _log.exception("gate.error упал при обработке ошибки тула — отдан отказ без данных")
             return _ОТКАЗ_НА_КРАЙНИЙ_СЛУЧАЙ
@@ -375,7 +386,14 @@ class ToolService:
         `resource_policy` индекса не читают, а на непроиндексированной базе `_open_index` отказал
         бы кодом `entity_unknown` — то есть реиндекс нельзя было бы вызвать ровно там, где он и
         нужен."""
-        итог = finisher or (lambda gate, result: gate.finish(result))
+        # Набор раскрытого — на один вызов и только на него (задача N1 M1d): `BaseGate`
+        # кэшируется на базу и делится между сессиями, поэтому хранить «что раскрыли» на
+        # гейте нельзя — это было бы пересечением сессий, то есть утечкой данных одной
+        # сессии в другую. Создаётся здесь, в единственной общей точке входа тулов, и
+        # отдаётся и телу вызова (там раскрывают), и стражу на выходе (там ищут обратно),
+        # включая оба пути ошибки ниже.
+        раскрытое = RevealedValues()
+        итог = finisher or (lambda gate, result, revealed: gate.finish(result, revealed))
         try:
             base_config = self._registry.get(base, scope)
         except ConfigError as ошибка:
@@ -411,8 +429,8 @@ class ToolService:
             гейт.refresh()
             if with_index:
                 репозиторий = self._open_index(base_config)
-            результат = await body(base_config, гейт, репозиторий)
-            return итог(гейт, результат)
+            результат = await body(base_config, гейт, репозиторий, раскрытое)
+            return итог(гейт, результат, раскрытое)
         except (
             OdataError,
             EdmxError,
@@ -423,11 +441,20 @@ class ToolService:
             RecipeError,
             _ServiceError,
         ) as ошибка:
-            return self._safe_error(гейт, ошибка.code, str(ошибка), getattr(ошибка, "hint", ""))
+            return self._safe_error(
+                гейт,
+                ошибка.code,
+                str(ошибка),
+                getattr(ошибка, "hint", ""),
+                revealed=раскрытое,
+            )
         except Exception:
             _log.exception("внутренняя ошибка тула odata1c — детали в журнале демона")
             return self._safe_error(
-                гейт, "internal", "внутренняя ошибка шлюза, подробности в журнале демона"
+                гейт,
+                "internal",
+                "внутренняя ошибка шлюза, подробности в журнале демона",
+                revealed=раскрытое,
             )
         finally:
             if репозиторий is not None:
@@ -620,7 +647,7 @@ class ToolService:
         kind: str | None = None,
         limit: int = 10,
     ) -> str:
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, _раскрытое):
             кандидаты = self._видимые_кандидаты(репозиторий, гейт, query, kind=kind, limit=limit)
             return {
                 "base": base_config.name,
@@ -648,7 +675,7 @@ class ToolService:
         entity: str,
         response_format: str = "markdown",
     ) -> str:
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, _раскрытое):
             описание = self._resolve_entity(репозиторий, гейт, entity)
             # Реализация обязана читать РЕАЛЬНУЮ структуру EntityDescription/describe(), а не
             # полагаться на бриф вслепую (решение оркестратора) — отсюда прямой проброс полей
@@ -668,10 +695,10 @@ class ToolService:
             факты["gate"] = гейт.mode
             return факты
 
-        def итог(гейт: BaseGate, факты: dict) -> str:
+        def итог(гейт: BaseGate, факты: dict, раскрытое: RevealedValues) -> str:
             if response_format == "markdown":
-                return гейт.finish_text(describe_tool.render_markdown(факты))
-            return гейт.finish(факты)
+                return гейт.finish_text(describe_tool.render_markdown(факты), раскрытое)
+            return гейт.finish(факты, раскрытое)
 
         return await self._run(scope, base, тело, finisher=итог)
 
@@ -691,18 +718,20 @@ class ToolService:
         params: dict | None = None,
         allowed_only: bool = False,
     ) -> str:
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, раскрытое):
             описание = self._resolve_entity(репозиторий, гейт, entity)
             self._проверить_сортировку(репозиторий, гейт, описание, orderby)
 
             реальный_filter = (
-                гейт.inbound_filter(filter, entity=описание.name) if filter else filter
+                гейт.inbound_filter(filter, entity=описание.name, revealed=раскрытое)
+                if filter
+                else filter
             )
             реальные_params = params
             if описание.is_virtual and params and "Condition" in params:
                 реальные_params = dict(params)
                 реальные_params["Condition"] = гейт.inbound_filter(
-                    params["Condition"], entity=описание.name
+                    params["Condition"], entity=описание.name, revealed=раскрытое
                 )
 
             return await self._выборка(
@@ -825,9 +854,9 @@ class ToolService:
         select: list[str] | str | None = None,
         expand: list[str] | str | None = None,
     ) -> str:
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, раскрытое):
             описание = self._resolve_entity(репозиторий, гейт, entity)
-            реальный_ключ = гейт.inbound_key(key, entity=описание.name)
+            реальный_ключ = гейт.inbound_key(key, entity=описание.name, revealed=раскрытое)
 
             spec = build_get(
                 описание,
@@ -887,7 +916,7 @@ class ToolService:
         попадают только имя рецепта и заголовок, но не то, с чем он был вызван.
         """
 
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, раскрытое):
             книга = self._книга_рецептов(base_config)
             if not name:
                 return self._перечислить(base_config, гейт, книга)
@@ -902,8 +931,8 @@ class ToolService:
 
             описание = self._resolve_entity(репозиторий, гейт, рецепт.entity)
             self._проверить_сортировку(репозиторий, гейт, описание, рецепт.orderby)
-            self._проверить_условия(гейт, рецепт, описание.name, params)
-            значения = self._значения_рецепта(гейт, рецепт, описание.name, params)
+            self._проверить_условия(гейт, рецепт, описание.name, params, раскрытое)
+            значения = self._значения_рецепта(гейт, рецепт, описание.name, params, раскрытое)
             аргументы = render_recipe(рецепт, значения)
 
             return await self._выборка(
@@ -937,7 +966,12 @@ class ToolService:
         return load_recipes(путь)
 
     def _проверить_условия(
-        self, gate: BaseGate, recipe: Recipe, entity: str, params: dict | None
+        self,
+        gate: BaseGate,
+        recipe: Recipe,
+        entity: str,
+        params: dict | None,
+        revealed: RevealedValues,
     ) -> None:
         """Условия рецепта с подставленными значениями — через тот же разбор `$filter`, что и
         отбор обычного `query` (Ruling 20, пункт 3, ревью 2026-09-11).
@@ -963,10 +997,15 @@ class ToolService:
         результат, таблица = probe_recipe(recipe, сырые)
         for выражение in (результат, таблица):
             if выражение:
-                gate.inbound_filter(выражение, entity=entity)
+                gate.inbound_filter(выражение, entity=entity, revealed=revealed)
 
     def _значения_рецепта(
-        self, gate: BaseGate, recipe: Recipe, entity: str, params: dict | None
+        self,
+        gate: BaseGate,
+        recipe: Recipe,
+        entity: str,
+        params: dict | None,
+        revealed: RevealedValues,
     ) -> dict:
         """Значения параметров рецепта после обратной подмены (токен → реальное значение).
 
@@ -993,7 +1032,10 @@ class ToolService:
             имя = str(сырое_имя)
             if имя in recipe.params:
                 значение = gate.inbound_value(
-                    значение, entity=entity, field=recipe.param_field(имя)
+                    значение,
+                    entity=entity,
+                    field=recipe.param_field(имя),
+                    revealed=revealed,
                 )
             готовые[имя] = значение
         return готовые
@@ -1104,7 +1146,7 @@ class ToolService:
         человек, и вписать туда он может что угодно.
         """
 
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, _раскрытое):
             return self._список_рецептов(
                 base_config, гейт, репозиторий, self._книга_рецептов(base_config)
             )
@@ -1113,7 +1155,9 @@ class ToolService:
             scope,
             base,
             тело,
-            finisher=lambda гейт, конверт: гейт.finish_text(_рецепты_markdown(конверт)),
+            finisher=lambda гейт, конверт, раскрытое: гейт.finish_text(
+                _рецепты_markdown(конверт), раскрытое
+            ),
         )
 
     # -- реиндекс, справочник, аварийный GET, ресурсы (план M1d, задача 7) ------------------
@@ -1141,7 +1185,7 @@ class ToolService:
         исправлено.
         """
 
-        async def тело(base_config, гейт, _репозиторий):
+        async def тело(base_config, гейт, _репозиторий, раскрытое):
             клиент = self._client_for(base_config)
             try:
                 результат = await rebuild_index(
@@ -1263,10 +1307,10 @@ class ToolService:
         разметки полей, и названия организаций уходили модели открытым текстом.
         """
 
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, раскрытое):
             очищенный = _проверить_путь(path)
             цель = self._цель_пути(репозиторий, гейт, очищенный)
-            параметры = self._подготовить_параметры(репозиторий, гейт, query, цель)
+            параметры = self._подготовить_параметры(репозиторий, гейт, query, цель, раскрытое)
 
             клиент = self._client_for(base_config)
             сырой = await клиент.get(очищенный, параметры or None)
@@ -1330,7 +1374,7 @@ class ToolService:
         сессия, суженная заголовком `X-Odata1c-Bases`, не должна читать политику чужой базы.
         """
 
-        async def тело(base_config, _гейт, _репозиторий):
+        async def тело(base_config, _гейт, _репозиторий, _раскрытое):
             путь = policy_path(self._config.home, base_config.name)
             if not путь.exists():
                 raise _ServiceError(
@@ -1344,7 +1388,7 @@ class ToolService:
             scope,
             base,
             тело,
-            finisher=lambda гейт, текст: гейт.finish_text(текст),
+            finisher=lambda гейт, текст, раскрытое: гейт.finish_text(текст, раскрытое),
             with_index=False,
         )
 
@@ -1358,7 +1402,7 @@ class ToolService:
         цифры в подписи базы в токен чужого ИНН), а защищать в ней нечего.
         """
 
-        async def тело(base_config, гейт, репозиторий):
+        async def тело(base_config, гейт, репозиторий, _раскрытое):
             число = репозиторий.meta("entity_count")
             return {
                 "base": base_config.name,
@@ -1373,7 +1417,7 @@ class ToolService:
             scope,
             base,
             тело,
-            finisher=lambda _гейт, конверт: json.dumps(конверт, ensure_ascii=False),
+            finisher=lambda _гейт, конверт, _раскрытое: json.dumps(конверт, ensure_ascii=False),
         )
 
     # -- разбор аргументов raw_get ----------------------------------------------------------
@@ -1465,7 +1509,12 @@ class ToolService:
         return _ЦельПути(entity=цель, resolved=разрешён, field=хвост)
 
     def _подготовить_параметры(
-        self, repo: IndexRepository, gate: BaseGate, query: dict | None, цель: _ЦельПути
+        self,
+        repo: IndexRepository,
+        gate: BaseGate,
+        query: dict | None,
+        цель: _ЦельПути,
+        revealed: RevealedValues,
     ) -> dict[str, str]:
         """Параметры запроса `raw_get`: проверка, приведение к строкам, обратная подмена токенов.
 
@@ -1511,7 +1560,9 @@ class ToolService:
                     f"значение параметра {имя} должно быть строкой, числом или списком строк",
                 )
             if имя == "$filter":
-                текст = gate.inbound_filter(текст, entity=цель.entity, strict=not цель.resolved)
+                текст = gate.inbound_filter(
+                    текст, entity=цель.entity, strict=not цель.resolved, revealed=revealed
+                )
             elif "[[" in текст:
                 raise _ServiceError(
                     "params_invalid",

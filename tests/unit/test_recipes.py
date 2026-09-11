@@ -13,6 +13,7 @@ import urllib.parse
 import httpx
 import pytest
 import respx
+from conftest import ЗНАЧЕНИЯ_КЛАССОВ, эхо_отбора
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -43,24 +44,8 @@ URL_UT = "http://localhost/ut/odata/standard.odata/"
 # Класс гейта → реальное значение. Перебор ПО ВСЕМ классам, а не по одному ИНН: прошлый сторож
 # утечки был построен на ИНН — единственном классе, у которого есть и детектор, и контрольная
 # сумма, и цифровая серия в страже, — и дыру в `addr`/`dob` не заметил (C1 ревью 2026-09-11).
-ЗНАЧЕНИЯ_КЛАССОВ: dict[str, str] = {
-    "inn": ИНН,
-    "kpp": "770701001",
-    "ogrn": "1027700132195",
-    "acc": "40702810900000012345",
-    "corr": "30101810400000000225",
-    "bic": "044525225",
-    "iban": "DE89370400440532013000",
-    "card": "4111111111111111",
-    "snils": "112-233-445 95",
-    "doc": "45 03 123456",
-    "phone": "+7 916 123-45-67",
-    "email": "ivan@example.com",
-    "dob": "1980-05-01",
-    "addr": "г. Москва, ул. Тверская, д. 7, кв. 43",
-    "org": "ООО Ромашка",
-    "person": "Иванов Иван Иванович",
-}
+# Набор общий на все параметризованные проверки — он переехал в `conftest.py`, когда тот же
+# перебор по классам понадобился стражу раскрытых значений (задача N1 M1d).
 
 BASES_YAML = f"""
 default: ut
@@ -620,6 +605,43 @@ async def test_токен_в_параметре_подставляется_ре�
     assert f"ИНН eq '{ИНН}'" in _адрес(respx_ut)
     # …а наружу оно не вернулось ни в каком виде.
     assert ИНН not in json.dumps(ответ, ensure_ascii=False)
+
+
+РЕЦЕПТ_АДРЕСА = """
+version: 1
+recipes:
+  адреса:
+    title: Физлица по адресу регистрации
+    entity: Catalog_ФизическиеЛица
+    params:
+      адрес: { type: string, required: true, description: адрес регистрации }
+    filter: АдресРегистрации eq {адрес}
+    select: [Ref_Key, Description]
+"""
+
+
+async def test_эхо_отбора_в_ошибке_1С_не_выносит_раскрытое_рецептом(сервис, дом, respx_ut):
+    """Задача N1 M1d: параметр рецепта — такой же вход обратной подмены, как `$filter` у
+    `query` (`_значения_рецепта` → `inbound_value`), и раскрытое им значение обязано дойти до
+    стража тем же набором. Класс `addr` — тот, у которого другого рубежа нет вовсе."""
+    (дом / "bases" / "ut" / "recipes.yaml").write_text(РЕЦЕПТ_АДРЕСА, encoding="utf-8")
+    значение = ЗНАЧЕНИЯ_КЛАССОВ["addr"]
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    токен = гейт._dictionary.token_for(
+        "addr",
+        значение,
+        base="ut",
+        entity="Catalog_ФизическиеЛица",
+        field="АдресРегистрации",
+    )
+    маршрут = respx_ut.get("Catalog_ФизическиеЛица").mock(side_effect=эхо_отбора)
+
+    ответ = json.loads(await сервис.recipe(SessionScope(), name="адреса", params={"адрес": токен}))
+
+    assert значение in маршрут.calls.last.request.url.params["$filter"]
+    assert ответ["error"]["code"] == "odata_error"
+    assert значение not in json.dumps(ответ, ensure_ascii=False)
+    assert токен in ответ["error"]["message"]
 
 
 @pytest.mark.parametrize("класс", sorted(ЗНАЧЕНИЯ_КЛАССОВ))

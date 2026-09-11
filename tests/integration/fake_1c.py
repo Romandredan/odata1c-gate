@@ -52,6 +52,30 @@ async def _контрагенты(request: Request) -> Response:
     return JSONResponse(тело)
 
 
+async def _физлица_эхо_отбора(request: Request) -> Response:
+    """Ошибка разбора отбора, повторяющая выражение ЦЕЛИКОМ, вместе с литералом (задача N1 M1d).
+
+    Отдельный маршрут на отдельной сущности: `Catalog_Контрагенты` остаётся прежним — на нём
+    держатся остальные потребители заглушки. Форма сообщения взята из находки ревью; спорить о
+    том, повторяет ли конкретная публикация литералы, эта проверка не должна — инвариант 1
+    сформулирован как «никогда», и защита строится так, чтобы не зависеть от того,
+    проговорится платформа или нет.
+    """
+    отбор = request.query_params.get("$filter", "")
+    return JSONResponse(
+        {
+            "odata.error": {
+                "code": "6",
+                "message": {
+                    "lang": "ru-RU",
+                    "value": f"Ошибка при разборе выражения отбора: {отбор}",
+                },
+            }
+        },
+        status_code=400,
+    )
+
+
 async def _не_найдено(request: Request) -> Response:
     # Тот же формат odata.error, что разбирает client1c/errors.py::_текст_ошибки_платформы —
     # неизвестный путь настоящая 1С тоже отдаёт так, а не голым текстом.
@@ -66,6 +90,7 @@ def build_app() -> Starlette:
         routes=[
             Route("/odata/standard.odata/$metadata", _metadata),
             Route("/odata/standard.odata/Catalog_Контрагенты", _контрагенты),
+            Route("/odata/standard.odata/Catalog_ФизическиеЛица", _физлица_эхо_отбора),
             Route("/{rest:path}", _не_найдено),
         ]
     )

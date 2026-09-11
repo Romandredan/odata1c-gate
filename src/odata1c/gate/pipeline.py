@@ -16,6 +16,7 @@ from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import Masker, MaskResult, effective_field_class
 from odata1c.gate.policy import load_policy
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.unmasking import Unmasker
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
@@ -102,10 +103,17 @@ class BaseGate:
         (форма (г) ревью 2026-09-11)."""
         return self.field_class(entity, field, strict=strict) not in (None, "keep", "scan")
 
-    def inbound_filter(self, expression: str, *, entity: str, strict: bool = False) -> str:
+    def inbound_filter(
+        self, expression: str, *, entity: str, revealed: RevealedValues, strict: bool = False
+    ) -> str:
         """Выражение отбора от модели: обратная подмена токенов и анти-оракульные правила (SPEC
         §6.7). Единственная точка, где эти правила реализованы, — рецепты прогоняют через неё
         свои условия (Ruling 20, пункт 3), а не повторяют список своими силами.
+
+        `revealed` — набор вызова, в который записывается КАЖДОЕ раскрытое значение (задача N1
+        M1d). Аргумент обязателен, а не с умолчанием `None`: раскрытие без набора и есть тот
+        дефект, который здесь чинится — значение уходит в 1С, а страж на обратном пути его не
+        узнаёт. Отказ типа делает пропуск невозможным, в том числе у тулов, которых ещё нет.
 
         `strict` — путь не разрешён по индексу целиком (Ruling 18, пункт 7 дополнения): «любые
         другие параметры, которые на разрешённом пути отклоняются как оракул, на неразрешённом
@@ -113,24 +121,36 @@ class BaseGate:
         в 1С — двоичный поиск по названию, — хотя на известной сущности отклонялся."""
         if self.mode == "off":
             return expression
-        return self._unmasker.filter(expression, entity=entity, strict=strict)
+        return self._unmasker.filter(expression, entity=entity, strict=strict, revealed=revealed)
 
-    def inbound_value(self, text: str, *, entity: str, field: str, strict: bool = False) -> str:
+    def inbound_value(
+        self,
+        text: str,
+        *,
+        entity: str,
+        field: str,
+        revealed: RevealedValues,
+        strict: bool = False,
+    ) -> str:
         """Одно значение от модели (параметр рецепта, элемент ключа). Раскрытие токена здесь
-        возможно только при известном поле и совпадении класса — см. `unmasking._раскрыть`."""
+        возможно только при известном поле и совпадении класса — см. `unmasking._раскрыть`.
+        `revealed` — набор вызова, см. `inbound_filter`."""
         if self.mode == "off":
             return text
-        return self._unmasker.value(text, entity=entity, field=field, strict=strict)
+        return self._unmasker.value(
+            text, entity=entity, field=field, strict=strict, revealed=revealed
+        )
 
-    def inbound_key(self, key, *, entity: str, strict: bool = False):
+    def inbound_key(self, key, *, entity: str, revealed: RevealedValues, strict: bool = False):
+        """Ключ записи от модели. `revealed` — набор вызова, см. `inbound_filter`."""
         if self.mode == "off":
             return key
-        return self._unmasker.key(key, entity=entity, strict=strict)
+        return self._unmasker.key(key, entity=entity, strict=strict, revealed=revealed)
 
     def mask(self, data, *, entity: str, strict: bool = False) -> MaskResult:
         return self._masker.mask(data, entity=entity, strict=strict)
 
-    def finish(self, envelope: dict) -> str:
+    def finish(self, envelope: dict, revealed: RevealedValues | None = None) -> str:
         """Сериализация ответа тула (`ensure_ascii=False` — страж должен видеть кириллицу как
         есть, не в `\\uXXXX`-экранировании) и страж утечек как последний проход по готовому
         тексту (SPEC §6.8, инвариант 1). Заменивший что-то страж помечает ответ `guard_replaced`
@@ -141,9 +161,14 @@ class BaseGate:
         ревью 2026-09-10): finish — часть инварианта 1, и голое исключение здесь потеряло бы
         текст ответа у клиента. Если страж когда-нибудь вернёт невалидный JSON, отдаём его текст
         как есть (он уже прошёл страж — утечки в нём нет, только `warnings` не допишутся) и
-        логируем сам факт, без текста ответа (в нём могут быть данные)."""
+        логируем сам факт, без текста ответа (в нём могут быть данные).
+
+        `revealed` — набор раскрытого в этом вызове (задача N1 M1d): страж ищет в ответе и его.
+        Умолчание `None` здесь допустимо, в отличие от `inbound_*`: у вызова, который ничего не
+        раскрывал, набора и нет, а тот, кто раскрывал, получает набор и на входе, и на выходе из
+        одного места — `ToolService._run`."""
         текст = json.dumps(envelope, ensure_ascii=False)
-        проверено = self._guard.check(текст, mode=self.mode)
+        проверено = self._guard.check(текст, mode=self.mode, revealed=revealed)
         if not проверено.replacements:
             return проверено.text
         try:
@@ -157,24 +182,37 @@ class BaseGate:
         )
         return json.dumps(данные, ensure_ascii=False)
 
-    def finish_text(self, text: str) -> str:
+    def finish_text(self, text: str, revealed: RevealedValues | None = None) -> str:
         """Страж по готовому тексту целиком, без обёртки в JSON-конверт — для markdown-ответов
-        (`describe` и подобные), а не JSON-тулов."""
-        return self._guard.check(text, mode=self.mode).text
+        (`describe` и подобные), а не JSON-тулов. `revealed` — как у `finish`."""
+        return self._guard.check(text, mode=self.mode, revealed=revealed).text
 
-    def error(self, code: str, message: str, hint: str = "") -> str:
+    def error(
+        self, code: str, message: str, hint: str = "", revealed: RevealedValues | None = None
+    ) -> str:
         """Ошибка тула — обычный текст с JSON `{"error": {...}}` (SPEC §5.2), не исключение.
         Сообщение 1С и подсказка могут содержать реальное значение (инвариант 1: ошибки 1С —
         такой же путь утечки, как обычный ответ) — маскируются `mask_text` тем же маскировщиком,
-        что и ответ, следом идёт обычный `finish` со стражем."""
+        что и ответ, следом идёт обычный `finish` со стражем.
+
+        Набор раскрытого нужен здесь не меньше, чем на успешном пути, а по сути — больше: это
+        главный путь эха (1С повторяет выражение отбора в сообщении об ошибке), и `mask_text`
+        на нём бессилен, потому что у `addr`/`dob`/свободнотекстового `doc` детектора нет
+        (задача N1 M1d)."""
         сообщение = self._masker.mask_text(message, entity="", field="error")
         подсказка = self._masker.mask_text(hint, entity="", field="error") if hint else hint
-        return self.finish({"error": {"code": code, "message": сообщение, "hint": подсказка}})
+        return self.finish(
+            {"error": {"code": code, "message": сообщение, "hint": подсказка}}, revealed
+        )
 
 
 def guard_only(guard: Guard, envelope: dict) -> str:
     """Сериализация и страж на строжайшем уровне — для ответов, у которых база не определена
     (запрос на неизвестную/недоступную базу): политики и классов полей ещё нет, но известные
-    словарю значения всё равно не должны выйти наружу (инвариант 1)."""
+    словарю значения всё равно не должны выйти наружу (инвариант 1).
+
+    Набора раскрытого здесь нет и быть не может, и это не упущение: пока база не разрешена (или
+    гейт этой базы не построился), обратная подмена не выполнялась ни разу — раскрывать токены
+    некому и нечем (задача N1 M1d)."""
     текст = json.dumps(envelope, ensure_ascii=False)
     return guard.check(текст, mode=СТРОЖАЙШИЙ_УРОВЕНЬ).text

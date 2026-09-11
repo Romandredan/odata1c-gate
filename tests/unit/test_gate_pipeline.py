@@ -11,6 +11,7 @@ from odata1c.config.models import BaseConfig, GateSettings
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard, GuardResult
 from odata1c.gate.pipeline import BaseGate, guard_only
+from odata1c.gate.revealed import RevealedValues
 
 СЕКРЕТ = "секрет-для-тестов-ровно-32-байта".encode()
 
@@ -134,7 +135,46 @@ def test_is_protected_учитывает_уровень(врата_prod, вра�
 
 def test_inbound_filter_в_режиме_identifiers_пропускает_название(врата_identifiers):
     выражение = "Description eq 'ООО Ромашка'"
-    assert врата_identifiers.inbound_filter(выражение, entity="Catalog_Контрагенты") == выражение
+    assert (
+        врата_identifiers.inbound_filter(
+            выражение, entity="Catalog_Контрагенты", revealed=RevealedValues()
+        )
+        == выражение
+    )
+
+
+def test_error_прогоняет_набор_раскрытого_через_стража(врата_prod):
+    """Задача N1 M1d: ошибка 1С — такой же путь утечки, как обычный ответ, и раскрытое в этом же
+    вызове значение обязано быть заменено обратно, даже если его класс страж сам не собирает."""
+    значение = "г. Москва, ул. Тверская, д. 7, кв. 43"
+    набор = RevealedValues()
+    набор.add(значение, token="[[addr:A60KNQH867]]")
+
+    текст = врата_prod.error(
+        "odata_error",
+        f"Ошибка при разборе выражения отбора: АдресРегистрации eq '{значение}'",
+        revealed=набор,
+    )
+
+    assert значение not in текст
+    assert "[[addr:A60KNQH867]]" in json.loads(текст)["error"]["message"]
+
+
+@pytest.mark.parametrize("вход", ["filter", "value", "key"])
+def test_вход_обратной_подмены_требует_набор(врата_prod, вход):
+    """Набор — обязательный аргумент входов обратной подмены, а не необязательный с умолчанием.
+
+    Раскрытие без набора — это в точности дефект, который здесь чинится: значение уходит в 1С, а
+    страж на обратном пути его не узнаёт. Умолчание `None` вернуло бы эту дыру молча, стоило бы
+    новому тулу (запись, M2) забыть про аргумент; отказ типа делает пропуск невозможным.
+    """
+    with pytest.raises(TypeError):
+        if вход == "filter":
+            врата_prod.inbound_filter("ИНН eq '7707083893'", entity="Catalog_Контрагенты")
+        elif вход == "value":
+            врата_prod.inbound_value("7707083893", entity="Catalog_Контрагенты", field="ИНН")
+        else:
+            врата_prod.inbound_key({"ИНН": "7707083893"}, entity="Catalog_Контрагенты")
 
 
 def test_refresh_подхватывает_новую_политику(врата_prod, путь_политики):
@@ -154,6 +194,18 @@ def test_finish_text_прогоняет_стража(врата_prod, слова
     assert инн not in врата_prod.finish_text(f"| ИНН | {инн} |")
 
 
+def test_finish_text_прогоняет_набор_раскрытого(врата_prod):
+    """Markdown-ответы (`describe_entity`, ресурсы) идут мимо разбора JSON-литералов — набор
+    обязан доходить и до этого выхода, иначе рубеж зависел бы от формата ответа."""
+    значение = "г. Москва, ул. Тверская, д. 7, кв. 43"
+    набор = RevealedValues()
+    набор.add(значение, token="[[addr:A60KNQH867]]")
+
+    текст = врата_prod.finish_text(f"| АдресРегистрации | {значение} |", набор)
+
+    assert текст == "| АдресРегистрации | [[addr:A60KNQH867]] |"
+
+
 def test_guard_only_на_строжайшем_уровне(guard, словарь):
     инн = "7707083893"
     словарь.token_for("inn", инн, base="ut", entity="E", field="ИНН")
@@ -168,7 +220,7 @@ def test_finish_не_падает_если_страж_вернул_невали�
     monkeypatch.setattr(
         врата_prod._guard,
         "check",
-        lambda serialized, *, mode: GuardResult(
+        lambda serialized, *, mode, revealed=None: GuardResult(
             text="не json{", replacements=[{"value_hint": "…", "token": "[[inn:1]]"}], warnings=[]
         ),
     )

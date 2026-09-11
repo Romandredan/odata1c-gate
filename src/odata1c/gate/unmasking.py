@@ -46,6 +46,7 @@ from odata1c.gate.detectors import inn_valid, ogrn_valid, snils_valid
 from odata1c.gate.dictionary import НУМЕРУЕМЫЕ, Dictionary
 from odata1c.gate.field_rules import classify_field
 from odata1c.gate.filter_lexer import Token, lex_filter
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.tokens import TOKEN_RE, find_tokens, is_partial_token, parse_token
 
 ФУНКЦИИ_ПОДСТРОКИ = ("substringof", "startswith", "endswith")
@@ -114,7 +115,14 @@ class Unmasker:
         self._base = base
         self._field_class = field_class
 
-    def filter(self, expression: str, *, entity: str, strict: bool = False) -> str:
+    def filter(
+        self,
+        expression: str,
+        *,
+        entity: str,
+        revealed: RevealedValues | None = None,
+        strict: bool = False,
+    ) -> str:
         значимые = [лексема for лексема in lex_filter(expression) if лексема.kind != "space"]
         # _вызовы_функций проверяет форму каждого вызова (ровно два простых аргумента) и
         # отказывает сразу же, до вычисления "занято" ниже — неоднозначный вызов не должен
@@ -129,13 +137,20 @@ class Unmasker:
 
         сегменты: list[tuple[int, int, str]] = []
         for вызов in вызовы:
-            сегмент = self._обработать_вызов(вызов, значимые, entity=entity, strict=strict)
+            сегмент = self._обработать_вызов(
+                вызов, значимые, entity=entity, strict=strict, revealed=revealed
+            )
             if сегмент is not None:
                 сегменты.append(сегмент)
 
         for индекс, (поле, оператор, _) in поля_сравнений.items():
             сегмент = self._обработать_сравнение(
-                значимые[индекс], поле, оператор, entity=entity, strict=strict
+                значимые[индекс],
+                поле,
+                оператор,
+                entity=entity,
+                strict=strict,
+                revealed=revealed,
             )
             if сегмент is not None:
                 сегменты.append(сегмент)
@@ -192,6 +207,7 @@ class Unmasker:
         *,
         entity: str,
         field: str,
+        revealed: RevealedValues | None = None,
         strict: bool = False,
         allow_mixed: bool = False,
     ) -> str:
@@ -206,7 +222,9 @@ class Unmasker:
             return text
         целиком = parse_token(text)
         if целиком:
-            return self._раскрыть(целиком, entity=entity, field=field, strict=strict)
+            return self._раскрыть(
+                целиком, entity=entity, field=field, strict=strict, revealed=revealed
+            )
         if is_partial_token(text):
             raise GateError(
                 "token_partial",
@@ -220,11 +238,13 @@ class Unmasker:
                     "в значении токен смешан с текстом",
                     "передайте токен целиком и сравнивайте через eq",
                 )
-            return self._подставить_внутри_текста(text, entity=entity, field=field, strict=strict)
+            return self._подставить_внутри_текста(
+                text, entity=entity, field=field, strict=strict, revealed=revealed
+            )
         self._проверить_реальное_значение(text, entity=entity, field=field, strict=strict)
         return text
 
-    def body(self, data, *, entity: str, field: str = ""):
+    def body(self, data, *, entity: str, revealed: RevealedValues | None = None, field: str = ""):
         """`field` — путь-префикс, накопленный при спуске во вложенный объект (третий раунд
         ревью, «путь записи»): раньше при обходе вложенного словаря под полем связи
         (`{"Контрагент": {"ИНН": токен}}`) рекурсивный вызов `self.body(значение, entity=entity)`
@@ -234,7 +254,9 @@ class Unmasker:
         (см. там же), а `_класс_поля` умеет резолвить класс по последнему сегменту такого пути."""
         if isinstance(data, dict):
             return {
-                ключ: self._обойти_значение(значение, entity=entity, field=_путь(field, ключ))
+                ключ: self._обойти_значение(
+                    значение, entity=entity, field=_путь(field, ключ), revealed=revealed
+                )
                 for ключ, значение in data.items()
             }
         # Верхний уровень без словаря (голая строка или список — например, список значений
@@ -251,9 +273,11 @@ class Unmasker:
         # по-настоящему безымянного верхнего уровня (Правка D, зафиксировано как принятое
         # ограничение интерфейса `body(data, *, entity)` без параметра поля на самом верхнем
         # вызове).
-        return self._обойти_значение(data, entity=entity, field=field)
+        return self._обойти_значение(data, entity=entity, field=field, revealed=revealed)
 
-    def key(self, value, *, entity: str, strict: bool = False):
+    def key(
+        self, value, *, entity: str, revealed: RevealedValues | None = None, strict: bool = False
+    ):
         if isinstance(value, dict):
             результат = {}
             for ключ, часть in value.items():
@@ -267,7 +291,7 @@ class Unmasker:
                         "токены непрозрачны: их нельзя достраивать и обрезать",
                     )
                 результат[ключ] = (
-                    self.value(часть, entity=entity, field=ключ, strict=strict)
+                    self.value(часть, entity=entity, field=ключ, strict=strict, revealed=revealed)
                     if isinstance(часть, str)
                     else часть
                 )
@@ -278,20 +302,27 @@ class Unmasker:
         # общее правило `_раскрыть` («нет совпадения класса — нет раскрытия»), а не отдельная
         # проверка здесь.
         if isinstance(value, str):
-            return self.value(value, entity=entity, field="Ref_Key", strict=strict)
+            return self.value(
+                value, entity=entity, field="Ref_Key", strict=strict, revealed=revealed
+            )
         return value
 
-    def _обойти_значение(self, значение, *, entity: str, field: str):
+    def _обойти_значение(
+        self, значение, *, entity: str, field: str, revealed: RevealedValues | None
+    ):
         if isinstance(значение, str):
-            return self.value(значение, entity=entity, field=field, allow_mixed=True)
+            return self.value(
+                значение, entity=entity, field=field, allow_mixed=True, revealed=revealed
+            )
         if isinstance(значение, dict):
             # `field` здесь — уже составленный путь до этого вложенного объекта (пустой на
             # самом верхнем уровне) — передаётся в `body()` как префикс, а не отбрасывается
             # (см. docstring `body`, «путь записи», третий раунд ревью).
-            return self.body(значение, entity=entity, field=field)
+            return self.body(значение, entity=entity, field=field, revealed=revealed)
         if isinstance(значение, list):
             return [
-                self._обойти_значение(элемент, entity=entity, field=field) for элемент in значение
+                self._обойти_значение(элемент, entity=entity, field=field, revealed=revealed)
+                for элемент in значение
             ]
         return значение
 
@@ -499,14 +530,22 @@ class Unmasker:
         return найденные
 
     def _обработать_вызов(
-        self, вызов: dict, значимые: list[Token], *, entity: str, strict: bool = False
+        self,
+        вызов: dict,
+        значимые: list[Token],
+        *,
+        entity: str,
+        revealed: RevealedValues | None,
+        strict: bool = False,
     ) -> tuple[int, int, str] | None:
         литерал = значимые[вызов["literal_idx"]]
         поле = значимые[вызов["field_idx"]].text
         содержимое = _снять_кавычки(литерал.text)
         целиком = parse_token(содержимое)
         if целиком:
-            реальное = self._раскрыть(целиком, entity=entity, field=поле, strict=strict)
+            реальное = self._раскрыть(
+                целиком, entity=entity, field=поле, strict=strict, revealed=revealed
+            )
             замена = f"{поле} eq {self._литерал_фильтра(entity, поле, реальное, strict=strict)}"
             if вызов["under_not"]:
                 замена = f"({замена})"
@@ -517,7 +556,14 @@ class Unmasker:
         return None  # реальный текст на разрешённом классе — вызов остаётся как есть
 
     def _обработать_сравнение(
-        self, литерал: Token, поле: str, оператор: str, *, entity: str, strict: bool = False
+        self,
+        литерал: Token,
+        поле: str,
+        оператор: str,
+        *,
+        entity: str,
+        revealed: RevealedValues | None,
+        strict: bool = False,
     ) -> tuple[int, int, str] | None:
         # Упорядоченное сравнение с литералом на защищаемом классе — отдельный ход в обход
         # анти-оракульного правила (Обход B): нет исключения для org/person — сортировать и
@@ -545,7 +591,9 @@ class Unmasker:
         содержимое = _снять_кавычки(литерал.text)
         целиком = parse_token(содержимое)
         if целиком:
-            реальное = self._раскрыть(целиком, entity=entity, field=поле, strict=strict)
+            реальное = self._раскрыть(
+                целиком, entity=entity, field=поле, strict=strict, revealed=revealed
+            )
             замена = self._литерал_фильтра(entity, поле, реальное, strict=strict)
             return (литерал.start, литерал.end, замена)
         # Обрезанный или смешанный с текстом токен — здесь, до отказа по дате рождения ниже:
@@ -615,18 +663,34 @@ class Unmasker:
         self._проверить_реальное_значение(содержимое, entity=entity, field=field, strict=strict)
 
     def _подставить_внутри_текста(
-        self, текст: str, *, entity: str, field: str, strict: bool = False
+        self,
+        текст: str,
+        *,
+        entity: str,
+        field: str,
+        revealed: RevealedValues | None,
+        strict: bool = False,
     ) -> str:
         куски, позиция = [], 0
         for начало, конец, класс, хвост in find_tokens(текст):
             куски.append(текст[позиция:начало])
-            куски.append(self._раскрыть((класс, хвост), entity=entity, field=field, strict=strict))
+            куски.append(
+                self._раскрыть(
+                    (класс, хвост), entity=entity, field=field, strict=strict, revealed=revealed
+                )
+            )
             позиция = конец
         куски.append(текст[позиция:])
         return "".join(куски)
 
     def _раскрыть(
-        self, разобранный: tuple[str, str], *, entity: str, field: str, strict: bool = False
+        self,
+        разобранный: tuple[str, str],
+        *,
+        entity: str,
+        field: str,
+        revealed: RevealedValues | None,
+        strict: bool = False,
     ) -> str:
         """Токен → реальное значение. Ruling 20, пункт 1: раскрытие допустимо ТОЛЬКО при
         известном целевом поле и совпадении класса; нет контекста — отказ, а не подстановка «на
@@ -679,6 +743,17 @@ class Unmasker:
                 f"токен {токен} не найден в словаре",
                 "токены непрозрачны: используйте только те, что пришли в ответах",
             )
+        # Единственная точка, где реальное значение появляется на свет: отсюда оно уходит в 1С,
+        # и отсюда же попадает в набор вызова, чтобы страж узнал его на обратном пути (задача N1
+        # M1d, инвариант 1). У классов `addr`, `dob` и свободнотекстового `doc` другого рубежа
+        # нет: ни детектора, ни цифровой серии, ни варианта названия.
+        if revealed is not None:
+            revealed.add(реальное, token=токен)
+            if "'" in реальное:
+                # В `$filter` значение уходит с удвоенным апострофом (`_экранировать`), и текст
+                # ошибки 1С повторяет именно эту форму — она такое же точное вхождение, как
+                # исходная.
+                revealed.add(_экранировать(реальное), token=токен)
         return реальное
 
     def _класс_поля(self, entity: str, field: str, *, strict: bool = False) -> str | None:
