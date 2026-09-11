@@ -29,7 +29,11 @@ from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
-from odata1c.gate.masking import ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ, Resolve
+from odata1c.gate.masking import (
+    ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА,
+    ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ,
+    Resolve,
+)
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.policy import PolicyError
 from odata1c.gate.revealed import RevealedValues
@@ -179,13 +183,6 @@ class _ЦельПути:
 
 # Ruling 18: строгая политика — не оправдание утечки, а объяснение, почему замаскировано больше
 # обычного, и подсказка, чем это лечится.
-_ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА = (
-    "путь не разрешён по индексу целиком (сущность или сегмент вне индекса): применена строгая "
-    "политика — наименования и ФИО маскируются, поиск реквизитов по значению включён "
-    "принудительно; для точной разметки полей обновите индекс: odata1c_reindex"
-)
-
-
 # Системные сегменты OData: именем реквизита не бывают никогда (пункт 5 дополнения). `$value`
 # запрещён отдельно и раньше (`_проверить_путь`); остальные — законный хвост пути, но
 # переименовывать по ним ответ нельзя: `{"$count": 42}` вместо `{"value": 42}` — искажение.
@@ -559,7 +556,12 @@ class ToolService:
                 return None
             цель = текущая.navigations.get(key)
             if цель is not None:
-                return цель
+                # Имя цели индекс знает, а саму цель может и не знать: битая ссылка на тип
+                # (`unresolved_entity_sets`, о них предупреждает сам реиндекс) оставляет имя без
+                # описания. Отвечать таким именем нельзя — обход ушёл бы в сущность, о которой
+                # политика молчит, и без строгого режима (C3 раунда 2, форма Б). «Не знаю» здесь
+                # честнее и включает ту же строгую ветку, что и неизвестный ключ.
+                return цель if описание(цель) is not None else None
             дочерняя = f"{entity}_{key}"
             return дочерняя if дочерняя in текущая.children else None
 
@@ -784,7 +786,9 @@ class ToolService:
             # анность осознанная, не забытая — публичный аксессор (`BaseGate.policy`/`.field_
             # class(...)`) числится долгом следующей правки `gate/pipeline.py` (задача демона
             # или M1e), не этой задачи.
-            факты = describe_tool.build(описание, policy=гейт._policy, mode=гейт.mode)
+            факты = describe_tool.build(
+                описание, policy=гейт._policy, mode=гейт.mode, hidden=гейт.is_hidden
+            )
             факты["entity"] = описание.name
             факты["base"] = base_config.name
             факты["role"] = base_config.role
@@ -1453,7 +1457,7 @@ class ToolService:
 
             предупреждения = _без_повторов([*обрезка, *маска.warnings])
             if not цель.resolved:
-                предупреждения.append(_ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА)
+                предупреждения.append(ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА)
 
             конверт = {
                 "path": очищенный,
