@@ -177,33 +177,10 @@ async def test_ресурс_политики_отказывает_на_неиз�
     assert json.loads(содержимое.contents[0].text)["error"]["code"] == "base_unknown"
 
 
-async def test_фоновая_проверка_пропускает_базы_без_индекса(сервис, дом, monkeypatch):
-    """Первый реиндекс — сознательное действие владельца, а не побочный эффект старта демона:
-    на базе уровня ERP он стоит десятков мегабайт трафика и минут разбора."""
-    from odata1c.config.loader import load_config
-    from odata1c.daemon import check_metadata_once
-
-    вызовы = []
-
-    async def перехват(self, scope, *, base=None, force=False):
-        вызовы.append(base)
-        return "{}"
-
-    monkeypatch.setattr(ToolService, "reindex", перехват)
-    await check_metadata_once(сервис, load_config(дом))
-
-    assert вызовы == []
-
-
-async def test_фоновая_проверка_записывает_отказ_в_реестр(tmp_path, monkeypatch, caplog):
-    """Отказ фоновой проверки не виден никому, кроме журнала и реестра: MCP-клиента у неё нет.
-
-    Ответ `reindex` уже прошёл гейт и страж — его можно и записать, и залогировать целиком.
-    """
+def _дом_с_базой(tmp_path):
+    """Домашний каталог с одной ОПИСАННОЙ базой `ut` (без индекса) — фикстура `дом` этого файла
+    описанных баз не содержит вовсе, и обход баз на ней проверять нечем."""
     from odata1c.cli import main
-    from odata1c.config.loader import load_config
-    from odata1c.daemon import check_metadata_once
-    from odata1c.index.reindex import index_path
 
     home = tmp_path / "home"
     main(["init", "--home", str(home)])
@@ -213,6 +190,51 @@ async def test_фоновая_проверка_записывает_отказ_�
         "    user: u\n    password: p\n    role: prod\n",
         encoding="utf-8",
     )
+    return home
+
+
+async def test_фоновая_проверка_обходит_только_проиндексированные_базы(tmp_path, monkeypatch):
+    """Первый реиндекс — сознательное действие владельца, а не побочный эффект старта демона:
+    на базе уровня ERP он стоит десятков мегабайт трафика и минут разбора. Проверяются ОБЕ
+    ветки обхода: база без индекса пропущена, база с индексом — проверена.
+    """
+    from odata1c.config.loader import load_config
+    from odata1c.daemon import check_metadata_once
+    from odata1c.index.reindex import index_path
+
+    home = _дом_с_базой(tmp_path)
+    вызовы = []
+
+    async def перехват(self, scope, *, base=None, force=False):
+        вызовы.append(base)
+        return "{}"
+
+    monkeypatch.setattr(ToolService, "reindex", перехват)
+    config = load_config(home)
+    служба = ToolService(config)
+    try:
+        assert config.bases, "база не описана — тест проверял бы пустой обход"
+        await check_metadata_once(служба, config)
+        assert вызовы == []
+
+        index_path(home, "ut").parent.mkdir(parents=True, exist_ok=True)
+        index_path(home, "ut").write_bytes(b"")
+        await check_metadata_once(служба, config)
+        assert вызовы == ["ut"]
+    finally:
+        await служба.aclose()
+
+
+async def test_фоновая_проверка_записывает_отказ_в_реестр(tmp_path, monkeypatch, caplog):
+    """Отказ фоновой проверки не виден никому, кроме журнала и реестра: MCP-клиента у неё нет.
+
+    Ответ `reindex` уже прошёл гейт и страж — его можно и записать, и залогировать целиком.
+    """
+    from odata1c.config.loader import load_config
+    from odata1c.daemon import check_metadata_once
+    from odata1c.index.reindex import index_path
+
+    home = _дом_с_базой(tmp_path)
     index_path(home, "ut").parent.mkdir(parents=True, exist_ok=True)
     index_path(home, "ut").write_bytes(b"")  # индекс есть — базу проверять положено
 
