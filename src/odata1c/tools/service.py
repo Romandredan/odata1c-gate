@@ -576,15 +576,7 @@ class ToolService:
     ) -> str:
         async def тело(base_config, гейт, репозиторий):
             описание = self._resolve_entity(репозиторий, гейт, entity)
-
-            if orderby:
-                for поле in orderby_fields(orderby):
-                    if self._поле_защищено_по_пути(репозиторий, гейт, описание, поле):
-                        raise _ServiceError(
-                            "params_invalid",
-                            "сортировка по защищаемому полю недоступна: порядок раскрывает "
-                            "значения",
-                        )
+            self._проверить_сортировку(репозиторий, гейт, описание, orderby)
 
             реальный_filter = (
                 гейт.inbound_filter(filter, entity=описание.name) if filter else filter
@@ -596,11 +588,11 @@ class ToolService:
                     params["Condition"], entity=описание.name
                 )
 
-            spec = build_query(
+            return await self._выборка(
+                base_config,
+                гейт,
+                репозиторий,
                 описание,
-                describe=репозиторий.describe,
-                limits=self._config.daemon.limits,
-                virtual_timeout_s=base_config.virtual_timeout_s,
                 filter=реальный_filter,
                 select=select,
                 expand=expand,
@@ -612,31 +604,99 @@ class ToolService:
                 allowed_only=allowed_only,
             )
 
-            клиент = self._client_for(base_config)
-            try:
-                сырой_ответ = await клиент.get(spec.path, spec.params, timeout=spec.timeout_s)
-            except OdataError as ошибка:
-                self._уточнить_404(ошибка)
-                raise
-
-            записи, всего = items_of(сырой_ответ)
-            записи = strip_service(записи, keep_data_version="DataVersion" in _как_список(select))
-            маска = гейт.mask(записи, entity=описание.name)
-            усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
-
-            конверт = {
-                "entity": описание.name,
-                "base": base_config.name,
-                "role": base_config.role,
-                "gate": гейт.mode,
-                **page_info(count=len(записи), total=всего, top=spec.top, skip=spec.skip),
-                "items": усечённые,
-                "masked_fields": маска.masked_fields,
-                "warnings": [*spec.warnings, *маска.warnings],
-            }
-            return fit_result(конверт, self._config.daemon.limits.result_chars, skip=spec.skip)
-
         return await self._run(scope, base, тело)
+
+    def _проверить_сортировку(
+        self,
+        repo: IndexRepository,
+        gate: BaseGate,
+        desc: EntityDescription,
+        orderby: str | None,
+    ) -> None:
+        """Сортировка по защищаемому полю запрещена (SPEC §6): порядок строк раскрывает исходное
+        значение не хуже самого значения. Проверка общая для `query` и `recipe` — рецепт пишет
+        владелец машины, но читает ответ модель, и оракул сравнения от авторства не зависит."""
+        if not orderby:
+            return
+        for поле in orderby_fields(orderby):
+            if self._поле_защищено_по_пути(repo, gate, desc, поле):
+                raise _ServiceError(
+                    "params_invalid",
+                    "сортировка по защищаемому полю недоступна: порядок раскрывает значения",
+                )
+
+    async def _выборка(
+        self,
+        base_config: BaseConfig,
+        гейт: BaseGate,
+        репозиторий: IndexRepository,
+        описание: EntityDescription,
+        *,
+        filter: str | None = None,  # noqa: A002 — имя аргумента тула зафиксировано SPEC §5
+        select: list[str] | str | None = None,
+        expand: list[str] | str | None = None,
+        orderby: str | None = None,
+        top: int | None = None,
+        skip: int | None = None,
+        inlinecount: bool = False,
+        params: dict | None = None,
+        allowed_only: bool = False,
+        extra: dict | None = None,
+    ) -> dict:
+        """Общий хвост выборки для `query` и `recipe` (план M1d, задача 8): построение запроса →
+        клиент 1С → очистка служебных полей → маска → усечение строк → конверт SPEC §5.1 →
+        подгонка под `result_chars`.
+
+        ВАЖНО: `filter` и `params` приходят сюда УЖЕ проведёнными через обратную подмену гейта —
+        в них реальные значения, а не токены. Вызывающий отвечает за то, чтобы каждое значение,
+        пришедшее от модели, прошло `inbound_filter`/`inbound_value` до этого места. Причина
+        такого разделения — в том, что у `query` и `recipe` источники разные: у первого модель
+        присылает целое выражение `$filter` (его разбирает лексер гейта), у второго — отдельные
+        значения параметров при доверенном тексте условия из `recipes.yaml`.
+
+        `extra` — поля конверта сверх общих (`recipe`, `title` у рецепта): добавляются ДО `items`,
+        чтобы не мешать `fit_result` выбрасывать записи при подгонке под лимит.
+        """
+        spec = build_query(
+            описание,
+            describe=репозиторий.describe,
+            limits=self._config.daemon.limits,
+            virtual_timeout_s=base_config.virtual_timeout_s,
+            filter=filter,
+            select=select,
+            expand=expand,
+            orderby=orderby,
+            top=top,
+            skip=skip,
+            inlinecount=inlinecount,
+            params=params,
+            allowed_only=allowed_only,
+        )
+
+        клиент = self._client_for(base_config)
+        try:
+            сырой_ответ = await клиент.get(spec.path, spec.params, timeout=spec.timeout_s)
+        except OdataError as ошибка:
+            self._уточнить_404(ошибка)
+            raise
+
+        записи, всего = items_of(сырой_ответ)
+        записи = strip_service(записи, keep_data_version="DataVersion" in _как_список(select))
+        маска = гейт.mask(записи, entity=описание.name)
+        усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
+
+        конверт = {
+            "entity": описание.name,
+            "base": base_config.name,
+            "role": base_config.role,
+            "gate": гейт.mode,
+            **(extra or {}),
+            **page_info(count=len(записи), total=всего, top=spec.top, skip=spec.skip),
+            "items": усечённые,
+            "masked_fields": маска.masked_fields,
+            "warnings": [*spec.warnings, *маска.warnings],
+        }
+        return fit_result(конверт, self._config.daemon.limits.result_chars, skip=spec.skip)
 
     async def get(
         self,
