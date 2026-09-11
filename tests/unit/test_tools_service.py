@@ -2473,6 +2473,62 @@ async def test_describe_не_называет_скрытую_дочернюю_с
     assert "скрыта настройкой базы" in текст
 
 
+def test_тип_видимой_табличной_части_не_портится_общим_префиксом():
+    """Minor итогового ревью M1d, раунд 3: замена имени в типе шла ПОДСТРОКОЙ, и пара детей с
+    общим префиксом (`Товары` и `ТоварыДоп` — в типовых конфигурациях обычное дело) страдала
+    дважды. Тип видимого соседа портился (`(сущность скрыта…)Доп_RowType` — настоящий тип модели
+    уже не прочитать), а остаток `Доп` выдавал структуру: скрытое имя восстанавливается как
+    «видимое минус суффикс», то есть замена не скрывала, а подсказывала.
+
+    Имя типа строки сравнивается целиком: оно вынимается из `Collection(StandardODATA.<имя>
+    _RowType)` и сверяется со списком скрытых детей."""
+    from odata1c.gate.policy import Policy
+    from odata1c.index.repository import EntityDescription
+    from odata1c.tools import describe as describe_tool
+
+    def поле(имя: str) -> dict:
+        return {
+            "name": имя,
+            "edm_type": f"Collection(StandardODATA.Document_Х_{имя}_RowType)",
+            "nullable": False,
+            "is_key": False,
+            "is_ref": False,
+            "ref_targets": [],
+            "is_composite": False,
+        }
+
+    описание = EntityDescription(
+        name="Document_Х",
+        kind="Document",
+        russian_kind="Документ",
+        parent_entity=None,
+        is_tabular_part=False,
+        is_records=False,
+        is_virtual=False,
+        virtual_kind=None,
+        key_fields=["Ref_Key"],
+        description_field=None,
+        fields=[поле("Товары"), поле("ТоварыДоп")],
+        children=["Document_Х_Товары", "Document_Х_ТоварыДоп"],
+        actions=[],
+        members=[],
+        navigations={},
+        is_independent_register=False,
+    )
+
+    факты = describe_tool.build(
+        описание,
+        policy=Policy(),
+        mode="identifiers+names",
+        hidden=lambda имя: имя == "Document_Х_Товары",
+    )
+    типы = {поле["name"]: поле["edm_type"] for поле in факты["fields"]}
+
+    assert типы["Товары"] == f"Collection(StandardODATA.{describe_tool.СКРЫТАЯ_ЦЕЛЬ}_RowType)"
+    assert типы["ТоварыДоп"] == "Collection(StandardODATA.Document_Х_ТоварыДоп_RowType)"
+    assert факты["children"] == ["Document_Х_ТоварыДоп"]
+
+
 # ---------------------------------------------------------------------------------------------
 # Итоговое ревью M1d, Important: bases() не объявляет умолчанием базу вне области видимости
 # ---------------------------------------------------------------------------------------------
