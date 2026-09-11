@@ -1386,7 +1386,8 @@ async def test_resource_policy_не_называет_скрытые_сущнос
     путь.write_text(
         путь.read_text(encoding="utf-8")
         + "entities:\n  Catalog_Контрагенты: {hide: true}\n"
-        + "names_for: [Catalog_Контрагенты, Catalog_Организации]\n",
+        + "names_for: [Catalog_Контрагенты, Catalog_Организации]\n"
+        + "custom:\n  driver_license:\n    fields: [ВодительскоеУдостоверение]\n",
         encoding="utf-8",
     )
 
@@ -1395,6 +1396,14 @@ async def test_resource_policy_не_называет_скрытые_сущнос
     assert "Catalog_Контрагенты" not in текст
     assert "скрыта настройкой базы" in текст
     assert "Catalog_Организации" in текст  # прочие настройки остаются: имён они не выдают
+    # Обратная половина того же сторожа: вычёркивается только то, что названо, — пересборка YAML
+    # не должна потерять настройки, в которых имён сущностей нет вовсе. Раздел `custom` фильтру
+    # недоступен по устройству (ключ там — имя КЛАССА), но проверяется явно: сторож должен
+    # краснеть и на «вычеркнули слишком много», а не только на «слишком мало».
+    assert "version: 2" in текст
+    assert "scan_free_text" in текст
+    assert "driver_license" in текст
+    assert "ВодительскоеУдостоверение" in текст
 
 
 async def test_resource_policy_не_называет_детей_скрытой_сущности(сервис, дом):
@@ -2695,6 +2704,68 @@ async def test_describe_дочерней_скрытой_сущности_не_о
     текст = await сервис.describe_entity(SessionScope(), base="ut", entity=f"{ДОКУМЕНТ}_Товары")
 
     assert json.loads(текст)["error"]["code"] == "entity_hidden"
+
+
+def _индекс_с_большим_поддеревом(дом) -> None:
+    """Индекс из документа с тридцатью табличными частями и четырёх посторонних справочников,
+    имена которых отвечают на тот же запрос. Нужен, чтобы скрытое поддерево заведомо не
+    помещалось в окно поиска: на образце `ut-real.edmx` у документа всего одна табличная часть."""
+    from odata1c.index.edmx import ParsedEntity, ParsedField, ParsedMetadata
+    from odata1c.index.reindex import index_path
+
+    def сущность(имя: str, родитель: str | None = None) -> ParsedEntity:
+        документ = имя.startswith("Document")
+        return ParsedEntity(
+            name=имя,
+            kind="Document" if документ else "Catalog",
+            russian_kind="Документ" if документ else "Справочник",
+            base_name=имя.split("_", 1)[1],
+            parent_entity=родитель,
+            is_tabular_part=родитель is not None,
+            is_records=False,
+            is_virtual=False,
+            virtual_kind=None,
+            key_fields=["Ref_Key"],
+            description_field=None,
+            has_posted=False,
+            has_recorder=False,
+            is_independent_register=False,
+            fields=[ParsedField(name="Ref_Key", edm_type="Edm.Guid", nullable=False, is_key=True)],
+        )
+
+    сущности = [сущность("Document_Тест")]
+    сущности += [сущность(f"Document_Тест_Часть{н:02d}", "Document_Тест") for н in range(1, 31)]
+    сущности += [
+        сущность("Catalog_ТестОдин"),
+        сущность("Catalog_ТестДва"),
+        сущность("Catalog_ЧастичноеТестирование"),
+        сущность("Catalog_ТестированиеЧастями"),
+    ]
+    хранилище = IndexRepository(index_path(дом, "ut"))
+    try:
+        хранилище.write(ParsedMetadata(entities=сущности, actions=[], edmx_sha256="0" * 64))
+    finally:
+        хранилище.close()
+
+
+async def test_поиск_не_недобирает_из_за_большого_скрытого_поддерева(сервис, дом):
+    """Окно поиска считалось от одного `limit` (`max(limit * 4, 20)`) — и было выверено тогда,
+    когда одно правило `hide` убирало одно имя. С Ruling 30 оно убирает поддерево: у документа
+    типовой конфигурации это десяток табличных частей, у регистра накопления — набор записей и
+    четыре виртуальные таблицы. Запрос, отвечающий имени скрытого родителя, отвечает и именам
+    всех его детей, поэтому окно могло целиком заполниться скрытыми именами, и `find_entity` молча
+    возвращал меньше кандидатов, чем просили, — при том что видимые в индексе были.
+
+    Утечки здесь нет (фильтр только убирает), это качество ответа. Окно теперь расширяется ровно
+    на число имён, которые фильтр может убрать."""
+    _индекс_с_большим_поддеревом(дом)
+    _скрыть_сущность(дом, "Document_Тест")
+
+    текст = await сервис.find_entity(SessionScope(), base="ut", query="Тест", limit=4)
+    имена = [с["name"] for с in json.loads(текст)["entities"]]
+
+    assert len(имена) == 4
+    assert not any(имя.startswith("Document_Тест") for имя in имена)
 
 
 async def test_дети_видимой_сущности_остаются_видны(сервис):
