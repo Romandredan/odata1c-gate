@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import pathlib
 import socket
+import urllib.parse
 from collections.abc import AsyncIterator
 
 import uvicorn
@@ -19,6 +20,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from starlette.types import ASGIApp
 
 _ОБРАЗЦЫ = pathlib.Path(__file__).resolve().parent.parent / "fixtures" / "edmx"
 EDMX_ФИКСТУРА = _ОБРАЗЦЫ / "ut-real.edmx"
@@ -85,8 +87,12 @@ async def _не_найдено(request: Request) -> Response:
     )
 
 
-def build_app() -> Starlette:
-    return Starlette(
+def build_app(журнал_запросов: list[str] | None = None) -> ASGIApp:
+    """`журнал_запросов` — список, в который дописывается путь и строка запроса КАЖДОГО
+    обращения, уже раскодированные из процентной записи. Нужен тем, кто проверяет, что именно
+    дошло до «1С» (раунд правок 2 по `stop()` и журналу): раскрыл ли гейт токен в настоящее
+    значение, было ли обращение вообще."""
+    приложение = Starlette(
         routes=[
             Route("/odata/standard.odata/$metadata", _metadata),
             Route("/odata/standard.odata/Catalog_Контрагенты", _контрагенты),
@@ -94,6 +100,16 @@ def build_app() -> Starlette:
             Route("/{rest:path}", _не_найдено),
         ]
     )
+    if журнал_запросов is None:
+        return приложение
+
+    async def записывающее(scope, receive, send) -> None:
+        if scope["type"] == "http":
+            строка = scope.get("query_string", b"").decode("latin-1")
+            журнал_запросов.append(urllib.parse.unquote(f"{scope['path']}?{строка}"))
+        await приложение(scope, receive, send)
+
+    return записывающее
 
 
 def свободный_порт() -> int:
@@ -103,12 +119,16 @@ def свободный_порт() -> int:
 
 
 @contextlib.asynccontextmanager
-async def запущенная(port: int | None = None) -> AsyncIterator[int]:
+async def запущенная(
+    port: int | None = None, *, журнал_запросов: list[str] | None = None
+) -> AsyncIterator[int]:
     """Поднять поддельную 1С в фоновой задаче на свободном (или заданном) порту, отдать номер
     порта, остановить при выходе — тот же приём (`uvicorn.Server` + флаг `should_exit`), что
     `odata1c.daemon.serve()` использует для настоящего демона."""
     порт = port if port is not None else свободный_порт()
-    настройки = uvicorn.Config(build_app(), host="127.0.0.1", port=порт, log_level="warning")
+    настройки = uvicorn.Config(
+        build_app(журнал_запросов), host="127.0.0.1", port=порт, log_level="warning"
+    )
     сервер = uvicorn.Server(настройки)
     задача = asyncio.create_task(сервер.serve())
     try:
