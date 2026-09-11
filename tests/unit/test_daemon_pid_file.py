@@ -14,6 +14,10 @@ daemon.pid существует: False, stop() смог остановить: Fa
 процесс, чей pid лежит в `daemon.pid`; проигравший — `serve()` этого процесса, чей uvicorn не смог
 занять порт. Настоящий второй демон для этого не нужен и сделал бы тест зависимым от совпадения
 времени двух холодных стартов.
+
+Раунд правок 4 добавил сюда пункт 1 (нечитаемый `daemon.pid` ронял `finally` у `serve()` —
+регрессия раунда 3) и пункт 2 (тот же класс дефекта в `stop()`: файл удалялся по пути, а не
+опознанный, плюс неатомарная запись pid-файла).
 """
 
 from __future__ import annotations
@@ -86,3 +90,125 @@ async def test_проигравший_гонку_за_порт_не_уносит
     assert daemon_stop(home) is True
     assert победитель.wait(timeout=10) is not None
     assert not pid_файл.exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# Раунд правок 4: нечитаемый pid-файл (пункт 1, регрессия раунда 3) и та же дисциплина удаления
+# в `stop()` (пункт 2, находка Б.7)
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_нечитаемый_pid_файл_не_обрывает_уборку_в_finally(tmp_path, monkeypatch):
+    """Раунд правок 4, пункт 1 (находка Б.1 ревьюера, регрессия раунда 3):
+    `read_text(encoding="utf-8")` на невалидном UTF-8 бросает `UnicodeDecodeError`, а это
+    `ValueError`, не `OSError`, — прежний перехват его пропускал. Вылетев из `finally` у `serve()`,
+    он подменял исходную ошибку (ту, из-за которой демон и завершался) и обрывал уборку на первой
+    же строке: `служба.aclose()` не вызывался, соединения с 1С оставались открытыми."""
+    home = tmp_path / "home"
+    ensure_home(home)
+    ensure_gate_secret(home / "daemon.yaml")
+    (home / "daemon.pid").write_bytes(b"\xff\xfe\x00")
+
+    закрытия: list[int] = []
+
+    class _СлужбаСоСчётчиком(daemon_module.ToolService):
+        async def aclose(self):
+            закрытия.append(1)
+            await super().aclose()
+
+    monkeypatch.setattr(daemon_module, "ToolService", _СлужбаСоСчётчиком)
+    monkeypatch.setattr(daemon_module, "is_listening", lambda port, timeout=0.5: False)
+    monkeypatch.setattr(daemon_module.uvicorn, "Server", _UvicornНеЗанявшийПорт)
+
+    with pytest.raises(OSError) as отказ:
+        await serve(home, port=58232)
+
+    # Наверх должна уйти ИСХОДНАЯ ошибка, а не UnicodeDecodeError из уборки.
+    assert not isinstance(отказ.value, UnicodeDecodeError)
+    assert закрытия == [1], "finally оборвался до aclose() — соединения с 1С остались открытыми"
+    assert (home / "daemon.pid").exists(), "чужой (нечитаемый) pid-файл трогать незачем"
+
+
+def test_stop_не_уносит_pid_файл_нового_демона(tmp_path, monkeypatch):
+    """Раунд правок 4, пункт 2 (находка Б.7): между чтением файла и его удалением умещается целый
+    перезапуск демона — прежний завершается и убирает свой pid-файл, новый поднимается и пишет
+    свой. `unlink` по пути уносил pid-файл ЖИВОГО нового демона, и получался ровно тот исход,
+    который чинил раунд 3: демон работает, остановить его нечем.
+
+    Перезапуск вставляется в настоящее окно — подменённый `os.kill` играет роль паузы между
+    чтением и удалением."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("4242", encoding="utf-8")
+
+    def kill_и_перезапуск(pid, sig):
+        assert pid == 4242
+        pid_файл.write_text("777777", encoding="utf-8")  # поднялся новый демон
+
+    monkeypatch.setattr(daemon_module.os, "kill", kill_и_перезапуск)
+
+    assert daemon_stop(home) is True
+    assert pid_файл.exists(), "stop() унёс pid-файл нового демона"
+    assert pid_файл.read_text(encoding="utf-8").strip() == "777777"
+
+
+def test_stop_не_удаляет_файл_с_недописанным_содержимым(tmp_path):
+    """Второй вход в тот же исход: пустая строка в `daemon.pid` — это не мусор, а живой демон,
+    чей pid-файл пишется прямо сейчас. Прежний `stop()` отчитывался «демон не запущен» и заодно
+    удалял файл."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("", encoding="utf-8")
+
+    assert daemon_stop(home) is False
+    assert pid_файл.exists(), "stop() удалил файл, который не смог разобрать"
+
+
+def test_pid_файл_пишется_атомарно(tmp_path, monkeypatch):
+    """Та же находка с другой стороны: `write_text` — это «усечь, потом записать», и читатель,
+    попавший в промежуток, видит пустой файл. Атомарность наблюдаема только по механизму записи,
+    поэтому тест белого ящика: замена происходит через `os.replace` временного файла, и временных
+    файлов после записи не остаётся."""
+    pid_файл = tmp_path / "daemon.pid"
+    pid_файл.write_text("1", encoding="utf-8")
+    замены: list[tuple[str, str]] = []
+    настоящий_replace = daemon_module.os.replace
+
+    def следящий_replace(откуда, куда):
+        замены.append((str(откуда), str(куда)))
+        настоящий_replace(откуда, куда)
+
+    monkeypatch.setattr(daemon_module.os, "replace", следящий_replace)
+
+    daemon_module._записать_pid_файл(pid_файл, 4242)
+
+    assert pid_файл.read_text(encoding="utf-8") == "4242"
+    assert [куда for _, куда in замены] == [str(pid_файл)], (
+        "pid-файл должен появляться целиком одной заменой, а не перезаписью на месте"
+    )
+    assert not list(tmp_path.glob("daemon.pid.tmp-*")), "временный файл не убран"
+
+
+def test_запись_pid_файла_переживает_занятость_файла_читателем(tmp_path, monkeypatch):
+    """На Windows файл, открытый читателем обычными средствами, нельзя ни удалить, ни заменить —
+    `os.replace` падает `PermissionError`. Хендл читателя живёт микросекунды, поэтому запись
+    повторяется: без повторов редкое совпадение с `odata1c daemon stop` роняло бы старт демона —
+    новый отказ вместо того, который чинится."""
+    pid_файл = tmp_path / "daemon.pid"
+    настоящий_replace = daemon_module.os.replace
+    осталось_отказов = [2]
+
+    def капризный_replace(откуда, куда):
+        if осталось_отказов[0]:
+            осталось_отказов[0] -= 1
+            raise PermissionError(32, "файл занят другим процессом")
+        настоящий_replace(откуда, куда)
+
+    monkeypatch.setattr(daemon_module.os, "replace", капризный_replace)
+
+    daemon_module._записать_pid_файл(pid_файл, 4242, пауза=0.001)
+
+    assert pid_файл.read_text(encoding="utf-8") == "4242"
+    assert осталось_отказов[0] == 0
