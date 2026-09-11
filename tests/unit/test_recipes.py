@@ -500,6 +500,7 @@ async def токен_инн(служба: ToolService, инн: str) -> str:
         entity="Catalog_Контрагенты",
         resolve=без_навигаций,
         hidden=ничего_не_скрыто,
+        revealed=None,
     )
     return результат.data["ИНН"]
 

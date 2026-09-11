@@ -162,6 +162,7 @@ class BaseGate:
         entity: str,
         resolve: Resolve,
         hidden: Callable[[str], bool],
+        revealed: RevealedValues | None,
         strict: bool = False,
     ) -> MaskResult:
         """`resolve` — резолвер «сущность и ключ ответа → сущность вложенного объекта» (итоговое
@@ -175,8 +176,17 @@ class BaseGate:
         без спроса (табличные части). Аргумент обязателен по той же причине, что `resolve` и
         `revealed`: запрет наследуется на дочерние объекты (Ruling 30), а знает об этом только
         `ToolService`, у которого есть индекс, — умолчание `self.is_hidden` молча вернуло бы
-        неполный запрет, и ошибку никто бы не заметил."""
-        return self._masker.mask(data, entity=entity, resolve=resolve, hidden=hidden, strict=strict)
+        неполный запрет, и ошибку никто бы не заметил.
+
+        `revealed` — набор раскрытого в этом вызове (находка П2 приёмки через настоящие
+        инструменты, 2026-09-12): ранний проход (`scrubber`) уже подменил раскрытые значения в
+        сыром теле токенами, и без набора маскировщик выдаёт полю с классом токен по чужому
+        токену — одна запись с отбором и без него приходит разными токенами. Аргумент обязателен
+        по той же причине, что `resolve` и `hidden`: пропуск не падает, а тихо ломает инвариант 5.
+        `None` — только у вызова, который заведомо ничего не раскрывал."""
+        return self._masker.mask(
+            data, entity=entity, resolve=resolve, hidden=hidden, strict=strict, revealed=revealed
+        )
 
     def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:
         """Обратная замена раскрытого по СЫРОМУ тексту от 1С — до всех преобразований

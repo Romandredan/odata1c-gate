@@ -1108,6 +1108,7 @@ class ToolService:
             entity=описание.name,
             resolve=self._навигации(репозиторий),
             hidden=self._скрытые(репозиторий, гейт).__contains__,
+            revealed=раскрытое,
         )
         усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
 
@@ -1166,6 +1167,7 @@ class ToolService:
                 entity=описание.name,
                 resolve=self._навигации(репозиторий),
                 hidden=self._скрытые(репозиторий, гейт).__contains__,
+                revealed=раскрытое,
             )
             усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
 
@@ -1693,6 +1695,7 @@ class ToolService:
                 entity=цель.entity,
                 resolve=self._навигации(репозиторий),
                 hidden=self._скрытые(репозиторий, гейт).__contains__,
+                revealed=раскрытое,
                 strict=not цель.resolved,
             )
             усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
