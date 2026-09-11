@@ -1,3 +1,165 @@
-# Рецепты для типовой конфигурации УТ. Наполняются планом M1d вместе с тулом odata1c_recipe.
+# Рецепты для типовой конфигурации «Управление торговлей 11» (SPEC §8).
+#
+# Имена регистров, виртуальных таблиц и полей сверены с полным описанием метаданных реальной
+# базы УТ (проба P4, tests/fixtures/edmx/probe.full.edmx) — не с документацией и не по памяти.
+# Состав полей у доработанной конфигурации может отличаться: рецепт, сущности которого в базе нет,
+# odata1c_recipe помечает `applicable: false`, и его достаточно поправить в своём
+# bases/<база>/recipes.yaml — файл пользователя обновлением пакета не затирается.
+#
+# Подстановка `{имя}` ставится ТОЛЬКО в позиции литерала и без кавычек: значение подставляется уже
+# готовым литералом по типу параметра. Условия перечисляются списком и склеиваются через `and`;
+# условие с незаданным необязательным параметром из запроса исчезает целиком.
+#
+# `virtual.Condition` — отбор ВНУТРИ виртуальной таблицы, то есть по измерениям регистра до
+# расчёта итога (по пробе P4 он сокращает расчёт оборотов с 3,5 с до 0,5 с). `filter` — отбор по
+# уже рассчитанному результату, и только там имеет смысл сравнивать ресурсы (`…Balance`,
+# `…Turnover`): до расчёта таких полей ещё не существует.
 version: 1
-recipes: {}
+recipes:
+  stock:
+    title: Остатки товаров на складах
+    description: >-
+      Количество в наличии и зарезервированное к отгрузке на указанный момент.
+      Номенклатура, характеристика, серия и склад — ссылки (Ref_Key соответствующих справочников).
+    entity: AccumulationRegister_ТоварыНаСкладах_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      warehouse: { type: guid, required: false, description: Ref_Key склада }
+      product: { type: guid, required: false, description: Ref_Key номенклатуры }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Склад_Key eq {warehouse}
+        - Номенклатура_Key eq {product}
+    select:
+      - Склад_Key
+      - Номенклатура_Key
+      - Характеристика_Key
+      - Серия_Key
+      - ВНаличииBalance
+      - КОтгрузкеBalance
+    filter: ВНаличииBalance gt 0
+    top: 200
+
+  debtors:
+    title: Дебиторская задолженность клиентов
+    description: >-
+      Долг клиентов по расчётным документам на указанный момент: положительный ДолгBalance.
+      Партнёр приходит ключом аналитики учёта (АналитикаУчетаПоПартнерам_Key) — сам партнёр
+      и контрагент раскрываются справочником РегистрыСведений/АналитикаУчетаПоПартнерам.
+    entity: AccumulationRegister_РасчетыСКлиентамиПоДокументам_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      partner_analytics:
+        type: guid
+        required: false
+        description: Ref_Key аналитики учёта по партнёрам
+    virtual:
+      Period: "{period}"
+      Condition:
+        - АналитикаУчетаПоПартнерам_Key eq {partner_analytics}
+    select:
+      - АналитикаУчетаПоПартнерам_Key
+      - Валюта_Key
+      - ЗаказКлиента_Key
+      - РасчетныйДокумент
+      - РасчетныйДокумент_Type
+      - ДолгBalance
+      - ПредоплатаBalance
+    filter: ДолгBalance gt 0
+    top: 200
+
+  payables:
+    title: Кредиторская задолженность поставщикам
+    description: >-
+      Долг перед поставщиками на указанный момент: СуммаBalance больше нуля. Партнёр — ключом
+      аналитики учёта по партнёрам, объект расчётов — заказ или договор.
+    entity: AccumulationRegister_РасчетыСПоставщиками_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      partner_analytics:
+        type: guid
+        required: false
+        description: Ref_Key аналитики учёта по партнёрам
+    virtual:
+      Period: "{period}"
+      Condition:
+        - АналитикаУчетаПоПартнерам_Key eq {partner_analytics}
+    select:
+      - АналитикаУчетаПоПартнерам_Key
+      - ОбъектРасчетов_Key
+      - Валюта_Key
+      - СуммаBalance
+      - КОплатеBalance
+      - КПоступлениюBalance
+    filter: СуммаBalance gt 0
+    top: 200
+
+  sales:
+    title: Продажи за период
+    description: >-
+      Обороты выручки и себестоимости по номенклатуре за интервал. Номенклатура приходит ключом
+      аналитики учёта (АналитикаУчетаНоменклатуры_Key), партнёр — ключом аналитики по партнёрам.
+    entity: AccumulationRegister_ВыручкаИСебестоимостьПродаж_Turnovers
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      manager: { type: guid, required: false, description: Ref_Key менеджера }
+      partner_analytics:
+        type: guid
+        required: false
+        description: Ref_Key аналитики учёта по партнёрам
+    virtual:
+      StartPeriod: "{start}"
+      EndPeriod: "{end}"
+      Condition:
+        - Менеджер_Key eq {manager}
+        - АналитикаУчетаПоПартнерам_Key eq {partner_analytics}
+    select:
+      - АналитикаУчетаНоменклатуры_Key
+      - АналитикаУчетаПоПартнерам_Key
+      - Менеджер_Key
+      - Подразделение_Key
+      - КоличествоTurnover
+      - СуммаВыручкиTurnover
+      - СуммаВыручкиБезНДСTurnover
+      - СтоимостьTurnover
+    top: 200
+
+  money_bank:
+    title: Безналичные денежные средства
+    description: Остатки на банковских счетах организаций на указанный момент.
+    entity: AccumulationRegister_ДенежныеСредстваБезналичные_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    select:
+      - Организация_Key
+      - БанковскийСчет_Key
+      - СуммаBalance
+      - КЗачислениюBalance
+      - КСписаниюBalance
+    filter: СуммаBalance ne 0
+    top: 200
+
+  money_cash:
+    title: Наличные денежные средства
+    description: Остатки по кассам организаций на указанный момент.
+    entity: AccumulationRegister_ДенежныеСредстваНаличные_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    select:
+      - Организация_Key
+      - Касса_Key
+      - СуммаBalance
+    filter: СуммаBalance ne 0
+    top: 200

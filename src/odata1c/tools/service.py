@@ -41,6 +41,8 @@ from odata1c.index.repository import (
     IndexCorruptError,
     IndexRepository,
 )
+from odata1c.recipes.model import Recipe, RecipeBook, RecipeError, load_recipes, recipes_path
+from odata1c.recipes.render import render as render_recipe
 from odata1c.registry.registry import Registry, SessionScope
 from odata1c.tools import describe as describe_tool
 from odata1c.tools import info as info_topics
@@ -165,6 +167,33 @@ def _как_список(значение: list[str] | str | None) -> list[str]:
         return []
     сырые = значение.split(",") if isinstance(значение, str) else list(значение)
     return [элемент.strip() for элемент in сырые if элемент and элемент.strip()]
+
+
+def _рецепты_markdown(конверт: dict) -> str:
+    """Читаемый вид перечня рецептов для ресурса `odata1c://recipes/{base}`."""
+    строки = [f"# Рецепты базы {конверт['base']} ({конверт['role']}, гейт {конверт['gate']})", ""]
+    if конверт.get("hint"):
+        строки += [конверт["hint"], ""]
+    for рецепт in конверт["recipes"]:
+        заголовок = рецепт["title"] or рецепт["name"]
+        строки.append(f"## {рецепт['name']} — {заголовок}")
+        if рецепт["description"]:
+            строки.append(рецепт["description"])
+        строки.append(f"Сущность: `{рецепт['entity']}`")
+        if not рецепт["applicable"]:
+            строки.append(f"**Неприменим к этой базе**: {рецепт.get('hint', '')}")
+        if рецепт["params"]:
+            строки.append("")
+            строки.append("| Параметр | Тип | Обязателен | Описание |")
+            строки.append("|---|---|---|---|")
+            for параметр in рецепт["params"]:
+                обязателен = "да" if параметр["required"] else "нет"
+                строки.append(
+                    f"| {параметр['name']} | {параметр['type']} | {обязателен} | "
+                    f"{параметр['description']} |"
+                )
+        строки.append("")
+    return "\n".join(строки)
 
 
 class ToolService:
@@ -304,6 +333,7 @@ class ToolService:
             QueryError,
             IndexCorruptError,
             PolicyError,
+            RecipeError,
             _ServiceError,
         ) as ошибка:
             return self._safe_error(гейт, ошибка.code, str(ошибка), getattr(ошибка, "hint", ""))
@@ -745,6 +775,179 @@ class ToolService:
             return fit_result(конверт, self._config.daemon.limits.result_chars)
 
         return await self._run(scope, base, тело)
+
+    # -- рецепты (SPEC §8, план M1d задача 8) ----------------------------------------------
+
+    async def recipe(
+        self,
+        scope: SessionScope,
+        *,
+        base: str | None = None,
+        name: str | None = None,
+        params: dict | None = None,
+    ) -> str:
+        """Рецепт базы: без `name` — список рецептов с параметрами, с `name` — выполнить (SPEC §8).
+
+        Рецепт — данные из `recipes.yaml`, а не код: из него берутся имя сущности, набор полей и
+        текст условий, значения параметров попадают в запрос только литералами (`render`). Поэтому
+        путь выполнения ничем не отличается от `query`: та же проверка сущности по индексу, тот же
+        запрет сортировки по защищаемому полю, та же выборка и тот же конвейер ответа.
+
+        Значения параметров приходят от модели и могут быть токенами гейта — каждое проходит
+        `inbound_value` ДО рендеринга, с именем поля, с которым параметр сравнивается в условии
+        (`Recipe.param_field`): от класса этого поля зависят и проверка типа токена, и контрольная
+        сумма открытого значения. Раскрытые значения наружу не возвращаются: в конверт ответа
+        попадают только имя рецепта и заголовок, но не то, с чем он был вызван.
+        """
+
+        async def тело(base_config, гейт, репозиторий):
+            книга = self._книга_рецептов(base_config)
+            if not name:
+                return self._список_рецептов(base_config, гейт, репозиторий, книга)
+
+            рецепт = книга.recipes.get(name) if книга is not None else None
+            if рецепт is None:
+                raise RecipeError(
+                    "recipe_unknown",
+                    f"рецепт «{name}» у базы «{base_config.name}» не описан",
+                    self._подсказка_рецептов(книга),
+                )
+
+            описание = self._resolve_entity(репозиторий, гейт, рецепт.entity)
+            self._проверить_сортировку(репозиторий, гейт, описание, рецепт.orderby)
+            значения = self._значения_рецепта(гейт, рецепт, описание.name, params)
+            аргументы = render_recipe(рецепт, значения)
+
+            return await self._выборка(
+                base_config,
+                гейт,
+                репозиторий,
+                описание,
+                filter=аргументы.filter,
+                select=аргументы.select,
+                orderby=аргументы.orderby,
+                top=аргументы.top,
+                params=аргументы.params,
+                extra={"recipe": name, "title": рецепт.title},
+            )
+
+        return await self._run(scope, base, тело)
+
+    def _книга_рецептов(self, base: BaseConfig) -> RecipeBook | None:
+        """Рецепты базы; `None` — файла нет вовсе (это не ошибка: рецепты необязательны).
+
+        Файл читается на каждый вызов, без кэша по mtime: он маленький, вызовы редки, а правка
+        рецепта должна действовать сразу, без перезапуска демона.
+        """
+        путь = recipes_path(self._config.home, base)
+        if not путь.exists():
+            return None
+        return load_recipes(путь)
+
+    def _значения_рецепта(
+        self, gate: BaseGate, recipe: Recipe, entity: str, params: dict | None
+    ) -> dict:
+        """Значения параметров рецепта после обратной подмены (токен → реальное значение).
+
+        Незаявленные имена проходят сюда нетронутыми — о них отказывает `render` кодом
+        `recipe_param`; раскрывать токен для параметра, которого у рецепта нет, незачем, и отказ
+        `token_unknown` вместо `recipe_param` только запутал бы вызывающего.
+        """
+        if params is None:
+            return {}
+        if not isinstance(params, dict):
+            raise RecipeError(
+                "recipe_param", "params рецепта должен быть словарём «параметр: значение»"
+            )
+        готовые = {}
+        for сырое_имя, значение in params.items():
+            имя = str(сырое_имя)
+            if isinstance(значение, str) and имя in recipe.params:
+                значение = gate.inbound_value(
+                    значение, entity=entity, field=recipe.param_field(имя)
+                )
+            готовые[имя] = значение
+        return готовые
+
+    def _список_рецептов(
+        self,
+        base: BaseConfig,
+        gate: BaseGate,
+        repo: IndexRepository,
+        book: RecipeBook | None,
+    ) -> dict:
+        """Перечень рецептов базы с параметрами и пометкой применимости (SPEC §8): сущность
+        рецепта может отсутствовать в базе (шаблон УТ на базе БП) или быть скрыта политикой —
+        такой рецепт помечается `applicable: false` с подсказкой, а не молча остаётся в списке
+        наравне с рабочими."""
+        конверт: dict = {
+            "base": base.name,
+            "role": base.role,
+            "gate": gate.mode,
+            "recipes": [],
+        }
+        if book is None:
+            конверт["hint"] = (
+                f"у базы «{base.name}» нет файла рецептов "
+                f"({recipes_path(self._config.home, base)}); шаблон копируется командой "
+                "odata1c base add --recipes ut|bp|zup"
+            )
+            return конверт
+
+        for имя, рецепт in book.recipes.items():
+            строка: dict = {
+                "name": имя,
+                "title": рецепт.title,
+                "description": рецепт.description,
+                "entity": рецепт.entity,
+                "params": [
+                    {
+                        "name": имя_параметра,
+                        "type": параметр.type,
+                        "required": параметр.required,
+                        "description": параметр.description,
+                    }
+                    for имя_параметра, параметр in рецепт.params.items()
+                ],
+                "applicable": True,
+            }
+            if gate.is_hidden(рецепт.entity):
+                строка["applicable"] = False
+                строка["hint"] = f"сущность {рецепт.entity} скрыта политикой гейта"
+            elif repo.describe(рецепт.entity) is None:
+                строка["applicable"] = False
+                строка["hint"] = self._entity_hint(repo, gate, рецепт.entity)
+            конверт["recipes"].append(строка)
+        if not конверт["recipes"]:
+            конверт["hint"] = "файл рецептов базы пуст"
+        return конверт
+
+    @staticmethod
+    def _подсказка_рецептов(book: RecipeBook | None) -> str:
+        if book is None:
+            return "у базы нет файла рецептов: odata1c base add --recipes ut|bp|zup"
+        имена = ", ".join(book.recipes) or "ни одного"
+        return f"рецепты базы: {имена}"
+
+    async def resource_recipes(self, scope: SessionScope, base: str) -> str:
+        """Ресурс `odata1c://recipes/{base}` — список рецептов базы в читаемом виде (SPEC §8).
+
+        Тот же перечень, что и `odata1c_recipe` без имени, только markdown: ресурс читают, а не
+        разбирают. Через страж (`finish_text`), как и политика: заголовки и описания пишет
+        человек, и вписать туда он может что угодно.
+        """
+
+        async def тело(base_config, гейт, репозиторий):
+            return self._список_рецептов(
+                base_config, гейт, репозиторий, self._книга_рецептов(base_config)
+            )
+
+        return await self._run(
+            scope,
+            base,
+            тело,
+            finisher=lambda гейт, конверт: гейт.finish_text(_рецепты_markdown(конверт)),
+        )
 
     # -- реиндекс, справочник, аварийный GET, ресурсы (план M1d, задача 7) ------------------
 

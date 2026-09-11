@@ -31,6 +31,7 @@ from odata1c.tools.service import ToolService
     "odata1c_get",
     "odata1c_info",
     "odata1c_raw_get",
+    "odata1c_recipe",
 }
 
 
@@ -154,7 +155,11 @@ async def test_ресурсы_и_шаблоны_объявлены(сервер)
         справочник = await сессия.read_resource("odata1c://cheatsheet")
 
     assert "odata1c://cheatsheet" in ресурсы
-    assert {"odata1c://policy/{base}", "odata1c://index/{base}"} <= шаблоны
+    assert {
+        "odata1c://policy/{base}",
+        "odata1c://index/{base}",
+        "odata1c://recipes/{base}",
+    } <= шаблоны
     assert "[[" in справочник.contents[0].text
 
 

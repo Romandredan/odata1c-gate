@@ -99,9 +99,9 @@ def scope_from_headers(headers: Mapping[str, str] | None) -> SessionScope:
 def build_server(service: ToolService, limits: Limits) -> MCPServer:
     """Собрать `MCPServer` поверх готового `ToolService`: тулы чтения (`odata1c_bases`,
     `odata1c_find_entity`, `odata1c_describe_entity`, `odata1c_query`, `odata1c_get`,
-    `odata1c_info`, `odata1c_reindex`, `odata1c_raw_get`), ресурсы (`odata1c://cheatsheet`,
-    `odata1c://policy/{base}`, `odata1c://index/{base}`) и промпт `explore`. Тулы записи и
-    `odata1c_recipe` — следующие задачи.
+    `odata1c_info`, `odata1c_reindex`, `odata1c_raw_get`, `odata1c_recipe`), ресурсы
+    (`odata1c://cheatsheet`, `odata1c://policy/{base}`, `odata1c://index/{base}`,
+    `odata1c://recipes/{base}`) и промпт `explore`. Тулы записи — этап M2.
 
     Каждый тул — тонкая обёртка: разобрать область видимости из `ctx.headers`, передать аргументы
     методу `ToolService`, вернуть его результат как есть. Методы сервиса сами не бросают исключений
@@ -289,6 +289,27 @@ def build_server(service: ToolService, limits: Limits) -> MCPServer:
             scope_from_headers(ctx.headers), base=base, path=path, query=query
         )
 
+    @server.tool(
+        name="odata1c_recipe",
+        description=(
+            "Готовые запросы базы (остатки, задолженность, продажи за период): без name — "
+            "список рецептов с параметрами, с name — выполнить. Вызывайте до того, как "
+            "собирать такую выборку вручную через query."
+        ),
+        annotations=аннотации,
+        meta=мета,
+        structured_output=False,
+    )
+    async def odata1c_recipe(
+        ctx: Context,
+        base: str | None = None,
+        name: str | None = None,
+        params: dict | None = None,
+    ) -> str:
+        return await service.recipe(
+            scope_from_headers(ctx.headers), base=base, name=name, params=params
+        )
+
     # -- ресурсы и промпт (SPEC §5) -----------------------------------------------------------
     # Ресурс — то, что модель или клиент читает по своему решению, без вызова тула: справочник
     # целиком, политика гейта базы, сводка индекса. Лаунчер (`launcher.build_proxy`) проксирует
@@ -323,6 +344,18 @@ def build_server(service: ToolService, limits: Limits) -> MCPServer:
     )
     async def index_resource(ctx: Context, base: str) -> str:
         return await service.resource_index(scope_from_headers(ctx.headers), base)
+
+    @server.resource(
+        "odata1c://recipes/{base}",
+        name="Рецепты базы",
+        description=(
+            "Готовые именованные запросы базы: что делает рецепт, к какой сущности обращается "
+            "и какие принимает параметры."
+        ),
+        mime_type="text/markdown",
+    )
+    async def recipes_resource(ctx: Context, base: str) -> str:
+        return await service.resource_recipes(scope_from_headers(ctx.headers), base)
 
     @server.prompt(
         name="explore",
