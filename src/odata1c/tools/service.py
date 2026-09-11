@@ -30,9 +30,11 @@ from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.policy import PolicyError
-from odata1c.gate.service import open_dictionary, policy_path
+from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
 from odata1c.gate.unmasking import GateError
+from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path
+from odata1c.index.reindex import reindex as rebuild_index
 from odata1c.index.repository import (
     EntityDescription,
     FoundEntity,
@@ -41,6 +43,7 @@ from odata1c.index.repository import (
 )
 from odata1c.registry.registry import Registry, SessionScope
 from odata1c.tools import describe as describe_tool
+from odata1c.tools import info as info_topics
 from odata1c.tools.odata_query import QueryError, build_get, build_query, orderby_fields
 from odata1c.tools.response import fit_result, items_of, page_info, strip_service, truncate_strings
 
@@ -87,6 +90,71 @@ class _ServiceError(Exception):
         self.code = code
         self.message = message
         self.hint = hint
+
+
+# Сколько строк разницы реиндекса показывать модели по каждому списку (бриф задачи 7): полный
+# список на боевой базе — тысячи имён, и он вытеснит из ответа всё остальное. Полное число
+# отдаётся рядом отдельным полем `*_total`.
+_ПРЕДЕЛ_РАЗНИЦЫ = 50
+
+# Символы, при которых путь `raw_get` отклоняется целиком (SPEC §9, проба P4 — и сверх неё):
+# `?` и `#` обрезали бы путь, отправив остаток в query или во фрагмент; `\` публикация за IIS
+# молча заменяет на `/`, то есть меняет адрес; `%` запрещён не из-за 1С, а из-за нас самих —
+# процентная запись позволила бы записать `..` как `%2e%2e` и пройти проверку на выход за
+# пределы публикации, а кодирует путь всё равно сам клиент (`client1c._экранировать_путь`),
+# так что писать её руками и незачем.
+_ЗАПРЕЩЕНО_В_ПУТИ = ("?", "#", "\\", "%")
+
+
+def _проверить_путь(path: str) -> str:
+    """Путь `raw_get` — ОТНОСИТЕЛЬНЫЙ путь внутри `standard.odata/` базы, и ничего сверх того.
+
+    Отклоняются: пустой путь, абсолютный адрес (`http://…`, `//host/…`), ведущий `/`, сегменты
+    `.` и `..` (выход за пределы публикации увёл бы запрос на произвольный адрес того же сервера,
+    где ни гейт, ни разрешения базы уже ничего не значат), `$metadata` (десятки мегабайт мимо
+    индекса — для него есть `reindex`) и символы `_ЗАПРЕЩЕНО_В_ПУТИ`.
+    """
+    путь = (path or "").strip()
+    if not путь:
+        raise _ServiceError("params_invalid", "путь не указан")
+    if "://" in путь or путь.startswith("//"):
+        raise _ServiceError(
+            "params_invalid",
+            "путь должен быть относительным, без адреса сервера",
+            "адрес базы шлюз подставляет сам: путь начинается с имени сущности",
+        )
+    if путь.startswith("/"):
+        raise _ServiceError("params_invalid", "путь не должен начинаться с «/»: он относительный")
+    for символ in _ЗАПРЕЩЕНО_В_ПУТИ:
+        if символ in путь:
+            raise _ServiceError(
+                "params_invalid",
+                f"путь не должен содержать «{символ}»",
+                "параметры запроса передавайте аргументом query, кодировать путь не нужно",
+            )
+    if any(ord(символ) < 0x20 or ord(символ) == 0x7F for символ in путь):
+        raise _ServiceError("params_invalid", "путь содержит управляющие символы")
+    сегменты = путь.split("/")
+    if any(сегмент in ("..", ".") for сегмент in сегменты):
+        raise _ServiceError(
+            "params_invalid",
+            "путь не должен выходить за пределы публикации OData базы",
+            "уберите сегменты «..» и «.»",
+        )
+    if сегменты[0].split("(")[0] == "$metadata":
+        raise _ServiceError(
+            "params_invalid",
+            "$metadata через raw_get не отдаётся",
+            "описание метаданных читает индекс: odata1c_reindex, затем find_entity/describe_entity",
+        )
+    return путь
+
+
+def _целое_или_ноль(значение: str | None) -> int:
+    try:
+        return max(int(значение), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _как_список(значение: list[str] | str | None) -> list[str]:
@@ -150,17 +218,47 @@ class ToolService:
             _log.exception("gate.error упал при обработке ошибки тула — отдан отказ без данных")
             return _ОТКАЗ_НА_КРАЙНИЙ_СЛУЧАЙ
 
+    def note_error(self, base: str, message: str) -> None:
+        """Запомнить последнюю ошибку базы в реестре — её показывает `odata1c base list` и
+        диагностика демона. Нужна фоновой проверке `$metadata` (SPEC §4.3, задача 7): она
+        вызывает `reindex` мимо MCP, и её отказы иначе не видно нигде, кроме журнала.
+
+        Имя базы, которой нет в реестре, здесь не ошибка и не повод падать: реестр собран из
+        того же `bases.yaml`, что и вызывающий цикл, а конкурентная перечитка настроек — не
+        причина ронять фоновую задачу.
+        """
+        try:
+            self._registry.set_error(base, message)
+        except ConfigError:
+            _log.warning("ошибка базы %s не записана в реестр: база в реестре не значится", base)
+
     def _guard_error(self, code: str, message: str, hint: str = "") -> str:
         """Ошибка тула БЕЗ гейта конкретной базы: либо база ещё не определена, либо гейт этой
         базы не удалось построить (см. `_run`) — в обоих случаях `gate.error`/`_safe_error`
         вызвать нечем, страж живёт на сервисе независимо от гейта (SPEC §6.8)."""
         return guard_only(self._guard, {"error": {"code": code, "message": message, "hint": hint}})
 
-    async def _run(self, scope: SessionScope, base: str | None, body, *, finisher=None) -> str:
+    async def _run(
+        self,
+        scope: SessionScope,
+        base: str | None,
+        body,
+        *,
+        finisher=None,
+        with_index: bool = True,
+    ) -> str:
         """Общая точка входа тулов на одну базу: разрешить базу → получить/обновить гейт →
         открыть индекс на время вызова → выполнить `body(base_config, gate, repo)` → отдать
         результат через `finisher` (по умолчанию `gate.finish`). Любое ожидаемое исключение —
-        код ошибки тула через гейт; неожиданное — `internal` без текста исключения."""
+        код ошибки тула через гейт; неожиданное — `internal` без текста исключения.
+
+        `with_index=False` — не открывать индекс вовсе, `body` получает `None` третьим аргументом
+        (план M1d, задача 7). Нужно двум тулам, и по разным причинам. `reindex` на Windows иначе
+        не работал бы вообще: `index/reindex.py::_заменить` подменяет файл индекса через
+        `os.replace`, а открытый в этом же процессе файл Windows заменить не даёт. `info` и
+        `resource_policy` индекса не читают, а на непроиндексированной базе `_open_index` отказал
+        бы кодом `entity_unknown` — то есть реиндекс нельзя было бы вызвать ровно там, где он и
+        нужен."""
         итог = finisher or (lambda gate, result: gate.finish(result))
         try:
             base_config = self._registry.get(base, scope)
@@ -195,11 +293,13 @@ class ToolService:
         репозиторий: IndexRepository | None = None
         try:
             гейт.refresh()
-            репозиторий = self._open_index(base_config)
+            if with_index:
+                репозиторий = self._open_index(base_config)
             результат = await body(base_config, гейт, репозиторий)
             return итог(гейт, результат)
         except (
             OdataError,
+            EdmxError,
             GateError,
             QueryError,
             IndexCorruptError,
@@ -585,6 +685,311 @@ class ToolService:
             return fit_result(конверт, self._config.daemon.limits.result_chars)
 
         return await self._run(scope, base, тело)
+
+    # -- реиндекс, справочник, аварийный GET, ресурсы (план M1d, задача 7) ------------------
+
+    async def reindex(
+        self, scope: SessionScope, *, base: str | None = None, force: bool = False
+    ) -> str:
+        """Обновить индекс метаданных базы и вернуть разницу (SPEC §4.3).
+
+        При перестройке (`changed`) политика гейта пересобирается по новому индексу
+        (`refresh_policy` — раздел `auto`, ручные разделы не трогаются), гейт этой базы
+        перечитывает её ПРИНУДИТЕЛЬНО (`refresh(force=True)`: сверка mtime здесь неприменима —
+        файл переписан секунду назад этим же вызовом), страж пересобирает автомат по словарю,
+        а реестр запоминает момент индексации. Порядок обязателен: пока политика не перечитана,
+        маскировщик знает прежние классы полей, и новое защищаемое поле ушло бы модели открытым.
+        """
+
+        async def тело(base_config, гейт, _репозиторий):
+            клиент = self._client_for(base_config)
+            try:
+                результат = await rebuild_index(
+                    base_config,
+                    клиент,
+                    self._config.home,
+                    force=force,
+                    classifier=classifier_for(base_config),
+                )
+            except PermissionError as ошибка:
+                # Windows: готовый индекс подменяется через `os.replace`, а файл, открытый
+                # ЧИТАЮЩИМ вызовом другой сессии (`_run` держит его на время вызова), заменить
+                # нельзя — WinError 32. Несколько сессий на одной машине — условие продукта
+                # (AGENTS.md), так что это штатное совпадение, а не поломка: без этой ветки
+                # общий перехват `_run` отдал бы `internal` с текстом «подробности в журнале»,
+                # по которому вызывающий не поймёт, что нужно просто повторить вызов.
+                raise _ServiceError(
+                    "index_busy",
+                    f"индекс базы «{base_config.name}» занят другой сессией и не заменён",
+                    "повторите вызов через несколько секунд",
+                ) from ошибка
+
+            if результат.changed:
+                refresh_policy(self._config.home, base_config)
+                гейт.refresh(force=True)
+                self._guard.rebuild()
+                self._registry.set_indexed(
+                    base_config.name, результат.indexed_at, результат.entity_count
+                )
+
+            предупреждения = list(результат.warnings)
+            if результат.unresolved_entity_sets:
+                предупреждения.append(
+                    f"наборов с испорченной ссылкой на тип: "
+                    f"{len(результат.unresolved_entity_sets)} — признак повреждённого $metadata, "
+                    "а не удалённых объектов"
+                )
+            конверт = {
+                "base": base_config.name,
+                "role": base_config.role,
+                "gate": гейт.mode,
+                "changed": результат.changed,
+                "message": результат.message,
+                "entity_count": результат.entity_count,
+                "indexed_at": результат.indexed_at,
+                "warnings": предупреждения,
+            }
+            for ключ, значения in (
+                ("added_entities", результат.added_entities),
+                ("removed_entities", результат.removed_entities),
+                ("new_sensitive_fields", результат.new_sensitive_fields),
+            ):
+                конверт[ключ] = значения[:_ПРЕДЕЛ_РАЗНИЦЫ]
+                конверт[f"{ключ}_total"] = len(значения)
+            return конверт
+
+        return await self._run(scope, base, тело, with_index=False)
+
+    async def info(self, topic: str = "all") -> str:
+        """Справочник по OData 1С (SPEC §5): готовый текст темы из `tools/info.py`.
+
+        Единственный ответ тула, который НЕ проходит страж утечек, — и по той же причине, по
+        которой его не проходит `bases()` (см. комментарий там): страж на строжайшем уровне
+        портит текст, в котором нечего защищать. Здесь основание даже прямее, чем у `bases()`:
+        ответ целиком собран из констант модуля, ни один байт данных 1С в него попасть физически
+        не может — ни из ответа базы, ни из аргументов вызова (`topic` в успешный ответ не
+        входит). Обратное — прогон констант через страж — не добавляет защиты, но даёт цифровым
+        примерам справочника («2026-01-01», guid в примере ключа) шанс совпасть с чем-нибудь из
+        словаря и превратиться в токен посреди объяснения.
+
+        Ошибка (неизвестная тема) — наоборот, через страж (`_guard_error`): в ней повторяется
+        аргумент вызова, то есть текст, пришедший снаружи.
+        """
+        текст = info_topics.render(topic)
+        if текст is None:
+            return self._guard_error(
+                "params_invalid",
+                f"неизвестная тема справочника: {topic}",
+                "доступные темы: " + ", ".join(info_topics.TOPICS),
+            )
+        return текст
+
+    async def raw_get(
+        self,
+        scope: SessionScope,
+        *,
+        base: str | None = None,
+        path: str,
+        query: dict | None = None,
+    ) -> str:
+        """Аварийный GET произвольного пути внутри `standard.odata/` (SPEC §5) — для случаев,
+        когда `query`/`get` не выражают нужного обращения (нестандартная публикация, действие
+        только для чтения, свежая сущность, которой ещё нет в индексе).
+
+        «Сырой» здесь относится к ПУТИ, а не к ответу: ответ проходит ровно тот же конвейер, что
+        и у `query` — очистка служебных полей, маска гейта, усечение строк, подгонка под лимит,
+        страж (инвариант 1). Иначе тул был бы дырой в гейте, а не запасным входом.
+        """
+
+        async def тело(base_config, гейт, репозиторий):
+            очищенный = _проверить_путь(path)
+            цель = self._цель_пути(репозиторий, гейт, очищенный)
+            параметры = self._подготовить_параметры(репозиторий, гейт, query, цель)
+
+            клиент = self._client_for(base_config)
+            сырой = await клиент.get(очищенный, параметры or None)
+
+            список = isinstance(сырой.get("value"), list)
+            записи, всего = items_of(сырой)
+            записи = strip_service(
+                записи, keep_data_version="DataVersion" in параметры.get("$select", "")
+            )
+            маска = гейт.mask(записи, entity=цель)
+            усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
+
+            конверт = {
+                "path": очищенный,
+                "entity": цель,
+                "base": base_config.name,
+                "role": base_config.role,
+                "gate": гейт.mode,
+                "masked_fields": маска.masked_fields,
+                "warnings": маска.warnings,
+            }
+            if список:
+                смещение = _целое_или_ноль(параметры.get("$skip"))
+                конверт["count"] = len(усечённые)
+                конверт["total"] = всего
+                конверт["items"] = усечённые
+                return fit_result(конверт, self._config.daemon.limits.result_chars, skip=смещение)
+            конверт["item"] = усечённые[0] if усечённые else None
+            return fit_result(конверт, self._config.daemon.limits.result_chars)
+
+        return await self._run(scope, base, тело)
+
+    async def resource_policy(self, scope: SessionScope, base: str) -> str:
+        """Ресурс `odata1c://policy/{base}` — текст `policy.yaml` базы через страж.
+
+        В политике только имена сущностей и полей с классами защиты, самих значений там нет, —
+        поэтому её можно показать модели целиком: это и есть ответ на вопрос «почему это поле
+        пришло токеном, а это нет». Страж всё равно последним проходом по тексту (инвариант 1):
+        файл правит человек, и в комментарий к правилу он может вписать что угодно.
+
+        `base` обязателен и проверяется по области видимости сессии (`_run` → `Registry.get`):
+        сессия, суженная заголовком `X-Odata1c-Bases`, не должна читать политику чужой базы.
+        """
+
+        async def тело(base_config, _гейт, _репозиторий):
+            путь = policy_path(self._config.home, base_config.name)
+            if not путь.exists():
+                raise _ServiceError(
+                    "entity_unknown",
+                    f"политика базы «{base_config.name}» ещё не создана",
+                    "она собирается при первом реиндексе: odata1c_reindex(base)",
+                )
+            return путь.read_text(encoding="utf-8")
+
+        return await self._run(
+            scope,
+            base,
+            тело,
+            finisher=lambda гейт, текст: гейт.finish_text(текст),
+            with_index=False,
+        )
+
+    async def resource_index(self, scope: SessionScope, base: str) -> str:
+        """Ресурс `odata1c://index/{base}` — сводка индекса: когда построен, сколько сущностей
+        всего и по видам.
+
+        Как и `bases()`, НЕ проходит страж: в сводке только локальные данные — отметка времени
+        индексации и числа. Отметка времени — строка сплошных цифр, и страж на строжайшем уровне
+        ищет в таких сериях известные словарю числа (именно так `bases()` однажды превратил
+        цифры в подписи базы в токен чужого ИНН), а защищать в ней нечего.
+        """
+
+        async def тело(base_config, гейт, репозиторий):
+            число = репозиторий.meta("entity_count")
+            return {
+                "base": base_config.name,
+                "role": base_config.role,
+                "gate": гейт.mode,
+                "indexed_at": репозиторий.meta("indexed_at"),
+                "entity_count": int(число) if число is not None else None,
+                "kinds": репозиторий.kind_counts(),
+            }
+
+        return await self._run(
+            scope,
+            base,
+            тело,
+            finisher=lambda _гейт, конверт: json.dumps(конверт, ensure_ascii=False),
+        )
+
+    # -- разбор аргументов raw_get ----------------------------------------------------------
+
+    def _цель_пути(self, repo: IndexRepository, gate: BaseGate, path: str) -> str:
+        """Сущность, по классам полей которой маскируется ответ `raw_get`, и проверка скрытости.
+
+        Первый сегмент пути — не всегда та сущность, чьи записи вернутся: путь
+        `Catalog_Договоры(guid'…')/Владелец` отдаёт запись КОНТРАГЕНТА, и маска по классам
+        `Catalog_Договоры` на ней не сработает — `Description` контрагента не отнесён там к
+        классу `org`, то есть название организации ушло бы открытым (бриф задачи говорит про
+        первый сегмент; это расхождение записано в отчёт как решение). Поэтому сегменты пути
+        проходятся по навигациям индекса, и цель — последняя РАЗРЕШЁННАЯ сущность цепочки;
+        неизвестный сегмент (действие, нестандартная публикация, отсутствие в индексе)
+        останавливает разбор на последней известной — маскировать по ней безопаснее, чем по
+        никакой.
+
+        Скрытость (`entities.hide` политики) проверяется на КАЖДОМ звене цепочки: иначе
+        `raw_get` стал бы обходом запрета, который `query`/`get` соблюдают, — а скрытая сущность
+        скрыта и через навигацию тоже.
+        """
+        сегменты = [сегмент.split("(")[0] for сегмент in path.split("/") if сегмент]
+        цель = сегменты[0]
+        if gate.is_hidden(цель):
+            raise _ServiceError("entity_hidden", f"сущность «{цель}» скрыта политикой гейта")
+        текущая = repo.describe(цель)
+        for сегмент in сегменты[1:]:
+            if текущая is None:
+                break
+            следующая = текущая.navigations.get(сегмент)
+            if следующая is None:
+                break
+            if gate.is_hidden(следующая):
+                raise _ServiceError(
+                    "entity_hidden", f"сущность «{следующая}» скрыта политикой гейта"
+                )
+            цель, текущая = следующая, repo.describe(следующая)
+        return цель
+
+    def _подготовить_параметры(
+        self, repo: IndexRepository, gate: BaseGate, query: dict | None, entity: str
+    ) -> dict[str, str]:
+        """Параметры запроса `raw_get`: проверка, приведение к строкам, обратная подмена токенов.
+
+        Токен разворачивается в реальное значение только в `$filter` (`gate.inbound_filter`) —
+        там гейт знает синтаксис и разбирает выражение лексером. В остальных параметрах стоят
+        имена полей, а не значения, поэтому токен в них — либо ошибка модели, либо попытка
+        протащить значение мимо разбора; и то и другое отклоняется, а не подставляется вслепую.
+        """
+        if query is None:
+            return {}
+        if not isinstance(query, dict):
+            raise _ServiceError("params_invalid", "query должен быть словарём «параметр: значение»")
+
+        готовые: dict[str, str] = {}
+        for сырое_имя, значение in query.items():
+            имя = str(сырое_имя)
+            if имя == "$format":
+                raise _ServiceError(
+                    "params_invalid",
+                    "формат ответа задаёт сам шлюз",
+                    "уберите $format — ответ всегда разбирается как JSON",
+                )
+            if isinstance(значение, bool):
+                текст = "true" if значение else "false"
+            elif isinstance(значение, str | int | float):
+                текст = str(значение)
+            else:
+                raise _ServiceError(
+                    "params_invalid", f"значение параметра {имя} должно быть строкой или числом"
+                )
+            if имя == "$filter":
+                текст = gate.inbound_filter(текст, entity=entity)
+            elif "[[" in текст:
+                raise _ServiceError(
+                    "params_invalid",
+                    f"токен в параметре {имя} подставлен быть не может",
+                    "токены разворачиваются только в $filter; в остальных параметрах стоят имена "
+                    "полей",
+                )
+            готовые[имя] = текст
+
+        сортировка = готовые.get("$orderby")
+        if сортировка:
+            описание = repo.describe(entity)
+            for поле in orderby_fields(сортировка):
+                защищено = (
+                    self._поле_защищено_по_пути(repo, gate, описание, поле)
+                    if описание is not None
+                    else gate.is_protected(entity, поле.split("/")[-1])
+                )
+                if защищено:
+                    raise _ServiceError(
+                        "params_invalid",
+                        "сортировка по защищаемому полю недоступна: порядок раскрывает значения",
+                    )
+        return готовые
 
     @staticmethod
     def _уточнить_404(ошибка: OdataError) -> None:

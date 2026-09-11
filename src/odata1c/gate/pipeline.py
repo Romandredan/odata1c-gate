@@ -48,14 +48,21 @@ class BaseGate:
         self._unmasker: Unmasker | None = None
         self.refresh()
 
-    def refresh(self) -> None:
+    def refresh(self, *, force: bool = False) -> None:
         """Перечитать политику, если файл изменился с прошлого раза. Политику перезаписывает и
         реиндекс (раздел auto), и пользователь (fields) — демон живёт дольше одной версии файла.
         Сверка mtime дешевле разбора YAML на каждый вызов. Отсутствующий файл политики —
         не ошибка и не повод падать (`load_policy` отдаёт пустую `Policy`): демон поднимается
-        и без политики, с пустыми классами."""
+        и без политики, с пустыми классами.
+
+        `force=True` — перечитать безусловно (план M1d, задача 7): тот, кто ТОЛЬКО ЧТО сам
+        переписал политику (`ToolService.reindex` → `refresh_policy`), не может опираться на
+        mtime. Прежнее значение снято этим же гейтом секундой раньше, и если файловая система
+        отдала обеим отметкам одно значение (разрешение mtime на Windows — не наносекунды),
+        обычный `refresh()` счёл бы новую политику прежней и оставил бы маскировщик на старых
+        классах полей — то есть новое защищаемое поле ушло бы модели открытым."""
         mtime = self._policy_path.stat().st_mtime if self._policy_path.exists() else None
-        if mtime == self._mtime and self._masker is not None:
+        if not force and mtime == self._mtime and self._masker is not None:
             return
         policy = load_policy(self._policy_path)
         self._policy, self._mtime = policy, mtime

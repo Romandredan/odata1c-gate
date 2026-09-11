@@ -4,6 +4,7 @@
 """
 
 import json
+import sys
 
 import httpx
 import pytest
@@ -38,6 +39,7 @@ bases:
 """
 
 ИНН = "7707083893"
+ССЫЛКА = "a103cb54-42ee-11ec-a7a0-f10ab59a067e"
 
 
 def _дом(tmp_path, edmx_ut_real):
@@ -615,3 +617,484 @@ async def test_битая_политика_не_роняет_bases(дом):
         assert [б["name"] for б in данные["bases"]] == ["dev", "ut"]
     finally:
         await служба.aclose()
+
+
+# =============================================================================================
+# Задача 7 плана M1d: reindex, info, raw_get, ресурсы
+# =============================================================================================
+
+
+async def токен_названия(сервис: ToolService, название: str) -> str:
+    """Токен названия организации — через ту же маскировку ответа, что и `токен_инн` выше:
+    значение попадает в словарь, и с этого момента его знает и обратная подмена, и страж."""
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    результат = гейт.mask({"Description": название}, entity="Catalog_Контрагенты")
+    return результат.data["Description"]
+
+
+def _скрыть_сущность(дом, имя: str) -> None:
+    """Дописать `entities.<имя>.hide: true` в политику базы ut — ручной раздел, реиндекс его
+    не трогает."""
+    import yaml
+
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8")) or {}
+    политика.setdefault("entities", {})[имя] = {"hide": True}
+    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------------------------
+# reindex
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_reindex_перестраивает_индекс_и_возвращает_разницу(
+    сервис, respx_ut, edmx_synthetic, дом
+):
+    # В доме лежит индекс по урезанному реальному УТ; 1С отдаёт ДРУГОЕ описание метаданных —
+    # значит и контрольная сумма другая, и индекс обязан перестроиться.
+    from odata1c.index.schema import connect
+
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+    # Отметка индексации пишется с точностью до секунды, а тест укладывается в одну: состаряем
+    # прежнюю отметку явно, иначе сравнение «изменилась» ничего не проверяло бы.
+    прежний_момент = "2000-01-01T00:00:00+00:00"
+    соединение = connect(index_path(дом, "ut"))
+    with соединение:
+        соединение.execute("UPDATE meta SET value = ? WHERE key = 'indexed_at'", (прежний_момент,))
+    соединение.close()
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert данные["changed"] is True
+    assert данные["indexed_at"] != прежний_момент
+    assert "Catalog_Валюты" in данные["removed_entities"]
+    assert "Catalog_БанковскиеСчета" in данные["added_entities"]
+    assert данные["added_entities_total"] == len(данные["added_entities"]) == 3
+    assert данные["removed_entities_total"] == len(данные["removed_entities"]) > 0
+    assert данные["entity_count"] == 8
+
+    стало = IndexRepository(index_path(дом, "ut"))
+    try:
+        assert стало.meta("indexed_at") == данные["indexed_at"]
+        assert "Catalog_Валюты" not in стало.entity_names()
+    finally:
+        стало.close()
+
+
+async def test_reindex_разница_урезана_до_предела(сервис, respx_ut, edmx_synthetic, monkeypatch):
+    """Полный список разницы на боевой базе — тысячи имён: он вытеснил бы из ответа всё
+    остальное. Показываются первые `_ПРЕДЕЛ_РАЗНИЦЫ`, полное число — рядом."""
+    monkeypatch.setattr("odata1c.tools.service._ПРЕДЕЛ_РАЗНИЦЫ", 2)
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert len(данные["removed_entities"]) == 2
+    assert данные["removed_entities_total"] > 2
+
+
+async def test_reindex_без_изменений_не_трогает_индекс(сервис, respx_ut, edmx_ut_real):
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert данные["changed"] is False
+    assert "без изменений" in данные["message"]
+    assert данные["added_entities"] == [] and данные["added_entities_total"] == 0
+
+
+async def test_reindex_пересобирает_политику_и_гейт_её_видит(сервис, respx_ut, edmx_ut_real, дом):
+    """После перестройки индекса политика пересобрана И гейт её перечитал.
+
+    Пока гейт держит прежнюю политику, маскировщик знает прежние классы полей — то есть поле,
+    ставшее защищаемым при этом реиндексе, ушло бы модели открытым. Проверяется с пустого места:
+    политика удалена, гейт это увидел (поле не защищено), и только реиндекс возвращает защиту.
+    """
+    from odata1c.gate.service import policy_path
+
+    # Поле выбрано так, чтобы защита зависела ИМЕННО от политики: `ИНН` узнаёт запасной
+    # классификатор по имени поля даже с пустой политикой, а `Description` контрагента относит
+    # к классу `org` только раздел `auto`, собранный по индексу.
+    policy_path(дом, "ut").unlink()
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    гейт.refresh()
+    assert not гейт.is_protected("Catalog_Контрагенты", "Description")
+
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut", force=True))
+
+    assert данные["changed"] is True
+    assert policy_path(дом, "ut").exists()
+    assert гейт.is_protected("Catalog_Контрагенты", "Description")
+
+
+async def test_reindex_сохраняет_ручные_разделы_политики(сервис, respx_ut, edmx_ut_real, дом):
+    """Реиндекс перезаписывает только раздел `auto`; `entities.hide` — ручная настройка
+    владельца, и потерять её значит молча открыть модели то, что он закрыл."""
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    _скрыть_сущность(дом, "Catalog_Валюты")
+    гейт.refresh()
+    assert гейт.is_hidden("Catalog_Валюты")
+
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+    await сервис.reindex(SessionScope(), base="ut", force=True)
+
+    assert гейт.is_hidden("Catalog_Валюты")
+
+
+async def test_reindex_ошибка_1С_приходит_кодом_а_не_исключением(сервис, respx_ut):
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(
+            500, json={"odata.error": {"code": "1", "message": {"value": "нет доступа"}}}
+        )
+    )
+
+    ошибка = json.loads(await сервис.reindex(SessionScope(), base="ut"))["error"]
+
+    assert ошибка["code"] == "odata_error"
+
+
+async def test_reindex_негодное_описание_метаданных(сервис, respx_ut):
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=b"<edmx:Edmx><ne-zakryt>")
+    )
+
+    ошибка = json.loads(await сервис.reindex(SessionScope(), base="ut"))["error"]
+
+    assert ошибка["code"] == "odata_error"
+    assert "traceback" not in ошибка["message"].lower()
+
+
+async def test_reindex_на_непроиндексированной_базе(tmp_path, edmx_ut_real):
+    """Реиндекс обязан работать ровно там, где индекса ещё нет: `_run(with_index=False)`.
+
+    Общий `_run` открывает индекс до вызова тела и на базе без индекса отдаёт `entity_unknown` —
+    без отдельной ветки единственная команда, которая индекс создаёт, была бы недоступна.
+    """
+    from odata1c.config.loader import load_config
+
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES_YAML, encoding="utf-8")
+    служба = ToolService(load_config(home))
+    try:
+        with respx.mock(base_url=URL_UT, assert_all_called=False) as router:
+            router.get(URL_UT).mock(return_value=httpx.Response(200, json={"value": []}))
+            router.get(f"{URL_UT}$metadata").mock(
+                return_value=httpx.Response(200, content=edmx_ut_real)
+            )
+            данные = json.loads(await служба.reindex(SessionScope(), base="ut"))
+    finally:
+        await служба.aclose()
+
+    assert данные["changed"] is True
+    assert index_path(home, "ut").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="заменить открытый файл не даёт только Windows (WinError 32)"
+)
+async def test_reindex_на_открытом_индексе_отвечает_index_busy(сервис, respx_ut, edmx_synthetic):
+    """Другая сессия читает индекс — `os.replace` на Windows не проходит.
+
+    Несколько сессий на одной машине — условие продукта, и без отдельного кода вызывающий
+    получил бы `internal` с текстом «подробности в журнале демона», по которому не понять, что
+    достаточно повторить вызов.
+    """
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+    читатель = IndexRepository(index_path(сервис._config.home, "ut"))
+    читатель.entity_names()  # соединение открывает файл лениво — заставляем открыть
+    try:
+        текст = await сервис.reindex(SessionScope(), base="ut")
+    finally:
+        читатель.close()
+
+    assert json.loads(текст)["error"]["code"] == "index_busy"
+
+
+# ---------------------------------------------------------------------------------------------
+# info
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_info_все_темы_объяснимого_объёма(сервис):
+    текст = await сервис.info("all")
+
+    assert "[[" in текст  # про токены сказано
+    assert len(текст) < 20_000  # справочник, а не пересказ спецификации
+    for тема in ("naming", "standard_fields", "registers", "keys", "filter", "tokens"):
+        assert await сервис.info(тема) in текст
+
+
+async def test_info_тема_записи_одной_строкой(сервис):
+    assert "M2" in await сервис.info("write_protocol")
+
+
+async def test_info_неизвестная_тема(сервис):
+    ошибка = json.loads(await сервис.info("что_нибудь"))["error"]
+
+    assert ошибка["code"] == "params_invalid"
+    assert "naming" in ошибка["hint"] and "all" in ошибка["hint"]
+
+
+async def test_info_не_проходит_страж(сервис):
+    """Справочник — единственный ответ тула мимо стража, и это должно быть ВИДНО.
+
+    Страж здесь заряжен на слово, которое буквально стоит в тексте справочника (пример
+    `substringof('Ромашка', Description)`): в любом другом ответе тула оно стало бы токеном.
+    Справочник обязан прийти байт в байт таким, как он записан константой, — иначе объяснение
+    превращается в мусор ради защиты того, что защищать не от чего.
+    """
+    from odata1c.tools import info as info_topics
+
+    assert "Ромашка" in info_topics.ALL
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    токен = await токен_названия(сервис, "Ромашка")
+    assert токен.startswith("[["), "название не попало в словарь — тест проверял бы пустоту"
+    assert "Ромашка" not in гейт.finish({"проба": "Ромашка"}), "страж не заряжен на это слово"
+
+    текст = await сервис.info("all")
+
+    assert текст == info_topics.ALL
+    assert "Ромашка" in текст
+
+
+# ---------------------------------------------------------------------------------------------
+# raw_get
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "путь",
+    [
+        "../../../etc/passwd",
+        "%2e%2e/Catalog_Контрагенты",
+        "/Catalog_Контрагенты",
+        "http://чужой-сервер/odata/standard.odata/Catalog_Контрагенты",
+        "$metadata",
+        "Catalog_Контрагенты?$top=1",
+        "Catalog_Контрагенты\\..\\x",
+        "",
+    ],
+)
+async def test_raw_get_отклоняет_негодный_путь(сервис, respx_ut, путь):
+    # Маршрут на корень базы зарегистрирован фикстурой: не сработай проверка, запрос ушёл бы
+    # в 1С и тест увидел бы успешный ответ, а не params_invalid.
+    текст = await сервис.raw_get(SessionScope(), base="ut", path=путь)
+
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+
+
+async def test_raw_get_маскирует_ответ(сервис, respx_ut):
+    respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "odata.metadata": "…",
+                "value": [
+                    {
+                        "Ref_Key": "a103cb54-42ee-11ec-a7a0-f10ab59a067e",
+                        "Description": "ООО Ромашка",
+                        "ИНН": ИНН,
+                        "Контрагент@navigationLinkUrl": "x",
+                    }
+                ],
+            },
+        )
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path="Catalog_Контрагенты", query={"$top": 1}
+    )
+    данные = json.loads(текст)
+
+    assert ИНН not in текст and "Ромашка" not in текст
+    # Именно маскировщик, а не страж: `masked_fields` заполняет только `gate.mask`, а страж,
+    # поймай он значение сам, оставил бы в ответе `guard_replaced`. Без этих двух проверок тест
+    # остаётся зелёным даже при полностью выключенной маскировке (страж поймает ИНН последним
+    # проходом) — задокументированный в этом проекте способ проходить тест по чужой причине.
+    assert "ИНН" in данные["masked_fields"] and "Description" in данные["masked_fields"]
+    assert not any("guard_replaced" in п for п in данные["warnings"])
+    assert данные["entity"] == "Catalog_Контрагенты"
+    assert данные["count"] == 1
+    assert "@navigationLinkUrl" not in текст
+
+
+async def test_raw_get_ошибка_1С_проходит_гейт(сервис, respx_ut):
+    await токен_инн(сервис, ИНН)
+    respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "odata.error": {
+                    "code": "6",
+                    "message": {"lang": "ru", "value": f"Сегмент пути {ИНН} не найден!"},
+                }
+            },
+        )
+    )
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path="Catalog_Контрагенты")
+
+    assert ИНН not in текст
+    assert json.loads(текст)["error"]["code"] == "odata_error"
+
+
+async def test_raw_get_токен_в_фильтре_уходит_реальным_значением(сервис, respx_ut):
+    токен = await токен_инн(сервис, ИНН)
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+
+    await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path="Catalog_Контрагенты",
+        query={"$filter": f"ИНН eq '{токен}'"},
+    )
+
+    assert ИНН in маршрут.calls.last.request.url.params["$filter"]
+
+
+async def test_raw_get_токен_вне_фильтра_отклонён(сервис, respx_ut):
+    токен = await токен_инн(сервис, ИНН)
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path="Catalog_Контрагенты",
+        query={"$select": f"Ref_Key,{токен}"},
+    )
+
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+async def test_raw_get_сортировка_по_защищаемому_полю_запрещена(сервис, respx_ut):
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path="Catalog_Контрагенты", query={"$orderby": "ИНН desc"}
+    )
+
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+async def test_raw_get_скрытая_сущность_не_читается(сервис, respx_ut, дом):
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": [{"ИНН": ИНН}]})
+    )
+    _скрыть_сущность(дом, "Catalog_Контрагенты")
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path="Catalog_Контрагенты")
+
+    assert json.loads(текст)["error"]["code"] == "entity_hidden"
+    assert not маршрут.called
+
+
+async def test_raw_get_скрытая_сущность_не_читается_через_навигацию(сервис, respx_ut, дом):
+    """Запрет `entities.hide` обходится навигацией, если проверять только первый сегмент пути."""
+    маршрут = respx_ut.get(url__regex=r".*Document_.*").mock(
+        return_value=httpx.Response(200, json={"ИНН": ИНН})
+    )
+    _скрыть_сущность(дом, "Catalog_Контрагенты")
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path=f"Document_РеализацияТоваровУслуг(guid'{ССЫЛКА}')/Контрагент",
+    )
+
+    assert json.loads(текст)["error"]["code"] == "entity_hidden"
+    assert not маршрут.called
+
+
+async def test_raw_get_маскирует_по_сущности_навигации(сервис, respx_ut):
+    """Путь через навигацию отдаёт запись ЦЕЛИ, а не первого сегмента.
+
+    `Description` — то самое поле, на котором это видно: классом `org` его помечает раздел
+    `auto` политики по паре «сущность и поле», и для `Catalog_Контрагенты` такая пара есть, а
+    для `Document_РеализацияТоваровУслуг` — нет. Маскируй ответ классами первого сегмента —
+    название организации ушло бы открытым. `ИНН` для этой проверки не годится: его узнаёт
+    запасной классификатор по имени поля независимо от сущности.
+    """
+    respx_ut.get(url__regex=r".*Document_.*").mock(
+        return_value=httpx.Response(200, json={"Ref_Key": ССЫЛКА, "Description": "Ромашка"})
+    )
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path=f"Document_РеализацияТоваровУслуг(guid'{ССЫЛКА}')/Контрагент",
+    )
+    данные = json.loads(текст)
+
+    assert данные["entity"] == "Catalog_Контрагенты"
+    assert "Ромашка" not in текст
+    assert "Description" in данные["masked_fields"]
+    assert not any("guard_replaced" in п for п in данные["warnings"])
+    assert данные["item"]["Ref_Key"] == ССЫЛКА
+
+
+async def test_raw_get_неизвестная_база(сервис):
+    текст = await сервис.raw_get(SessionScope(), base="нет_такой", path="Catalog_Валюты")
+
+    assert json.loads(текст)["error"]["code"] == "base_unknown"
+
+
+# ---------------------------------------------------------------------------------------------
+# ресурсы
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_resource_policy_отдаёт_текст_политики(сервис):
+    текст = await сервис.resource_policy(SessionScope(), "ut")
+
+    assert "Catalog_Контрагенты.ИНН" in текст
+    assert "auto" in текст
+
+
+async def test_resource_policy_чужой_базы_не_видна_суженной_сессии(сервис):
+    текст = await сервис.resource_policy(SessionScope(bases=("dev",)), "ut")
+
+    assert json.loads(текст)["error"]["code"] == "base_unknown"
+
+
+async def test_resource_policy_без_политики(сервис, дом):
+    from odata1c.gate.service import policy_path
+
+    policy_path(дом, "ut").unlink()
+
+    ошибка = json.loads(await сервис.resource_policy(SessionScope(), "ut"))["error"]
+
+    assert "odata1c_reindex" in ошибка["hint"]
+
+
+async def test_resource_index_сводка(сервис):
+    данные = json.loads(await сервис.resource_index(SessionScope(), "ut"))
+
+    assert данные["base"] == "ut"
+    assert данные["indexed_at"]
+    assert данные["kinds"]["Справочник"] == 7
+    assert данные["entity_count"] == sum(данные["kinds"].values())
+
+
+async def test_resource_index_непроиндексированной_базы(сервис):
+    ошибка = json.loads(await сервис.resource_index(SessionScope(), "dev"))["error"]
+
+    assert ошибка["code"] == "entity_unknown"

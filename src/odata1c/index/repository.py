@@ -340,6 +340,24 @@ class IndexRepository:
             for строка in self._connection.execute("SELECT name FROM entities").fetchall()
         }
 
+    def kind_counts(self) -> dict[str, int]:
+        """Сколько сущностей каждого вида — сводка индекса для ресурса `odata1c://index/{base}`
+        (план M1d, задача 7). Вид — русское название (`справочник`, `документ`, …), чтобы
+        сводка читалась без обратного перевода префиксов имён; порядок — по убыванию числа,
+        при равенстве по имени вида, чтобы ответ не плясал между вызовами.
+
+        Табличные части, наборы записей регистров и виртуальные таблицы считаются наравне с
+        остальными: это тоже адресуемые сущности индекса, и `entity_count` в `meta` считает их
+        так же — расхождение суммы этой сводки с `entity_count` было бы непонятно читателю.
+        """
+        return {
+            строка["russian_kind"]: строка["число"]
+            for строка in self._connection.execute(
+                "SELECT russian_kind, COUNT(*) AS число FROM entities"
+                " GROUP BY russian_kind ORDER BY число DESC, russian_kind"
+            ).fetchall()
+        }
+
     def field_sensitivities(self) -> dict[tuple[str, str], str | None]:
         """(сущность, поле) → проставленный класс защиты (или None, если не проставлен).
 

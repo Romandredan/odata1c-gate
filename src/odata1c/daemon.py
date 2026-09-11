@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import pathlib
@@ -31,8 +32,9 @@ from mcp_types import ToolAnnotations
 
 from odata1c.config.home import check_file_permissions, ensure_home
 from odata1c.config.loader import load_config
-from odata1c.config.models import Limits
+from odata1c.config.models import AppConfig, Limits
 from odata1c.config.writer import ensure_gate_secret
+from odata1c.index.reindex import index_path
 from odata1c.registry.registry import SessionScope
 from odata1c.tools.service import ToolService
 
@@ -56,6 +58,9 @@ INSTRUCTIONS = """\
 3. `odata1c_describe_entity` — поля, ключи, навигация, классы гейта;
 4. `odata1c_query` с явным `select` — только нужные поля, постранично (`top`/`skip`), а не «всё
    сразу»; без `select` в ответ попадают все поля сущности.
+
+`odata1c_info(topic)` — чем OData 1С отличается от обычного: имена сущностей, стандартные поля,
+виртуальные таблицы регистров, ключи, отбор, токены. Читайте тему, а не гадайте.
 
 Токены `[[type:tail]]` непрозрачны: не выдумывайте и не достраивайте значение за токеном, не
 меняйте его написание. Используйте токен как есть — в `filter`, `key` и параметрах он подставится
@@ -92,9 +97,11 @@ def scope_from_headers(headers: Mapping[str, str] | None) -> SessionScope:
 
 
 def build_server(service: ToolService, limits: Limits) -> MCPServer:
-    """Собрать `MCPServer` с тулами чтения этой задачи (`odata1c_bases`, `odata1c_find_entity`,
-    `odata1c_describe_entity`, `odata1c_query`, `odata1c_get`) поверх готового `ToolService`.
-    Остальные тулы (запись, `reindex`, `recipe`, `info`, ресурсы, промпты) — задача 7.
+    """Собрать `MCPServer` поверх готового `ToolService`: тулы чтения (`odata1c_bases`,
+    `odata1c_find_entity`, `odata1c_describe_entity`, `odata1c_query`, `odata1c_get`,
+    `odata1c_info`, `odata1c_reindex`, `odata1c_raw_get`), ресурсы (`odata1c://cheatsheet`,
+    `odata1c://policy/{base}`, `odata1c://index/{base}`) и промпт `explore`. Тулы записи и
+    `odata1c_recipe` — следующие задачи.
 
     Каждый тул — тонкая обёртка: разобрать область видимости из `ctx.headers`, передать аргументы
     методу `ToolService`, вернуть его результат как есть. Методы сервиса сами не бросают исключений
@@ -230,7 +237,168 @@ def build_server(service: ToolService, limits: Limits) -> MCPServer:
             expand=expand,
         )
 
+    @server.tool(
+        name="odata1c_info",
+        description=(
+            "Справочник по OData 1С: имена сущностей, стандартные поля, регистры и виртуальные "
+            "таблицы, ключи, отбор, токены гейта. Темы: naming, standard_fields, registers, "
+            "keys, filter, tokens, write_protocol, recipes, all."
+        ),
+        annotations=аннотации,
+        meta=мета,
+        structured_output=False,
+    )
+    async def odata1c_info(topic: str = "all") -> str:
+        return await service.info(topic)
+
+    @server.tool(
+        name="odata1c_reindex",
+        description=(
+            "Обновить индекс метаданных базы по $metadata и вернуть разницу. Вызывайте, когда "
+            "1С отвечает «сущность не найдена» на объект, который точно есть, или после "
+            "обновления конфигурации."
+        ),
+        # Не read_only: тул перестраивает индекс базы и раздел auto её политики гейта. Данные в
+        # 1С он при этом не меняет (SPEC §4.3), поэтому повтор безопасен — idempotent.
+        annotations=ToolAnnotations(idempotent_hint=True),
+        meta=мета,
+        structured_output=False,
+    )
+    async def odata1c_reindex(ctx: Context, base: str | None = None, force: bool = False) -> str:
+        return await service.reindex(scope_from_headers(ctx.headers), base=base, force=force)
+
+    @server.tool(
+        name="odata1c_raw_get",
+        description=(
+            "Запасной GET по произвольному пути внутри публикации OData базы (например "
+            "Catalog_Контрагенты(guid'…')/Владелец); query — словарь параметров запроса "
+            "($filter, $select, $top). Ответ проходит гейт так же, как у query. Используйте, "
+            "только когда query и get не выражают нужного обращения."
+        ),
+        annotations=аннотации,
+        meta=мета,
+        structured_output=False,
+    )
+    async def odata1c_raw_get(
+        ctx: Context,
+        path: str,
+        base: str | None = None,
+        query: dict | None = None,
+    ) -> str:
+        return await service.raw_get(
+            scope_from_headers(ctx.headers), base=base, path=path, query=query
+        )
+
+    # -- ресурсы и промпт (SPEC §5) -----------------------------------------------------------
+    # Ресурс — то, что модель или клиент читает по своему решению, без вызова тула: справочник
+    # целиком, политика гейта базы, сводка индекса. Лаунчер (`launcher.build_proxy`) проксирует
+    # их без изменений — объявлять их достаточно здесь.
+
+    @server.resource(
+        "odata1c://cheatsheet",
+        name="Справочник odata1c",
+        description="Все темы odata1c_info одним текстом: имена, поля, регистры, отбор, токены.",
+        mime_type="text/markdown",
+    )
+    async def cheatsheet() -> str:
+        return await service.info("all")
+
+    @server.resource(
+        "odata1c://policy/{base}",
+        name="Политика гейта базы",
+        description=(
+            "policy.yaml базы: какое поле к какому классу защиты отнесено и какие сущности "
+            "скрыты. Значений в политике нет, только имена полей и классы."
+        ),
+        mime_type="text/yaml",
+    )
+    async def policy_resource(ctx: Context, base: str) -> str:
+        return await service.resource_policy(scope_from_headers(ctx.headers), base)
+
+    @server.resource(
+        "odata1c://index/{base}",
+        name="Сводка индекса базы",
+        description="Когда построен индекс базы, сколько в нём сущностей всего и по видам.",
+        mime_type="application/json",
+    )
+    async def index_resource(ctx: Context, base: str) -> str:
+        return await service.resource_index(scope_from_headers(ctx.headers), base)
+
+    @server.prompt(
+        name="explore",
+        title="Осмотреть базу 1С",
+        description="Стартовый сценарий: что за база, что в ней есть и как с ней работать.",
+    )
+    def explore(base: str) -> str:
+        return (
+            f"Покажи состав базы {base}: вызови odata1c_bases, затем odata1c_find_entity по "
+            "основным справочникам и документам (контрагенты, номенклатура, организации, "
+            "заказы, реализации) и опиши, что нашёл: какие сущности есть, какие у них ключи. "
+            "Помни правила работы с токенами: значения вида [[type:tail]] непрозрачны, их не "
+            "нужно достраивать или менять — подставляй их обратно как есть. Подробности — "
+            'odata1c_info(topic="tokens").'
+        )
+
     return server
+
+
+async def check_metadata_once(service: ToolService, config: AppConfig) -> None:
+    """Один проход фоновой проверки `$metadata` (SPEC §4.3): для каждой УЖЕ проиндексированной
+    базы вызвать `reindex(force=False)` — он сам скачает описание метаданных, сверит контрольную
+    сумму и в обычном случае («сумма та же») ничего не перестроит.
+
+    Базы без индекса пропускаются намеренно: первый реиндекс — сознательное действие владельца
+    (`odata1c reindex <база>`), а не побочный эффект запуска демона, и на базе уровня ERP он
+    стоит десятков мегабайт трафика и минут разбора.
+
+    Отдельная функция, а не тело цикла: цикл спит часами и в тесте непроверяем, а проверять здесь
+    есть что — и обход баз, и разбор отказа.
+    """
+    for имя in sorted(config.bases):
+        if not index_path(config.home, имя).exists():
+            continue
+        # `reindex` исключений не бросает (инвариант слоя тулов): отказ приходит готовым текстом
+        # ответа MCP, уже прошедшим гейт и страж, — поэтому его можно и записать в реестр, и
+        # положить в журнал демона целиком, не опасаясь вынести наружу значение из 1С.
+        ответ = await service.reindex(SessionScope(), base=имя)
+        отказ = _отказ_ответа(ответ)
+        if отказ is not None:
+            _log.warning("фоновая проверка $metadata базы %s не удалась: %s", имя, отказ)
+            service.note_error(имя, отказ)
+
+
+def _отказ_ответа(ответ: str) -> str | None:
+    """Текст ошибки из ответа тула (`{"error": {...}}`, SPEC §5.2) или `None`, если ответ
+    успешный. Невалидный JSON считается отказом: ответ тула всегда JSON, кроме `info` и
+    `resource_policy`, которых здесь нет."""
+    try:
+        разобрано = json.loads(ответ)
+    except json.JSONDecodeError:
+        return "ответ не разобран как JSON"
+    ошибка = разобрано.get("error") if isinstance(разобрано, dict) else None
+    if not isinstance(ошибка, dict):
+        return None
+    return f"[{ошибка.get('code')}] {ошибка.get('message')}"
+
+
+async def _цикл_проверки_метаданных(service: ToolService, config: AppConfig) -> None:
+    """Фоновая задача демона: `check_metadata_once` раз в `reindex_check_hours`.
+
+    Сначала пауза, потом проверка: сразу после старта индекс либо только что построен вручную,
+    либо не нужен ещё никому, а вот занять собой холодный старт демона проверка вполне успела бы.
+    `reindex_check_hours <= 0` — проверка выключена, задача не запускается вовсе (см. `serve`).
+    """
+    период = config.daemon.reindex_check_hours * 3600
+    while True:
+        await asyncio.sleep(период)
+        try:
+            await check_metadata_once(service, config)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Фоновая задача не имеет права умереть от единичного сбоя: умерев, она молча
+            # перестанет проверять ВСЕ базы до перезапуска демона.
+            _log.exception("фоновая проверка $metadata прервана ошибкой — цикл продолжен")
 
 
 def daemon_url(port: int) -> str:
@@ -401,6 +569,11 @@ async def serve(
     )
     http = uvicorn.Server(настройки_uvicorn)
     задача_http = asyncio.create_task(http.serve())
+    задача_проверки = (
+        asyncio.create_task(_цикл_проверки_метаданных(служба, config))
+        if config.daemon.reindex_check_hours > 0
+        else None
+    )
 
     pid_файл = home / "daemon.pid"
     try:
@@ -424,6 +597,13 @@ async def serve(
             raise
     finally:
         _убрать_pid_файл(pid_файл, str(os.getpid()))
+        # Фоновая проверка снимается ДО закрытия службы и обязательно с ожиданием: реиндекс
+        # внутри неё держит клиент 1С, и `служба.aclose()` поверх незавершённого запроса закрыл
+        # бы httpx-клиент из-под работающей задачи.
+        if задача_проверки is not None:
+            задача_проверки.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await задача_проверки
         await служба.aclose()
         _log.info("демон остановлен")
         logging.getLogger("odata1c").removeHandler(обработчик_журнала)
