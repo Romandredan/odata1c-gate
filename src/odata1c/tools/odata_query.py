@@ -108,9 +108,12 @@ def _проверить_литерал_пути(value, аргумент: str) ->
     1С искажают или отклоняют их даже закодированными."""
     for символ in str(value):
         if символ in _ЗАПРЕЩЁННЫЕ_СИМВОЛЫ_ПУТИ or ord(символ) < 0x20 or ord(символ) == 0x7F:
+            # Сам символ в сообщение не попадает (Ruling 20, пункт 2): значение здесь уже
+            # раскрытое, и знак из него — тоже байт реального значения. Перечень запрещённого
+            # закрытый и короткий, назвать его целиком не менее понятно.
             raise _ошибка(
-                f"значение параметра {аргумент} содержит символ {символ!r}, который 1С не "
-                "переносит в пути запроса",
+                f"значение параметра {аргумент} содержит символ, который 1С не переносит в пути "
+                "запроса (?, +, обратная косая черта или управляющий символ)",
                 hint=(
                     "в пути запроса 1С (публикация через IIS) этот символ не передаётся; для "
                     "виртуальной таблицы перенесите условие из Condition в filter результата, "
@@ -127,25 +130,32 @@ def _к_списку(значение: list[str] | str | None) -> list[str]:
     return [элемент.strip() for элемент in сырые if элемент and элемент.strip()]
 
 
-def odata_literal(edm_type: str, value) -> str:
+def odata_literal(edm_type: str, value, *, name: str = "") -> str:
     """Значение аргумента виртуальной таблицы/ключа как литерал OData (SPEC §9).
 
     `Edm.Guid` и `Edm.DateTime` проверяются на формат — иначе `params_invalid`. `Edm.String`
     удваивает внутренние одинарные кавычки (SQL-стиль OData). `Edm.Boolean` — `true`/`false`.
     Числовые типы — как есть, после проверки, что значение действительно число.
-    """
+
+    Текст отказа НИКОГДА не повторяет само значение (Ruling 20, пункт 2, ревью 2026-09-11):
+    сюда значение приходит уже ПОСЛЕ обратной подмены, то есть реальным, а ответ об ошибке
+    уходит модели тем же путём, что и данные. Прежнее «„г. Москва, ул. Тверская…“ не похоже на
+    дату/время» и было той самой утечкой: маскировщик и страж собирают обратно не все классы —
+    у `addr` и `dob` последнего рубежа нет вовсе. Понятность отказа держится на имени параметра
+    (`name`) и ожидаемом типе, а этого модели достаточно, чтобы исправить вызов."""
+    что = f"значение параметра «{name}»" if name else "значение"
     if edm_type == "Edm.Guid":
         текст = str(value)
-        if not _GUID.match(текст):
-            raise _ошибка(f"«{value}» не похоже на GUID (Edm.Guid)")
+        if not _GUID.fullmatch(текст):
+            raise _ошибка(f"{что} не похоже на GUID (Edm.Guid)")
         return f"guid'{текст}'"
     if edm_type == "Edm.DateTime":
         текст = str(value)
-        if _ДАТА.match(текст):
+        if _ДАТА.fullmatch(текст):
             текст = f"{текст}T00:00:00"
-        elif not _ДАТА_ВРЕМЯ.match(текст):
+        elif not _ДАТА_ВРЕМЯ.fullmatch(текст):
             raise _ошибка(
-                f"«{value}» не похоже на дату/время (Edm.DateTime)",
+                f"{что} не похоже на дату/время (Edm.DateTime)",
                 hint="формат YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS",
             )
         return f"datetime'{текст}'"
@@ -156,17 +166,17 @@ def odata_literal(edm_type: str, value) -> str:
             return "true" if value else "false"
         if isinstance(value, str) and value.strip().lower() in ("true", "false"):
             return value.strip().lower()
-        raise _ошибка(f"«{value}» не похоже на булево значение (Edm.Boolean)")
+        raise _ошибка(f"{что} не похоже на булево значение (Edm.Boolean)")
     if edm_type in _ЦЕЛЫЕ_ТИПЫ:
         try:
             return str(int(value))
         except (TypeError, ValueError) as ошибка:
-            raise _ошибка(f"«{value}» не похоже на целое число ({edm_type})") from ошибка
+            raise _ошибка(f"{что} не похоже на целое число ({edm_type})") from ошибка
     if edm_type in _ДРОБНЫЕ_ТИПЫ:
         try:
             return str(float(value))
         except (TypeError, ValueError) as ошибка:
-            raise _ошибка(f"«{value}» не похоже на число ({edm_type})") from ошибка
+            raise _ошибка(f"{что} не похоже на число ({edm_type})") from ошибка
     raise _ошибка(f"построение запроса не поддерживает тип поля {edm_type}")
 
 
@@ -263,7 +273,7 @@ def _путь_виртуальной_таблицы(desc: EntityDescription, par
     # пересортировывается); раунд правок 1 (Minor) подтвердил это чтение брифа.
     порядок = [имя for имя in схема_параметров if имя in заданные]
     аргументы = ",".join(
-        f"{имя}={odata_literal(схема_параметров[имя], заданные[имя])}" for имя in порядок
+        f"{имя}={odata_literal(схема_параметров[имя], заданные[имя], name=имя)}" for имя in порядок
     )
     return f"{desc.parent_entity}/{desc.virtual_kind}({аргументы})"
 
@@ -360,7 +370,7 @@ def _литерал_ключа(desc: EntityDescription, key) -> str:
                 hint=f"передайте ключ словарём с полями: {', '.join(desc.key_fields)}",
             )
         _проверить_литерал_пути(key, "key")
-        return odata_literal("Edm.Guid", key)
+        return odata_literal("Edm.Guid", key, name="key")
 
     if not isinstance(key, dict):
         raise _ошибка(
@@ -387,7 +397,8 @@ def _литерал_ключа(desc: EntityDescription, key) -> str:
 
     типы_полей = {поле["name"]: поле["edm_type"] for поле in desc.fields}
     части_ключа = [
-        f"{имя}={odata_literal(типы_полей[имя], заданные[имя])}" for имя in desc.key_fields
+        f"{имя}={odata_literal(типы_полей[имя], заданные[имя], name=имя)}"
+        for имя in desc.key_fields
     ]
     return ",".join(части_ключа)
 
