@@ -367,6 +367,43 @@ def test_тело_ошибки_число_не_роняет_разбор():
     assert "42" in ошибка.message
 
 
+def _ошибка_платформы(код: str, текст: str) -> str:
+    import json
+
+    return json.dumps(
+        {"odata.error": {"code": код, "message": {"lang": "ru", "value": текст}}},
+        ensure_ascii=False,
+    )
+
+
+def test_нет_объекта_по_ключу_отдельный_код():
+    """Находка П6: 404 на объект по ключу, которого нет, приходил кодом `entity_unknown` с
+    советом «вызовите odata1c_reindex» — модель запускала бы реиндекс 16,8 МБ метаданных впустую.
+    Платформа различает случаи кодом `odata.error.code` (живая база: «9» — «Экземпляр сущности не
+    найден», «8» — «Сущность '…' не найдена»), и это не зависит от языка текста."""
+    ошибка = map_error(404, _ошибка_платформы("9", "Экземпляр сущности не найден"))
+
+    assert ошибка.code == "object_not_found"
+    assert "ключ" in ошибка.hint
+    assert "reindex" not in ошибка.hint
+
+
+@pytest.mark.parametrize(
+    "тело",
+    [
+        pytest.param(_ошибка_платформы("8", "Сущность 'Catalog_Нет' не найдена"), id="код-8"),
+        pytest.param(_ошибка_платформы("1", "не найдено"), id="прочий-код"),
+        pytest.param(_ошибка_платформы("", "не найдено"), id="пустой-код"),
+        pytest.param("Not found", id="не-json"),
+    ],
+)
+def test_прочие_404_остаются_неизвестной_сущностью(тело):
+    ошибка = map_error(404, тело)
+
+    assert ошибка.code == "entity_unknown"
+    assert "reindex" in ошибка.hint
+
+
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_несуществующий_файл_сертификата_даёт_понятную_ошибку(tmp_path):
     """Регресс: verify_tls как путь к несуществующему CA-сертификату роняет конструктор

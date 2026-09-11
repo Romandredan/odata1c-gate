@@ -79,7 +79,7 @@ async def _физлица_эхо_отбора(request: Request) -> Response:
 
 
 async def _не_найдено(request: Request) -> Response:
-    # Тот же формат odata.error, что разбирает client1c/errors.py::_текст_ошибки_платформы —
+    # Тот же формат odata.error, что разбирает client1c/errors.py::_ошибка_платформы —
     # неизвестный путь настоящая 1С тоже отдаёт так, а не голым текстом.
     return JSONResponse(
         {"odata.error": {"code": "0", "message": {"lang": "ru-RU", "value": "не найдено"}}},

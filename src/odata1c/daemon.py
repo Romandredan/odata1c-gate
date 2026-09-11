@@ -214,8 +214,9 @@ def build_server(service: ToolService, limits: Limits) -> MCPServer:
     @server.tool(
         name="odata1c_get",
         description=(
-            "Один объект по ключу (guid или объект для составного ключа). Используйте после "
-            "query/describe_entity, когда ключ уже известен."
+            "Один объект по ключу: guid (как есть или guid'…') либо объект полей составного "
+            "ключа. Используйте после query/describe_entity, когда ключ уже известен. expand "
+            "раскрывает связи, кроме строки табличной части. Нет объекта — object_not_found."
         ),
         annotations=аннотации,
         meta=мета,

@@ -374,6 +374,122 @@ def test_литералы():
         odata_literal("Edm.Guid", "не-guid")
 
 
+ССЫЛКА = "0c4320aa-1b2c-11ee-8d4f-00155d000001"
+
+
+@pytest.mark.parametrize(
+    "ключ",
+    [
+        pytest.param(ССЫЛКА, id="голый"),
+        pytest.param(f"guid'{ССЫЛКА}'", id="синтаксис-OData"),
+        pytest.param(f"GUID'{ССЫЛКА}'", id="синтаксис-OData-заглавными"),
+    ],
+)
+def test_ключ_guid_в_обоих_написаниях(индекс_ut, лимиты, ключ):
+    """Находка П5: модели пишут ключ в синтаксисе OData — `guid'…'` — и получали отказ «не похоже
+    на GUID» с пустой подсказкой. Обёртка снимается; литерал в пути один, не двойной."""
+    спец = build_get(
+        индекс_ut.describe("Catalog_Контрагенты"), ключ, describe=индекс_ut.describe, limits=лимиты
+    )
+    assert спец.path == f"Catalog_Контрагенты(guid'{ССЫЛКА}')"
+
+
+def test_составной_ключ_в_синтаксисе_OData(индекс_ut, лимиты):
+    """Обёртки снимаются в `odata_literal`, поэтому части составного ключа получают то же даром:
+    `guid'…'` у поля ссылки и `datetime'…'` у периода."""
+    спец = build_get(
+        индекс_ut.describe("InformationRegister_КурсыВалют"),
+        {"Period": "datetime'2026-01-01T00:00:00'", "Валюта_Key": f"guid'{ССЫЛКА}'"},
+        describe=индекс_ut.describe,
+        limits=лимиты,
+    )
+    assert спец.path == (
+        f"InformationRegister_КурсыВалют(Period=datetime'2026-01-01T00:00:00',"
+        f"Валюта_Key=guid'{ССЫЛКА}')"
+    )
+
+
+@pytest.mark.parametrize("ключ", ["не-гуид", "guid'не-гуид'", f"guid'{ССЫЛКА}", f"{ССЫЛКА}'"])
+def test_нераспознанный_ключ_подсказывает_форму(индекс_ut, лимиты, ключ):
+    """Отказ по-прежнему не повторяет значение (Ruling 20, пункт 2: здесь оно уже раскрыто), но
+    подсказка больше не пустая — показывает, чего ждут."""
+    with pytest.raises(QueryError) as ошибка:
+        build_get(
+            индекс_ut.describe("Catalog_Контрагенты"),
+            ключ,
+            describe=индекс_ut.describe,
+            limits=лимиты,
+        )
+    assert ошибка.value.code == "params_invalid"
+    assert "guid'" in ошибка.value.hint and "xxxxxxxx-" in ошибка.value.hint
+    assert ключ not in ошибка.value.message and ключ not in ошибка.value.hint
+
+
+# --- Находка П7: `get` с `expand` — 1С не раскрывает связи у одиночной сущности -----------------
+
+
+def test_get_с_expand_идёт_отбором_по_ключу(индекс_ut, лимиты):
+    """1С: «Опция $expand не поддерживается при запросе одиночных сущностей». Для сущности с
+    простым ключом `get` с `expand` выполняется выборкой с отбором по `Ref_Key`, где 1С `$expand`
+    поддерживает (проверено на живой базе)."""
+    спец = build_get(
+        индекс_ut.describe("Catalog_Контрагенты"),
+        f"guid'{ССЫЛКА}'",
+        describe=индекс_ut.describe,
+        limits=лимиты,
+        select=["Ref_Key", "ИНН"],
+        expand=["ГоловнойКонтрагент"],
+    )
+
+    assert спец.path == "Catalog_Контрагенты"
+    assert спец.params["$filter"] == f"Ref_Key eq guid'{ССЫЛКА}'"
+    assert спец.params["$expand"] == "ГоловнойКонтрагент"
+    assert спец.params["$top"] == "1"
+    assert "ГоловнойКонтрагент/Ref_Key" in спец.params["$select"]
+
+
+def test_get_без_expand_остаётся_обращением_по_ключу(индекс_ut, лимиты):
+    спец = build_get(
+        индекс_ut.describe("Catalog_Контрагенты"),
+        ССЫЛКА,
+        describe=индекс_ut.describe,
+        limits=лимиты,
+    )
+    assert спец.path == f"Catalog_Контрагенты(guid'{ССЫЛКА}')"
+    assert "$filter" not in спец.params
+
+
+def test_get_с_expand_строки_табличной_части_отклоняется_с_подсказкой(индекс_ut, лимиты):
+    """Строка табличной части: `$expand` по пути ключа 1С не выполняет (501), а отбор по полям
+    её ключа — тоже (500 «Операция не разрешена в предложении ГДЕ»; живая проба). Выполнить
+    нечем — отказ до обращения к 1С, с подсказкой, как получить связанный объект."""
+    with pytest.raises(QueryError) as ошибка:
+        build_get(
+            индекс_ut.describe("Document_РеализацияТоваровУслуг_Товары"),
+            {"Ref_Key": ССЫЛКА, "LineNumber": 1},
+            describe=индекс_ut.describe,
+            limits=лимиты,
+            expand=["Серия"],
+        )
+    assert ошибка.value.code == "params_invalid"
+    assert "_Key" in ошибка.value.hint
+
+
+def test_get_с_expand_записи_регистра_остаётся_обращением_по_ключу(индекс_ut, лимиты):
+    """Составной ключ записи регистра: отбор по его полям 1С отклоняет (живая проба), а `$expand`
+    по пути ключа у записи регистра выполняет (200). Путь не меняется."""
+    спец = build_get(
+        индекс_ut.describe("AccumulationRegister_РасчетыСКлиентамиПланОплат_RecordType"),
+        {"Recorder": ССЫЛКА, "LineNumber": 1, "Recorder_Type": "StandardODATA.Document_Y"},
+        describe=индекс_ut.describe,
+        limits=лимиты,
+        expand=["Валюта"],
+    )
+    assert спец.path.startswith("AccumulationRegister_РасчетыСКлиентамиПланОплат_RecordType(")
+    assert спец.params["$expand"] == "Валюта"
+    assert "$filter" not in спец.params
+
+
 def test_orderby_fields():
     assert orderby_fields("Дата desc, Контрагент/Description asc") == [
         "Дата",

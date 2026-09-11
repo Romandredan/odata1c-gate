@@ -761,6 +761,94 @@ async def test_get_маскирует_и_отдаёт_item(сервис, respx_u
     assert данные["item"]["Ref_Key"] == "a103cb54-42ee-11ec-a7a0-f10ab59a067e"
 
 
+async def test_get_принимает_ключ_в_синтаксисе_OData(сервис, respx_ut):
+    """Находка П5: `key="guid'…'"` — так ключ пишут модели; раньше — отказ с пустой подсказкой."""
+    маршрут = respx_ut.get(url__regex=rf".*\(guid'{ССЫЛКА}'\).*").mock(
+        return_value=httpx.Response(200, json={"Ref_Key": ССЫЛКА})
+    )
+
+    данные = json.loads(
+        await сервис.get(SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, key=f"guid'{ССЫЛКА}'")
+    )
+
+    assert данные["item"]["Ref_Key"] == ССЫЛКА
+    assert маршрут.called
+
+
+def _нет_объекта(request: httpx.Request) -> httpx.Response:
+    """Ответ живой 1С на ключ, которого нет: 404, `odata.error.code` = «9»."""
+    return httpx.Response(
+        404,
+        json={
+            "odata.error": {
+                "code": "9",
+                "message": {"lang": "ru", "value": "Экземпляр сущности не найден"},
+            }
+        },
+    )
+
+
+async def test_get_отсутствующий_объект_не_толкает_на_реиндекс(сервис, respx_ut):
+    """Находка П6: сущность известна, не найден объект — это `object_not_found` с советом
+    проверить ключ, а не `entity_unknown` с советом перестроить индекс."""
+    respx_ut.route(method="GET").mock(side_effect=_нет_объекта)
+
+    ошибка = json.loads(
+        await сервис.get(SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, key=ССЫЛКА)
+    )["error"]
+
+    assert ошибка["code"] == "object_not_found"
+    assert "ключ" in ошибка["hint"]
+    assert "reindex" not in ошибка["hint"]
+
+
+async def test_get_с_expand_отдаёт_item_из_выборки(сервис, respx_ut):
+    """Находка П7: `get` с `expand` идёт выборкой с отбором по ключу, а ответ — в форме `get`
+    (`item`, не `items`), с раскрытым объектом по его собственной политике."""
+    маршрут = respx_ut.get(КОНТРАГЕНТЫ).mock(
+        return_value=_одна_запись(
+            {"ИНН": ИНН, "ГоловнойКонтрагент": {"Ref_Key": ССЫЛКА, "Description": "ООО Ромашка"}}
+        )
+    )
+
+    текст = await сервис.get(
+        SessionScope(),
+        base="ut",
+        entity=КОНТРАГЕНТЫ,
+        key=ССЫЛКА,
+        select=["Ref_Key", "ИНН"],
+        expand=["ГоловнойКонтрагент"],
+    )
+    данные = json.loads(текст)
+
+    параметры = маршрут.calls.last.request.url.params
+    assert параметры["$filter"] == f"Ref_Key eq guid'{ССЫЛКА}'"
+    assert параметры["$expand"] == "ГоловнойКонтрагент"
+    assert "items" not in данные and "count" not in данные
+    assert данные["item"]["Ref_Key"] == ССЫЛКА
+    assert данные["item"]["ГоловнойКонтрагент"]["Description"].startswith("[[org:")
+    assert ИНН not in текст and "Ромашка" not in текст
+
+
+async def test_get_с_expand_отсутствующий_объект(сервис, respx_ut):
+    """Выборка по несуществующему ключу отвечает пустым списком, а не 404 (живая проба): `get`
+    обязан ответить так же, как без `expand`, — `object_not_found`, а не `item: null`."""
+    respx_ut.get(КОНТРАГЕНТЫ).mock(return_value=httpx.Response(200, json={"value": []}))
+
+    ошибка = json.loads(
+        await сервис.get(
+            SessionScope(),
+            base="ut",
+            entity=КОНТРАГЕНТЫ,
+            key=ССЫЛКА,
+            expand=["ГоловнойКонтрагент"],
+        )
+    )["error"]
+
+    assert ошибка["code"] == "object_not_found"
+    assert "reindex" not in ошибка["hint"]
+
+
 # ---------------------------------------------------------------------------------------------
 # bases, find_entity, describe_entity — без сети
 # ---------------------------------------------------------------------------------------------

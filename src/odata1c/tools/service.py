@@ -25,7 +25,7 @@ import logging
 import sqlite3
 
 from odata1c.client1c.client import Client1C
-from odata1c.client1c.errors import OdataError
+from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
 from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
 from odata1c.gate.dictionary import Dictionary
@@ -1161,6 +1161,17 @@ class ToolService:
                 raise
 
             записи, _ = items_of(сырой_ответ)
+            if not записи:
+                # `get` с `expand` идёт выборкой с отбором по ключу (находка П7, см.
+                # `odata_query.build_get`), и отсутствующий объект 1С отдаёт там пустым списком,
+                # а не 404. Ответ обязан быть тем же, что без `expand`: `object_not_found`, а не
+                # `item: null` — иначе один и тот же промах выглядел бы по-разному в зависимости
+                # от того, просили ли связанные объекты.
+                raise _ServiceError(
+                    "object_not_found",
+                    f"объект с таким ключом в сущности «{описание.name}» не найден",
+                    ПОДСКАЗКА_НЕТ_ОБЪЕКТА,
+                )
             записи = strip_service(записи, keep_data_version="DataVersion" in _как_список(select))
             маска = гейт.mask(
                 записи,
