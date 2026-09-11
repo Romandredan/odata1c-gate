@@ -150,6 +150,28 @@ class BaseGate:
     def mask(self, data, *, entity: str, strict: bool = False) -> MaskResult:
         return self._masker.mask(data, entity=entity, strict=strict)
 
+    def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:
+        """Обратная замена раскрытого по СЫРОМУ тексту от 1С — до всех преобразований
+        (Ruling 25, раунд правок 1).
+
+        Слой раскрытого держится на точном вхождении, а до стража текст успевают переписать:
+        `mask_text` заменяет телефон или название ВНУТРИ раскрытого адреса, `truncate_strings` и
+        `map_error` режут значение посередине, — и вхождение перестаёт совпадать. Поэтому проход
+        делается первым в конвейере ответа, а не первым внутри стража: на сыром теле ответа 1С
+        (и успешном, и ошибочном) заменять нечему мешать. Дальше конвейер работает как работал,
+        а `finish` со стражем остаётся последним рубежом.
+
+        Пустой набор (вызов ничего не раскрывал — обычный случай) стоит одну проверку: автомат
+        не собирается, текст возвращается тем же объектом."""
+        if self.mode == "off" or not revealed:
+            return text
+        return self._guard.scrub_revealed(text, revealed)
+
+    def scrubber(self, revealed: RevealedValues | None):
+        """Функция обратной замены раскрытого для клиента 1С (`Client1C.get(scrub=…)`):
+        единственное, что смотрит на сырой ответ базы до разбора, маскировки и усечения."""
+        return lambda текст: self.scrub_revealed(текст, revealed)
+
     def finish(self, envelope: dict, revealed: RevealedValues | None = None) -> str:
         """Сериализация ответа тула (`ensure_ascii=False` — страж должен видеть кириллицу как
         есть, не в `\\uXXXX`-экранировании) и страж утечек как последний проход по готовому
@@ -169,7 +191,11 @@ class BaseGate:
         одного места — `ToolService._run`."""
         текст = json.dumps(envelope, ensure_ascii=False)
         проверено = self._guard.check(текст, mode=self.mode, revealed=revealed)
-        if not проверено.replacements:
+        # Замены, сделанные проходом по сырому ответу (`scrub_revealed`), считаются наравне с
+        # заменами этого прохода: к моменту `finish` заменять уже нечего, но ответ всё равно
+        # содержал защищённое значение, и получатель обязан это видеть (Ruling 25).
+        всего = len(проверено.replacements) + (revealed.replacements if revealed else 0)
+        if not всего:
             return проверено.text
         try:
             данные = json.loads(проверено.text)
@@ -177,8 +203,7 @@ class BaseGate:
             _log.error("страж вернул невалидный JSON при непустых replacements")
             return проверено.text
         данные.setdefault("warnings", []).append(
-            f"guard_replaced: страж заменил {len(проверено.replacements)} значений, "
-            "не распознанных маскировщиком"
+            f"guard_replaced: страж заменил {всего} значений, не распознанных маскировщиком"
         )
         return json.dumps(данные, ensure_ascii=False)
 
@@ -198,7 +223,15 @@ class BaseGate:
         Набор раскрытого нужен здесь не меньше, чем на успешном пути, а по сути — больше: это
         главный путь эха (1С повторяет выражение отбора в сообщении об ошибке), и `mask_text`
         на нём бессилен, потому что у `addr`/`dob`/свободнотекстового `doc` детектора нет
-        (задача N1 M1d)."""
+        (задача N1 M1d).
+
+        Набор проходит по тексту ДО `mask_text` (Ruling 25, раунд правок 1): иначе детектор
+        заменит реквизит ВНУТРИ раскрытого значения — телефон, вписанный в адрес, обычное
+        содержимое свободных полей 1С, — и точное вхождение адреса больше не совпадёт, а адресная
+        часть выйдет открытой. Соглашение проекта «маскировка, затем страж» при этом не меняется:
+        проход добавляется перед, а не переставляется существующий."""
+        message = self.scrub_revealed(message, revealed)
+        hint = self.scrub_revealed(hint, revealed) if hint else hint
         сообщение = self._masker.mask_text(message, entity="", field="error")
         подсказка = self._masker.mask_text(hint, entity="", field="error") if hint else hint
         return self.finish(

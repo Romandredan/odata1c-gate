@@ -739,6 +739,7 @@ class ToolService:
                 гейт,
                 репозиторий,
                 описание,
+                раскрытое,
                 filter=реальный_filter,
                 select=select,
                 expand=expand,
@@ -777,6 +778,7 @@ class ToolService:
         гейт: BaseGate,
         репозиторий: IndexRepository,
         описание: EntityDescription,
+        раскрытое: RevealedValues,
         *,
         filter: str | None = None,  # noqa: A002 — имя аргумента тула зафиксировано SPEC §5
         select: list[str] | str | None = None,
@@ -821,7 +823,12 @@ class ToolService:
 
         клиент = self._client_for(base_config)
         try:
-            сырой_ответ = await клиент.get(spec.path, spec.params, timeout=spec.timeout_s)
+            сырой_ответ = await клиент.get(
+                spec.path,
+                spec.params,
+                timeout=spec.timeout_s,
+                scrub=гейт.scrubber(раскрытое),
+            )
         except OdataError as ошибка:
             self._уточнить_404(ошибка)
             raise
@@ -869,7 +876,9 @@ class ToolService:
 
             клиент = self._client_for(base_config)
             try:
-                сырой_ответ = await клиент.get(spec.path, spec.params)
+                сырой_ответ = await клиент.get(
+                    spec.path, spec.params, scrub=гейт.scrubber(раскрытое)
+                )
             except OdataError as ошибка:
                 self._уточнить_404(ошибка)
                 raise
@@ -940,6 +949,7 @@ class ToolService:
                 гейт,
                 репозиторий,
                 описание,
+                раскрытое,
                 filter=аргументы.filter,
                 select=аргументы.select,
                 orderby=аргументы.orderby,
@@ -1313,7 +1323,7 @@ class ToolService:
             параметры = self._подготовить_параметры(репозиторий, гейт, query, цель, раскрытое)
 
             клиент = self._client_for(base_config)
-            сырой = await клиент.get(очищенный, параметры or None)
+            сырой = await клиент.get(очищенный, параметры or None, scrub=гейт.scrubber(раскрытое))
             if not isinstance(сырой, dict):
                 # Путь здесь произвольный, и 1С отвечает не только объектом: `…/$count` отдаёт
                 # число, примитивное свойство — скаляр. `items_of` ждёт словарь, и без этой

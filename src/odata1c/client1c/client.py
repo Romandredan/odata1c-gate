@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import urllib.parse
+from collections.abc import Callable
 
 import httpx
 
@@ -87,13 +89,30 @@ class Client1C:
             ) from exc
 
     async def get(
-        self, path: str, params: dict | None = None, *, timeout: float | None = None
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        timeout: float | None = None,
+        scrub: Callable[[str], str] | None = None,
     ) -> dict:
         """Таймаут одного запроса (SPEC §10): по умолчанию — таймаут базы (`timeout_s`,
         конструктор `httpx.AsyncClient`), явный `timeout=` (план M1d: виртуальные таблицы —
-        `virtual_timeout_s`) переопределяет его только для этого запроса."""
-        response = await self._request("GET", path, params=params, retry=True, timeout=timeout)
-        return response.json()
+        `virtual_timeout_s`) переопределяет его только для этого запроса.
+
+        `scrub` — функция гейта, возвращающая на место раскрытых значений их токены (Ruling 25,
+        задача N1 M1d). Она применяется к СЫРОМУ телу ответа — и успешного, и ошибочного — до
+        разбора JSON и до `map_error`: инвариант 1 требует, чтобы раскрытое гейтом значение не
+        вышло наружу, а точное вхождение, на котором держится обратная замена, рвут все
+        преобразования ниже по конвейеру (маскировка, усечение строк, обрезка неразобранного
+        тела до 500 знаков в `map_error`). Клиент о гейте ничего не знает — только вызывает
+        переданную функцию; без неё поведение прежнее."""
+        response = await self._request(
+            "GET", path, params=params, retry=True, timeout=timeout, scrub=scrub
+        )
+        if scrub is None:
+            return response.json()
+        return json.loads(scrub(response.text))
 
     async def get_raw(
         self,
@@ -167,6 +186,7 @@ class Client1C:
         headers: dict | None = None,
         add_format: bool = True,
         timeout: float | None = None,
+        scrub: Callable[[str], str] | None = None,
     ) -> httpx.Response:
         путь = _экранировать_путь(path)
         params = dict(params or {})
@@ -240,7 +260,13 @@ class Client1C:
                     if response.status_code >= 400:
                         if открывает_сеанс:
                             await self._release_session_claim()
-                        raise map_error(response.status_code, response.text)
+                        тело = response.text
+                        # Обратная замена раскрытого — ДО map_error (Ruling 25): он берёт
+                        # `body.strip()[:500]`, когда тело не разбирается как odata.error
+                        # (страница веб-сервера, XML-ошибка), и обрезает значение посередине.
+                        raise map_error(
+                            response.status_code, scrub(тело) if scrub is not None else тело
+                        )
                     return response
                 await asyncio.sleep(ПАУЗА_ПЕРЕД_ПОВТОРОМ_С)
             # Недостижимо: на последней попытке каждая ветка выше либо возвращает ответ
