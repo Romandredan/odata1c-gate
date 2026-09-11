@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import sqlite3
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
@@ -464,6 +465,28 @@ class ToolService:
         finally:
             if репозиторий is not None:
                 репозиторий.close()
+
+    def _скрытые_для_разницы(self, base: BaseConfig, gate: BaseGate) -> frozenset[str]:
+        """Скрытые имена для ответа `reindex` — вместе с поддеревом (Ruling 30).
+
+        Отдельный метод, а не `self._скрытые(репозиторий, гейт)` вызывающего, потому что у
+        `reindex` репозитория на руках нет по построению: `_run(..., with_index=False)` не
+        открывает индекс, пока тот подменяется. К моменту сборки ответа подмена уже завершилась,
+        и индекс можно открыть на секунду — ровно затем, чтобы узнать родство. Если открыть не
+        вышло (реиндекс как раз и мог упасть на записи файла) — остаются корни запрета из
+        политики: они верны всегда и без индекса, а наследование без индекса недостижимо.
+        """
+        корни = self._скрытые(None, gate)
+        if not корни:
+            return корни
+        try:
+            репозиторий = self._open_index(base)
+        except (_ServiceError, IndexCorruptError, sqlite3.Error):
+            return корни
+        try:
+            return self._скрытые(репозиторий, gate)
+        finally:
+            репозиторий.close()
 
     def _open_index(self, base: BaseConfig) -> IndexRepository:
         путь = index_path(self._config.home, base.name)
@@ -1444,13 +1467,26 @@ class ToolService:
                 "indexed_at": результат.indexed_at,
                 "warnings": предупреждения,
             }
+            # Ruling 28 и Ruling 29 (найдено при проверке «нет ли третьего такого места», ревью
+            # M1d раунд 4, §2): разница индекса складывается из имён 1С как есть, и без этого
+            # отбора имя скрытой сущности печаталось в ответе открытым текстом — воспроизведено
+            # исполнением на скрытом `Catalog_Валюты`, который выпал из конфигурации. Счётчик
+            # `*_total` считается по ОТОБРАННОМУ списку: иначе разность «всего минус показано»
+            # вернула бы ровно то количество, которое отбор и убрал.
+            скрытые = self._скрытые_для_разницы(base_config, гейт)
             for ключ, значения in (
                 ("added_entities", результат.added_entities),
                 ("removed_entities", результат.removed_entities),
                 ("new_sensitive_fields", результат.new_sensitive_fields),
             ):
-                конверт[ключ] = значения[:_ПРЕДЕЛ_РАЗНИЦЫ]
-                конверт[f"{ключ}_total"] = len(значения)
+                видимые = [
+                    значение
+                    for значение in значения
+                    if (значение["entity"] if isinstance(значение, dict) else значение)
+                    not in скрытые
+                ]
+                конверт[ключ] = видимые[:_ПРЕДЕЛ_РАЗНИЦЫ]
+                конверт[f"{ключ}_total"] = len(видимые)
             return конверт
 
         return await self._run(scope, base, тело, with_index=False)

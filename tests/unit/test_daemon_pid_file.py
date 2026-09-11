@@ -298,6 +298,30 @@ def test_stop_на_настоящем_процессе_отличает_снят
     assert not pid_файл.exists()
 
 
+def test_команда_stop_различает_не_запущен_и_не_смог(tmp_path, monkeypatch, capsys):
+    """`odata1c daemon stop` обязан говорить о двух разных отказах по-разному. «Демон не запущен»
+    на живого демона — та же ложь, которую перестал говорить сам `stop()`, только со стороны
+    команды: владелец по такому сообщению искал бы не то и снова снимал бы процесс вручную."""
+    from odata1c.cli import cmd_daemon_stop
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert cmd_daemon_stop(home) == 1
+    assert "не запущен" in capsys.readouterr().out
+
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(daemon_module, "процесс_жив", lambda pid: True)
+    monkeypatch.setattr(daemon_module, "ОЖИДАНИЕ_СМЕРТИ_ДЕМОНА_С", 0.2)
+
+    assert cmd_daemon_stop(home) == 1
+    вывод = capsys.readouterr().out
+    assert "не удалось остановить" in вывод, вывод
+    assert "не запущен" not in вывод, f"живой демон объявлен незапущенным: {вывод!r}"
+
+
 def test_pid_файл_пишется_атомарно(tmp_path, monkeypatch):
     """Та же находка с другой стороны: `write_text` — это «усечь, потом записать», и читатель,
     попавший в промежуток, видит пустой файл. Атомарность наблюдаема только по механизму записи,

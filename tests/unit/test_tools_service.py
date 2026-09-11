@@ -997,6 +997,92 @@ async def test_reindex_без_изменений_не_трогает_индек�
     assert данные["added_entities"] == [] and данные["added_entities_total"] == 0
 
 
+async def test_reindex_не_называет_скрытую_сущность_в_разнице(
+    сервис, respx_ut, edmx_synthetic, дом
+):
+    """Ruling 28 в разнице реиндекса — найдено проверкой «нет ли третьего такого места» (ревью
+    M1d, раунд 4, §2) и воспроизведено исполнением.
+
+    `added_entities`/`removed_entities`/`new_sensitive_fields` складывались из имён 1С как есть,
+    без отбора по скрытым. Достаточно было скрыть сущность и обновить конфигурацию, чтобы её имя
+    ушло модели открытым текстом: здесь `Catalog_Валюты` скрыт политикой и выпадает из нового
+    описания метаданных — то есть попадает ровно в `removed_entities`.
+
+    Счётчик `*_total` проверяется вместе с самим списком: если он считает ДО отбора, разность
+    «всего минус показано» возвращает количество скрытого — та же обратимость, что и у счётчика
+    рецептов."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + "entities:\n  Catalog_Валюты: {hide: true}\n",
+        encoding="utf-8",
+    )
+    сервис._gates.clear()  # политика перечитывается по mtime, а тест меняет её в ту же секунду
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=edmx_synthetic)
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert данные["changed"] is True, "без перестройки индекса разница пуста и тест пуст"
+    assert "Catalog_Валюты" not in текст, "имя скрытой сущности ушло модели в разнице реиндекса"
+    assert данные["removed_entities_total"] == len(данные["removed_entities"]), (
+        "счётчик считает до отбора: разностью восстанавливается количество скрытого"
+    )
+
+
+async def test_reindex_не_называет_дочернюю_сущность_скрытой(сервис, respx_ut, edmx_synthetic, дом):
+    """Ruling 30 в той же разнице: `hide: true` на документ закрывает и его табличные части, и
+    имя ребёнка содержит имя родителя целиком — то есть выдаёт и сам факт сокрытия.
+
+    Родство берётся из индекса, а не из имени (как и везде в этом слое), поэтому `reindex`
+    открывает только что перестроенный индекс на секунду — своего репозитория у него нет по
+    построению. Новая табличная часть скрытого документа добавляется к описанию метаданных прямо
+    здесь: в поставляемых образцах пары «скрытый родитель + добавленный ребёнок» нет.
+
+    Что разница при этом не пуста и отбор не превратился в «показывать нечего», доказывает
+    соседняя добавленная сущность, которую никто не скрывал."""
+    import re
+
+    from odata1c.gate.service import policy_path
+
+    текст_edmx = edmx_synthetic.decode("utf-8")
+    тип = re.search(
+        r'<EntityType Name="Document_РеализацияТоваровУслуг_Товары">.*?</EntityType>',
+        текст_edmx,
+        re.S,
+    ).group(0)
+    набор = re.search(
+        r'<EntitySet Name="Document_РеализацияТоваровУслуг_Товары".*?/>', текст_edmx, re.S
+    ).group(0)
+    текст_edmx = текст_edmx.replace(тип, тип + "\n" + тип.replace("_Товары", "_Услуги"))
+    текст_edmx = текст_edmx.replace(набор, набор + "\n" + набор.replace("_Товары", "_Услуги"))
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8")
+        + "entities:\n  Document_РеализацияТоваровУслуг: {hide: true}\n",
+        encoding="utf-8",
+    )
+    сервис._gates.clear()
+    respx_ut.get(f"{URL_UT}$metadata").mock(
+        return_value=httpx.Response(200, content=текст_edmx.encode("utf-8"))
+    )
+
+    текст = await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(текст)
+
+    assert "Catalog_БанковскиеСчета" in данные["added_entities"], (
+        "разница пуста — тест не проверил бы и полное отсутствие отбора"
+    )
+    assert "_Услуги" not in текст, (
+        "имя табличной части скрытого документа ушло модели в разнице реиндекса"
+    )
+    assert "Document_РеализацияТоваровУслуг" not in текст
+
+
 async def test_reindex_пересобирает_политику_и_гейт_её_видит(сервис, respx_ut, edmx_ut_real, дом):
     """После перестройки индекса политика пересобрана И гейт её перечитал.
 

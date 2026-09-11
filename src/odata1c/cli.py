@@ -377,10 +377,22 @@ def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
 
 
 def cmd_daemon_stop(home: pathlib.Path) -> int:
+    """`odata1c daemon stop`.
+
+    Отказ `stop()` бывает двух разных видов, и говорить о них одно и то же нельзя (ревью M1d,
+    раунд 4, пункт 4): «pid-файла нет» — это «демон не запущен», а «файл на месте» — это «демон
+    жив, снять его не удалось». Прежний текст объявлял вторым первое, то есть повторял ту же ложь,
+    которую только что перестал говорить сам `stop()`, только с другой стороны.
+    """
+    pid_файл = home / "daemon.pid"
     if daemon_stop(home):
         print("демон остановлен")
         return 0
-    print(f"демон не запущен: {home / 'daemon.pid'} не найден")
+    if pid_файл.exists():
+        print(f"не удалось остановить демон: процесс из {pid_файл} жив")
+        print(f"подробности в журнале: {home / 'logs' / 'daemon.log'}")
+        return 1
+    print(f"демон не запущен: {pid_файл} не найден")
     return 1
 
 
