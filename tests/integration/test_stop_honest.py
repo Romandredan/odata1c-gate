@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import socket
 import sys
 import time
@@ -47,6 +50,7 @@ def test_stop_на_живом_демоне_не_врёт_про_успех(tmp_p
     ensure_gate_secret(home / "daemon.yaml")
     (home / "bases.yaml").write_text("bases: {}\n", encoding="utf-8")
     pid_файл = home / "daemon.pid"
+    номер_демона: list[str | None] = [None]
 
     try:
         spawn_detached(home, порт)
@@ -56,6 +60,7 @@ def test_stop_на_живом_демоне_не_врёт_про_успех(tmp_p
         assert is_listening(порт), "демон не поднялся — проверять нечего"
         assert pid_файл.exists()
         номер = pid_файл.read_text(encoding="utf-8").strip()
+        номер_демона[0] = номер
 
         # 1. Снять не смогли: отказ обязан остаться отказом.
         with monkeypatch.context() as отказ:
@@ -80,8 +85,15 @@ def test_stop_на_живом_демоне_не_врёт_про_успех(tmp_p
         assert not is_listening(порт), "демон не снят, хотя stop() отчитался успехом"
         assert not pid_файл.exists(), "pid-файл снятого демона остался"
     finally:
-        if is_listening(порт):
-            daemon_stop(home)
+        # Уборка НЕ через `stop()`: именно его этот тест и проверяет, а проверяемым нельзя
+        # убирать за собой — сломанный `stop()` (например, под мутацией) оставит демон работать
+        # вечно. Проверено на себе: мутационный прогон оставил в системе два демона на временных
+        # домашних каталогах, которые пришлось снимать руками по номеру процесса — ровно то, что
+        # владелец делал из-за самого дефекта. Номер запоминается сразу после подъёма и
+        # снимается безусловно.
+        if номер_демона[0] is not None:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(номер_демона[0]), signal.SIGTERM)
             предел = time.monotonic() + ПРЕДЕЛ_ОСТАНОВКИ_С
             while is_listening(порт) and time.monotonic() < предел:
                 time.sleep(0.2)
