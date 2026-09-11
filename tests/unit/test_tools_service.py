@@ -1372,6 +1372,87 @@ async def test_resource_policy_без_политики(сервис, дом):
     assert "odata1c_reindex" in ошибка["hint"]
 
 
+async def test_resource_policy_не_называет_скрытые_сущности(сервис, дом):
+    """Ruling 29 (I4.2 итогового ревью M1d, раунд 3): ресурс печатал политику дословно — вместе
+    с секцией `entities`, где стоит `hide: true`, и со всеми правилами скрытой сущности. Это
+    было самое полное раскрытие из всех: модель узнавала и имя, и сам факт сокрытия.
+
+    Вычёркивается не одна секция `entities`, а КАЖДАЯ строка, ключом которой стоит скрытая
+    сущность: имя лежит и в `fields`, и в `auto`, и в `names_for`, и в `defaults.addr.mask_for`.
+    Отсечь только `entities` значило бы убрать имя из одной строки и напечатать тремя ниже."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8")
+        + "entities:\n  Catalog_Контрагенты: {hide: true}\n"
+        + "names_for: [Catalog_Контрагенты, Catalog_Организации]\n",
+        encoding="utf-8",
+    )
+
+    текст = await сервис.resource_policy(SessionScope(), "ut")
+
+    assert "Catalog_Контрагенты" not in текст
+    assert "скрыта настройкой базы" in текст
+    assert "Catalog_Организации" in текст  # прочие настройки остаются: имён они не выдают
+
+
+async def test_resource_policy_не_называет_детей_скрытой_сущности(сервис, дом):
+    """Ruling 29 вместе с Ruling 30: имя ребёнка содержит имя родителя целиком, поэтому строка
+    `Document_X_Товары.Поле` выдала бы и скрытый документ, и то, где искать его данные."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8")
+        + f"entities:\n  {ДОКУМЕНТ}: {{hide: true}}\n"
+        + f"fields:\n  {ДОКУМЕНТ}_Товары.ОсобыеОтметки: doc\n",
+        encoding="utf-8",
+    )
+
+    текст = await сервис.resource_policy(SessionScope(), "ut")
+
+    assert ДОКУМЕНТ not in текст
+
+
+async def test_resource_policy_без_правил_hide_отдаётся_дословно(сервис, дом):
+    """Обратный сторож: там, где владелец ничего не скрывал, ресурс остаётся прежним — текст
+    файла целиком, вместе с комментариями. Пересборка YAML комментарии теряет, поэтому она
+    включается только тогда, когда есть что вычёркивать."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        "# комментарий владельца\n" + путь.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    текст = await сервис.resource_policy(SessionScope(), "ut")
+
+    assert текст == путь.read_text(encoding="utf-8")
+    assert "# комментарий владельца" in текст
+
+
+async def test_resource_policy_на_непроиндексированной_базе_со_скрытым_отказывает(сервис, дом):
+    """Наследование запрета знает только индекс: без него шлюз не может отличить строку ребёнка
+    скрытой сущности от строки посторонней. Показать политику «как получится» значило бы выдать
+    ровно те имена, ради сокрытия которых Ruling 29 и принят, — поэтому отказ с указанием
+    починки. Без правил `hide` этот путь не включается, и ресурс работает как прежде."""
+    from odata1c.gate.service import policy_path
+    from odata1c.index.reindex import index_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + "entities:\n  Catalog_Контрагенты: {hide: true}\n",
+        encoding="utf-8",
+    )
+    index_path(дом, "ut").unlink()
+
+    ошибка = json.loads(await сервис.resource_policy(SessionScope(), "ut"))["error"]
+
+    assert ошибка["code"] == "entity_unknown"
+    assert "odata1c_reindex" in ошибка["hint"]
+
+
 async def test_resource_index_сводка(сервис):
     данные = json.loads(await сервис.resource_index(SessionScope(), "ut"))
 
