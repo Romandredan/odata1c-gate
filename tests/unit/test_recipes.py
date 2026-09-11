@@ -13,7 +13,7 @@ import urllib.parse
 import httpx
 import pytest
 import respx
-from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_навигаций, эхо_отбора
+from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_навигаций, ничего_не_скрыто, эхо_отбора
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -495,7 +495,13 @@ def respx_ut():
 
 async def токен_инн(служба: ToolService, инн: str) -> str:
     гейт = служба._gate_for(служба._config.bases["ut"])
-    return гейт.mask({"ИНН": инн}, entity="Catalog_Контрагенты", resolve=без_навигаций).data["ИНН"]
+    результат = гейт.mask(
+        {"ИНН": инн},
+        entity="Catalog_Контрагенты",
+        resolve=без_навигаций,
+        hidden=ничего_не_скрыто,
+    )
+    return результат.data["ИНН"]
 
 
 async def _токен_класса(служба: ToolService, класс: str) -> tuple[str, str]:
@@ -557,6 +563,30 @@ recipes:
     ответ = json.loads(await сервис.recipe(SessionScope()))
     assert ответ["recipes"][0]["applicable"] is False
     assert "не виртуальная таблица" in ответ["recipes"][0]["hint"]
+
+
+async def test_рецепт_скрытой_сущности_не_показывается(сервис, дом):
+    """Распространение Ruling 28 на список рецептов (раунд 3 итогового ревью M1d).
+
+    Рецепт закрытой сущности прежде оставался в списке с пометкой `applicable: false`, и имя
+    скрытой сущности печаталось дважды — полем `entity` и текстом подсказки («сущность X скрыта
+    политикой гейта»), — при том что SPEC §6.9 требует, чтобы имя скрытой сущности не появлялось
+    ни в одном ответе. Строка вычёркивается целиком, а общий счётчик говорит владельцу, что
+    список неполон, не называя имён."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + "entities:\n  Catalog_Контрагенты: {hide: true}\n",
+        encoding="utf-8",
+    )
+
+    текст = await сервис.recipe(SessionScope())
+    ответ = json.loads(текст)
+
+    assert "partners" not in {строка["name"] for строка in ответ["recipes"]}
+    assert "Catalog_Контрагенты" not in текст
+    assert "скрыта настройкой базы" in ответ["hint"]
 
 
 async def test_список_без_файла_рецептов_даёт_подсказку(сервис, дом):

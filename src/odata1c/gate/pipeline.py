@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+from collections.abc import Callable
 
 from odata1c.config.models import BaseConfig
 from odata1c.gate.dictionary import Dictionary
@@ -77,7 +78,14 @@ class BaseGate:
         )
 
     def is_hidden(self, entity: str) -> bool:
+        """Выписано ли правило `entities.hide` прямо на эту сущность. Наследование запрета на
+        дочерние объекты (Ruling 30) здесь не учитывается и учтено быть не может: родство знает
+        индекс метаданных, а гейт его не читает — полный набор строит `ToolService._скрытые`."""
         return self._policy.is_hidden(entity)
+
+    def hidden_entities(self) -> set[str]:
+        """Корни запрета — имена с `entities.hide: true`; см. `policy.Policy.hidden_entities`."""
+        return self._policy.hidden_entities()
 
     def has_hidden_entities(self) -> bool:
         """Есть ли у базы хоть одно правило `entities.hide` — см. `policy.Policy.has_hidden`."""
@@ -147,19 +155,28 @@ class BaseGate:
             return key
         return self._unmasker.key(key, entity=entity, strict=strict, revealed=revealed)
 
-    def mask(self, data, *, entity: str, resolve: Resolve, strict: bool = False) -> MaskResult:
+    def mask(
+        self,
+        data,
+        *,
+        entity: str,
+        resolve: Resolve,
+        hidden: Callable[[str], bool],
+        strict: bool = False,
+    ) -> MaskResult:
         """`resolve` — резолвер «сущность и ключ ответа → сущность вложенного объекта» (итоговое
         ревью M1d, C1). Аргумент обязателен, а не с умолчанием `None`: маскировка раскрытого
         через `$expand` объекта по политике чужой сущности и есть тот дефект, который здесь
         чинится, — отказ типа делает пропуск невозможным, в том числе у тулов, которых ещё нет.
         Тот же приём, что с `revealed` у `inbound_*` (задача N1 M1d).
 
-        Скрытость сущности маскировщику передаёт сам гейт (`is_hidden`): вложенный объект
-        скрытой сущности изымается из ответа — второй рубеж к обрезке `$expand` в запросе, для
-        того что 1С отдаёт без спроса (табличные части)."""
-        return self._masker.mask(
-            data, entity=entity, resolve=resolve, hidden=self.is_hidden, strict=strict
-        )
+        `hidden` — скрыта ли сущность запретом владельца. Вложенный объект скрытой сущности
+        изымается из ответа — второй рубеж к обрезке `$expand` в запросе, для того что 1С отдаёт
+        без спроса (табличные части). Аргумент обязателен по той же причине, что `resolve` и
+        `revealed`: запрет наследуется на дочерние объекты (Ruling 30), а знает об этом только
+        `ToolService`, у которого есть индекс, — умолчание `self.is_hidden` молча вернуло бы
+        неполный запрет, и ошибку никто бы не заметил."""
+        return self._masker.mask(data, entity=entity, resolve=resolve, hidden=hidden, strict=strict)
 
     def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:
         """Обратная замена раскрытого по СЫРОМУ тексту от 1С — до всех преобразований

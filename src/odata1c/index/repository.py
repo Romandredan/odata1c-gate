@@ -7,6 +7,7 @@ import datetime
 import json
 import pathlib
 import sqlite3
+from collections.abc import Iterable
 
 from odata1c.index.edmx import PARSER_VERSION, ParsedMetadata
 from odata1c.index.naming import normalize, stems
@@ -333,6 +334,36 @@ class IndexRepository:
             navigations=навигации,
             is_independent_register=bool(строка["is_independent_register"]),
         )
+
+    def descendants(self, names: Iterable[str]) -> set[str]:
+        """Всё поддерево дочерних сущностей под заданными именами: табличные части, наборы
+        записей, виртуальные таблицы — и их собственные дети, до неподвижной точки.
+
+        Обход именно транзитивный, а не в одно поколение (Ruling 30, итоговое ревью M1d, раунд 3):
+        у среза регистра сведений родителем стоит не сам регистр, а его набор записей
+        (`InformationRegister_X` → `…_RecordType` → `…_SliceLast`; проверено на настоящем
+        `$metadata` УТ и на образце `tests/fixtures/edmx/ut-real.edmx`). Одного поколения хватило
+        бы, чтобы закрыть набор записей и оставить открытым срез — те же данные под другим именем.
+
+        Сами `names` в результат не входят: это вопрос «кто под ними», а не «они и всё под ними».
+        Ответ по `parent_entity` — тому же столбцу, из которого `describe` собирает `children`.
+        """
+        найденное: set[str] = set()
+        слой = {имя for имя in names if имя}
+        while слой:
+            вопросы = ",".join("?" * len(слой))
+            следующий = {
+                строка["name"]
+                for строка in self._connection.execute(
+                    f"SELECT name FROM entities WHERE parent_entity IN ({вопросы})",
+                    tuple(слой),
+                ).fetchall()
+            }
+            # Вычитание найденного — защита от цикла в данных (родитель-потомок кольцом): индекс
+            # такого строить не должен, но цикл здесь означал бы вечный цикл в демоне.
+            слой = следующий - найденное
+            найденное |= следующий
+        return найденное
 
     def entity_names(self) -> set[str]:
         return {
