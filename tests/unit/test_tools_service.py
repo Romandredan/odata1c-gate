@@ -1663,6 +1663,10 @@ async def test_перечисление_открыто_и_при_словаре_
     assert "guard_replaced" not in текст
 
 
+# Начало предупреждения `reindex` о пересобранной политике при неизменном `$metadata`.
+ПОЛИТИКА_ПЕРЕСОБРАНА = "политика гейта пересобрана"
+
+
 def _записать_auto(дом, ключ: str, класс: str) -> None:
     путь = policy_path(дом, "ut")
     политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
@@ -1689,6 +1693,9 @@ async def test_reindex_без_изменений_пересобирает_уст
     политика = yaml.safe_load(policy_path(дом, "ut").read_text(encoding="utf-8"))
     assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
     assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо") is None
+    # Смена классов без перемены `$metadata` меняет то, как приходят значения, посреди сессии;
+    # модель узнаёт об этом из ответа, а не из «у того же контрагента вдруг другое значение».
+    assert [с for с in данные["warnings"] if с.startswith(ПОЛИТИКА_ПЕРЕСОБРАНА)]
 
 
 async def test_reindex_без_изменений_не_переписывает_политику_без_нужды(
@@ -1703,9 +1710,10 @@ async def test_reindex_без_изменений_не_переписывает_�
     до = путь.read_bytes()
     respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
 
-    await сервис.reindex(SessionScope(), base="ut")
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
 
     assert путь.read_bytes() == до
+    assert not [с for с in данные["warnings"] if с.startswith(ПОЛИТИКА_ПЕРЕСОБРАНА)]
 
 
 async def test_reindex_сохраняет_ручные_разделы_политики(сервис, respx_ut, edmx_ut_real, дом):
