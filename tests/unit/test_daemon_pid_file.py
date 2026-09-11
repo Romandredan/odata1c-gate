@@ -322,6 +322,69 @@ def test_команда_stop_различает_не_запущен_и_не_см
     assert "не запущен" not in вывод, f"живой демон объявлен незапущенным: {вывод!r}"
 
 
+@pytest.mark.parametrize(
+    ("содержимое", "признак"),
+    [
+        ("", "пуст"),
+        ("   \n", "пуст"),
+        ("не номер", "номера процесса"),
+    ],
+)
+def test_команда_stop_на_пустом_и_мусорном_pid_файле_не_объявляет_процесс_живым(
+    tmp_path, capsys, содержимое, признак
+):
+    """Раунд правок 2 по `stop()` и журналу, пункт 5 (находка 4 ревью раунда 5). На пустом или
+    мусорном `daemon.pid` команда печатала «процесс из … жив», хотя номера процесса там нет вовсе,
+    и отсылала в `daemon.log`, куда процесс команды ничего не пишет (журнал он не настраивает, а
+    каталога `logs` может и не быть). Сообщение обязано назвать настоящую причину — и не отсылать
+    туда, где её нет."""
+    from odata1c.cli import cmd_daemon_stop
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "daemon.pid").write_text(содержимое, encoding="utf-8")
+
+    assert cmd_daemon_stop(home) == 1
+    вывод = capsys.readouterr()
+    assert "жив" not in вывод.out, вывод.out
+    assert "не запущен" not in вывод.out, "файл на месте — «не запущен» неправда"
+    assert признак in вывод.out, вывод.out
+    assert "daemon.log" not in вывод.out, "отсылка в журнал, куда команда не пишет"
+    assert (home / "daemon.pid").exists(), "неразобранный файл удалять нельзя (находка Б.7)"
+
+
+def test_команда_stop_на_живом_процессе_называет_номер_и_отказ_os_kill(
+    tmp_path, monkeypatch, capsys, caplog
+):
+    """Третий случай той же находки: процесс жив и не снят. Причина печатается самой командой —
+    номер процесса и текст отказа ОС, — а не остаётся строкой журнала, которого у команды нет.
+
+    Повтора той же строки быть не должно. Процесс команды журнал не настраивает, и запись
+    `logging` ушла бы через `logging.lastResort` в stderr — вторым экземпляром того же текста.
+    Под pytest у корня есть обработчики, `lastResort` молчит, и проверка stderr была бы пустой;
+    поэтому проверяется сама запись: команда не пишет в `logging` ничего."""
+    from odata1c.cli import cmd_daemon_stop
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "daemon.pid").write_text("4242", encoding="utf-8")
+
+    def отказ(pid, sig):
+        raise PermissionError(5, "Отказано в доступе")
+
+    monkeypatch.setattr(daemon_module.os, "kill", отказ)
+    monkeypatch.setattr(daemon_module, "процесс_жив", lambda pid: True)
+    monkeypatch.setattr(daemon_module, "ОЖИДАНИЕ_СМЕРТИ_ДЕМОНА_С", 0.2)
+
+    with caplog.at_level("DEBUG"):
+        assert cmd_daemon_stop(home) == 1
+    вывод = capsys.readouterr()
+    assert "4242" in вывод.out and "жив" in вывод.out, вывод.out
+    assert "Отказано в доступе" in вывод.out, вывод.out
+    assert "daemon.log" not in вывод.out
+    assert not caplog.records, f"причина ушла ещё и в logging: {caplog.text!r}"
+
+
 def test_pid_файл_пишется_атомарно(tmp_path, monkeypatch):
     """Та же находка с другой стороны: `write_text` — это «усечь, потом записать», и читатель,
     попавший в промежуток, видит пустой файл. Атомарность наблюдаема только по механизму записи,

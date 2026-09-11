@@ -26,7 +26,7 @@ from odata1c.config.loader import ConfigError, format_validation_error, load_con
 from odata1c.config.models import ИМЯ_БАЗЫ, BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret, ensure_templates
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
-from odata1c.daemon import stop as daemon_stop
+from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
@@ -383,17 +383,16 @@ def cmd_daemon_stop(home: pathlib.Path) -> int:
     раунд 4, пункт 4): «pid-файла нет» — это «демон не запущен», а «файл на месте» — это «демон
     жив, снять его не удалось». Прежний текст объявлял вторым первое, то есть повторял ту же ложь,
     которую только что перестал говорить сам `stop()`, только с другой стороны.
+
+    Раунд правок 2 по `stop()` и журналу, пункт 5: исходов отказа на деле три — файла нет, файл не
+    разобран (пуст, мусор, не читается), процесс жив и не снят, — и прежний текст на пустом или
+    мусорном файле объявлял процесс живым, хотя номера в файле нет. Причину теперь называет
+    `daemon.остановить`, а команда печатает её сама, без отсылки в `daemon.log`: процесс команды
+    журнал не настраивает, и туда ничего не попадало.
     """
-    pid_файл = home / "daemon.pid"
-    if daemon_stop(home):
-        print("демон остановлен")
-        return 0
-    if pid_файл.exists():
-        print(f"не удалось остановить демон: процесс из {pid_файл} жив")
-        print(f"подробности в журнале: {home / 'logs' / 'daemon.log'}")
-        return 1
-    print(f"демон не запущен: {pid_файл} не найден")
-    return 1
+    итог = остановить_демон(home)
+    print(итог.причина)
+    return 0 if итог.снят else 1
 
 
 def _разобрать_bases(raw: str | None) -> list[str] | None:
