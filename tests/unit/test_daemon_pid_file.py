@@ -147,6 +147,10 @@ def test_stop_не_уносит_pid_файл_нового_демона(tmp_path,
         pid_файл.write_text("777777", encoding="utf-8")  # поднялся новый демон
 
     monkeypatch.setattr(daemon_module.os, "kill", kill_и_перезапуск)
+    # Прежний демон снят — это условие теста, а не то, что он проверяет. Без подмены исход зависел
+    # бы от того, занят ли на машине номер 4242 посторонним процессом (ревью раунда 4, пункт 4:
+    # `stop()` теперь судит по факту смерти).
+    monkeypatch.setattr(daemon_module, "процесс_жив", lambda pid: False)
 
     assert daemon_stop(home) is True
     assert pid_файл.exists(), "stop() унёс pid-файл нового демона"
@@ -164,6 +168,134 @@ def test_stop_не_удаляет_файл_с_недописанным_соде�
 
     assert daemon_stop(home) is False
     assert pid_файл.exists(), "stop() удалил файл, который не смог разобрать"
+
+
+# ---------------------------------------------------------------------------------------------
+# Ревью раунда 4, пункт 4 (находка вне раунда): `stop()` отчитывался успехом, не сняв процесс.
+#
+# Прежний код подавлял отказ `os.kill` целиком, после чего удалял pid-файл и возвращал `True`
+# независимо от исхода. Владелец видел ровно то, что и описано в находке: первый `stop()` —
+# «успех» и файл унесён, демон при этом жив; второй — `False`, и штатно управлять демоном больше
+# нечем. Решение — судить по ФАКТУ смерти процесса, а не по тому, подавилось ли исключение:
+# разбор `OSError` по подклассам на Windows не работает, потому что `os.kill` идёт через
+# `TerminateProcess` и `ProcessLookupError` может не прийти ни разу.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_stop_не_уносит_файл_когда_процесс_остался_жив(tmp_path, monkeypatch, caplog):
+    """Сердце находки: снять не смогли — значит отказ, а не успех. Файл остаётся (иначе демоном
+    нельзя управлять штатно вообще), ответ `False`, причина — в журнале.
+
+    Отказ `os.kill` задан принудительно: чем он был вызван у владельца, неизвестно, а механизм
+    существует безотносительно триггера."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("4242", encoding="utf-8")
+
+    def отказ_kill(pid, sig):
+        raise PermissionError(5, "отказано в доступе")
+
+    monkeypatch.setattr(daemon_module.os, "kill", отказ_kill)
+    monkeypatch.setattr(daemon_module, "процесс_жив", lambda pid: True)
+    monkeypatch.setattr(daemon_module, "ОЖИДАНИЕ_СМЕРТИ_ДЕМОНА_С", 0.2)
+
+    with caplog.at_level("WARNING", logger="odata1c.daemon"):
+        итог = daemon_stop(home)
+
+    assert итог is False, "не снятый процесс не может считаться остановленным"
+    assert pid_файл.exists(), "файл живого демона унесён — управлять им больше нечем"
+    assert pid_файл.read_text(encoding="utf-8").strip() == "4242"
+    assert "4242" in caplog.text, f"владелец не узнает, что демон жив: {caplog.text!r}"
+
+
+def test_stop_не_уносит_файл_даже_когда_kill_прошёл_а_процесс_жив(tmp_path, monkeypatch):
+    """Вторая половина того же: `os.kill` может не бросить ничего и при этом не снять процесс
+    (на Windows это `TerminateProcess`, завершение асинхронное). Решает не отсутствие исключения,
+    а проверка живости."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("4242", encoding="utf-8")
+
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(daemon_module, "процесс_жив", lambda pid: True)
+    monkeypatch.setattr(daemon_module, "ОЖИДАНИЕ_СМЕРТИ_ДЕМОНА_С", 0.2)
+
+    assert daemon_stop(home) is False
+    assert pid_файл.exists()
+
+
+def test_stop_дожидается_смерти_а_не_отчитывается_сразу(tmp_path, monkeypatch):
+    """Завершение на Windows асинхронное: сразу после `os.kill` процесс ещё жив. Ответ даётся по
+    факту смерти, поэтому «жив, жив, мёртв» — это успех, а не отказ."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text("4242", encoding="utf-8")
+    осталось_живым = [2]
+
+    def жив(pid):
+        if осталось_живым[0]:
+            осталось_живым[0] -= 1
+            return True
+        return False
+
+    monkeypatch.setattr(daemon_module.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(daemon_module, "процесс_жив", жив)
+
+    assert daemon_stop(home) is True
+    assert not pid_файл.exists()
+    assert осталось_живым[0] == 0, "проверка живости не повторялась — ответ дан до смерти"
+
+
+def test_stop_убирает_осиротевший_файл_если_процесса_уже_нет(tmp_path):
+    """Обратная сторона правила: отказ `os.kill` сам по себе провалом не является. Демон, упавший
+    или снятый диспетчером задач, оставляет pid-файл без процесса за ним; `os.kill` на такой номер
+    на Windows бросает `OSError` — это единственный способ ОС сказать «процесса нет». Работа при
+    этом сделана: файл надо убрать, иначе он останется навсегда, а вместе с ним и риск снять
+    чужой процесс, когда ОС переиспользует номер.
+
+    Всё настоящее: номер принадлежал процессу, который действительно завершился, исключение
+    бросает сама ОС, живость проверяется настоящим `OpenProcess`."""
+    процесс = subprocess.Popen([sys.executable, "-c", "pass"])
+    процесс.wait(timeout=30)
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text(str(процесс.pid), encoding="utf-8")
+
+    assert daemon_stop(home) is True
+    assert not pid_файл.exists(), "осиротевший pid-файл остался бы навсегда"
+
+
+def test_stop_на_настоящем_процессе_отличает_снятый_от_живого(tmp_path, monkeypatch, победитель):
+    """То же на настоящем процессе и настоящей проверке живости (`OpenProcess` +
+    `GetExitCodeProcess`), без подмены чего-либо, кроме самого отказа `os.kill`.
+
+    Сначала отказ: процесс жив, файл на месте, ответ `False`. Затем обычный вызов: процесс снят,
+    файл убран, ответ `True`. Одна и та же функция на одном и том же процессе отвечает по-разному —
+    ровно то, чего прежний `stop()` не мог по построению."""
+    home = tmp_path / "home"
+    home.mkdir()
+    pid_файл = home / "daemon.pid"
+    pid_файл.write_text(str(победитель.pid), encoding="utf-8")
+
+    with monkeypatch.context() as отказ:
+        отказ.setattr(
+            daemon_module.os,
+            "kill",
+            lambda pid, sig: (_ for _ in ()).throw(PermissionError(5, "отказано в доступе")),
+        )
+        отказ.setattr(daemon_module, "ОЖИДАНИЕ_СМЕРТИ_ДЕМОНА_С", 0.3)
+        assert daemon_stop(home) is False
+
+    assert победитель.poll() is None, "процесс не должен был пострадать"
+    assert pid_файл.exists()
+
+    assert daemon_stop(home) is True
+    assert победитель.wait(timeout=10) is not None
+    assert not pid_файл.exists()
 
 
 def test_pid_файл_пишется_атомарно(tmp_path, monkeypatch):
