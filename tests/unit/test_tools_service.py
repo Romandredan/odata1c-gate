@@ -1480,6 +1480,73 @@ async def test_reindex_пересобирает_политику_и_гейт_е�
     assert гейт.is_protected("Catalog_Контрагенты", "Description")
 
 
+async def test_перечисление_тип_лица_приходит_открытым(сервис, respx_ut):
+    """Находка П1: `ЮрФизЛицо` — перечисление «юрлицо/физлицо», а не ФИО; модели нужно его
+    значение, чтобы отличить организацию от ИП. Название рядом по-прежнему токен."""
+    respx_ut.get(КОНТРАГЕНТЫ).mock(
+        return_value=_одна_запись({"ЮрФизЛицо": "ФизЛицо", "Description": "ИП Иванов"})
+    )
+
+    данные = json.loads(
+        await сервис.query(
+            SessionScope(),
+            base="ut",
+            entity=КОНТРАГЕНТЫ,
+            select=["Ref_Key", "ЮрФизЛицо", "Description"],
+        )
+    )
+
+    запись = данные["items"][0]
+    assert запись["ЮрФизЛицо"] == "ФизЛицо"
+    assert запись["Description"].startswith("[[org:")
+    assert "ЮрФизЛицо" not in данные["masked_fields"]
+
+
+def _записать_auto(дом, ключ: str, класс: str) -> None:
+    путь = policy_path(дом, "ut")
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    политика["auto"][ключ] = класс
+    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+
+
+async def test_reindex_без_изменений_пересобирает_устаревший_auto(
+    сервис, respx_ut, edmx_ut_real, дом
+):
+    """Находка П1, доставка правки: классификатор поменялся, а `$metadata` базы — нет. Прежде
+    реиндекс отвечал «без изменений» и раздел `auto` не пересобирал вовсе: у владельца
+    `ЮрФизЛицо: person` пережил бы обновление шлюза, пока в конфигурации 1С что-нибудь не
+    поменяется, — то есть правка до установленной базы не доходила бы без `force`."""
+    _записать_auto(дом, "Catalog_Контрагенты.ЮрФизЛицо", "person")
+    гейт = сервис._gate_for(сервис._config.bases["ut"])
+    гейт.refresh(force=True)
+    assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо") == "person"
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+
+    данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
+
+    assert данные["changed"] is False
+    политика = yaml.safe_load(policy_path(дом, "ut").read_text(encoding="utf-8"))
+    assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
+    assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо") is None
+
+
+async def test_reindex_без_изменений_не_переписывает_политику_без_нужды(
+    сервис, respx_ut, edmx_ut_real, дом
+):
+    """Обратная сторона: раздел `auto` совпал — файл политики не трогается ни на байт. Политику
+    правит и владелец (комментарии, ручные разделы), а фоновая проверка `$metadata` зовёт
+    реиндекс раз в сутки: переписывать файл на каждом таком вызове значило бы терять его
+    разметку без всякой причины."""
+    путь = policy_path(дом, "ut")
+    путь.write_text(путь.read_text(encoding="utf-8") + "# заметка владельца\n", encoding="utf-8")
+    до = путь.read_bytes()
+    respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+
+    await сервис.reindex(SessionScope(), base="ut")
+
+    assert путь.read_bytes() == до
+
+
 async def test_reindex_сохраняет_ручные_разделы_политики(сервис, respx_ut, edmx_ut_real, дом):
     """Реиндекс перезаписывает только раздел `auto`; `entities.hide` — ручная настройка
     владельца, и потерять её значит молча открыть модели то, что он закрыл."""

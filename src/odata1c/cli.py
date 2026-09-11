@@ -282,9 +282,14 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
         await client.close()
 
     print(результат.message)
-    if результат.changed:
-        на_проверку = refresh_policy(home, base)
-        print(f"политика обновлена: {policy_path(home, base.name)}")
+    # Политика — на каждом реиндексе, а не только перестроившем индекс (находка П1, тот же довод,
+    # что у `ToolService.reindex`): раздел `auto` зависит и от классификатора, а тот меняется с
+    # версией шлюза. Сообщение печатается, только если файл действительно переписан.
+    путь_политики = policy_path(home, base.name)
+    было = путь_политики.read_bytes() if путь_политики.exists() else None
+    на_проверку = refresh_policy(home, base)
+    if путь_политики.read_bytes() != было:
+        print(f"политика обновлена: {путь_политики}")
         if на_проверку:
             print(f"поля классов org и person на проверку ({len(на_проверку)}):")
             for поле in на_проверку[:20]:

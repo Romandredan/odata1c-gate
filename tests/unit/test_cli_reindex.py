@@ -51,6 +51,35 @@ def test_reindex_строит_индекс_на_базе_без_индекса(t
     assert (home / "bases" / "ut" / "metadata.sqlite").exists()
 
 
+@respx.mock
+def test_reindex_без_изменений_пересобирает_устаревший_auto(tmp_path, capsys, edmx_ut_real):
+    """Находка П1, доставка правки классификатора через командную строку: `$metadata` тот же,
+    а раздел `auto` устарел (так его записал прежний классификатор) — обычный `reindex` без
+    `--force` обязан его пересобрать и сказать об этом; повторный вызов — промолчать."""
+    import yaml
+
+    home = _домашний_с_базой(tmp_path)
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
+    _замокать_завершение_сеанса()
+    assert main(["reindex", "ut", "--home", str(home)]) == 0
+    путь = home / "bases" / "ut" / "policy.yaml"
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    политика["auto"]["Catalog_Контрагенты.ЮрФизЛицо"] = "person"
+    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["reindex", "ut", "--home", str(home)]) == 0
+    вывод = capsys.readouterr().out
+
+    assert "без изменений" in вывод
+    assert "политика обновлена" in вывод
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
+
+    assert main(["reindex", "ut", "--home", str(home)]) == 0
+    assert "политика обновлена" not in capsys.readouterr().out
+
+
 def test_reindex_неизвестной_базы(tmp_path, capsys):
     home = _домашний_с_базой(tmp_path)
 
