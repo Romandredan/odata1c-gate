@@ -160,16 +160,30 @@ class Client1C:
         )
         return response.content
 
-    async def post(self, path: str, json: dict) -> dict:
-        response = await self._request("POST", path, json=json, retry=False)
-        return json_mod.loads(_тело_текстом(response)) if response.content else {}
+    async def post(self, path: str, json: dict, *, scrub: Scrub | None = None) -> dict:
+        """Создание объекта. `scrub` — ранний проход гейта, тот же протокол, что у `get` (Б-3,
+        находка M-6 ревью 7): ответ на запись — объект 1С целиком, и в нём, как и в тексте ошибки,
+        стоят значения, которые шлюз только что раскрыл для тела запроса. Без прохода ответ на
+        запись шёл бы в модель мимо него. Пишущий тул передаёт `scrub` всегда."""
+        response = await self._request("POST", path, json=json, retry=False, scrub=scrub)
+        return self._разобрать_ответ_записи(response, scrub)
 
-    async def patch(self, path: str, json: dict) -> dict:
-        response = await self._request("PATCH", path, json=json, retry=False)
-        return json_mod.loads(_тело_текстом(response)) if response.content else {}
+    async def patch(self, path: str, json: dict, *, scrub: Scrub | None = None) -> dict:
+        """Изменение объекта; `scrub` — как у `post`."""
+        response = await self._request("PATCH", path, json=json, retry=False, scrub=scrub)
+        return self._разобрать_ответ_записи(response, scrub)
 
-    async def delete(self, path: str) -> None:
-        await self._request("DELETE", path, retry=False)
+    async def delete(self, path: str, *, scrub: Scrub | None = None) -> None:
+        """Удаление; тела у ответа нет, `scrub` нужен тексту ошибки — 1С повторяет в нём путь, а
+        в пути стоит раскрытый ключ."""
+        await self._request("DELETE", path, retry=False, scrub=scrub)
+
+    @staticmethod
+    def _разобрать_ответ_записи(response: httpx.Response, scrub: Scrub | None) -> dict:
+        if not response.content:
+            return {}
+        тело = _тело_текстом(response)
+        return scrub.load(тело) if scrub is not None else json_mod.loads(тело)
 
     async def close(self) -> None:
         if self._session_started and self._base.ib_session:

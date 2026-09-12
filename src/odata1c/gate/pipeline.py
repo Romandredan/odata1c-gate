@@ -24,7 +24,7 @@ from odata1c.gate.masking import (
     inbound_path_class,
 )
 from odata1c.gate.policy import load_policy
-from odata1c.gate.revealed import RevealedValues
+from odata1c.gate.revealed import RevealedValues, ScrubbedText
 from odata1c.gate.unmasking import Unmasker
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
@@ -276,9 +276,9 @@ class BaseGate:
 
     def scrub_revealed_json(self, text: str, revealed: RevealedValues | None):
         """Тот же ранний проход по сырому телу УСПЕШНОГО ответа — и его разбор JSON (Ruling 32):
-        строки, которые проход переписал, приходят `revealed.ScrubbedText` с исходным значением
-        своего места, и маскировщик токенизирует поле с классом по нему. Без раскрытого —
-        обычный `json.loads`."""
+        строки, которые проход переписал, приходят `revealed.ScrubbedText`, исходное значение
+        своего места каждая оставляет в наборе вызова (Б-3), и маскировщик токенизирует поле с
+        классом по нему. Без раскрытого — обычный `json.loads`."""
         if self.mode == "off" or not revealed:
             return json.loads(text)
         return self._guard.scrub_revealed_json(text, revealed, mode=self.mode)
@@ -304,7 +304,13 @@ class BaseGate:
         `revealed` — набор раскрытого в этом вызове (задача N1 M1d): страж ищет в ответе и его.
         Умолчание `None` здесь допустимо, в отличие от `inbound_*`: у вызова, который ничего не
         раскрывал, набора и нет, а тот, кто раскрывал, получает набор и на входе, и на выходе из
-        одного места — `ToolService._run`."""
+        одного места — `ToolService._run`.
+
+        Сторож Б-3 (находка M-6 ревью 7): строка, переписанная ранним проходом (`ScrubbedText`),
+        в конверте означает, что тул положил ответ 1С в выдачу мимо маскировщика, — ответ
+        заменяется ошибкой `internal`. См. `_отказ_мимо_маскировщика`."""
+        if _есть_строка_раннего_прохода(envelope):
+            return self._отказ_мимо_маскировщика(revealed)
         текст = json.dumps(envelope, ensure_ascii=False)
         проверено = self._guard.check(текст, mode=self.mode, revealed=revealed)
         # Замены, сделанные проходом по сырому ответу (`scrub_revealed`), считаются наравне с
@@ -325,8 +331,33 @@ class BaseGate:
 
     def finish_text(self, text: str, revealed: RevealedValues | None = None) -> str:
         """Страж по готовому тексту целиком, без обёртки в JSON-конверт — для markdown-ответов
-        (`describe` и подобные), а не JSON-тулов. `revealed` — как у `finish`."""
+        (`describe` и подобные), а не JSON-тулов. `revealed` — как у `finish`, сторож Б-3 — тоже."""
+        if isinstance(text, ScrubbedText):
+            return self._отказ_мимо_маскировщика(revealed)
         return self._guard.check(text, mode=self.mode, revealed=revealed).text
+
+    def _отказ_мимо_маскировщика(self, revealed: RevealedValues | None) -> str:
+        """Ответ вместо конверта, в котором нашлась строка раннего прохода (сторож Б-3).
+
+        Почему отказ, а не «привести к обычной строке и отдать». Сама строка утечки не несёт:
+        исходное значение хранит набор вызова (`RevealedValues.original_of`), в строке — токены
+        раннего прохода. Но она не прошла маскировщик, а поле с классом закрывает только он:
+        ранний проход меняет лишь раскрытое в этом вызове, а соседний реквизит той же строки
+        (второй ИНН, телефон, название) остаётся открытым до стража — последнего рубежа, а не
+        основного. Такой ответ — дефект тула (M2: ответ на запись, отданный как пришёл), и
+        показать его громко дешевле, чем полагаться на то, что страж узнает всё.
+
+        В журнал — только факт: ни текста ответа, ни пути к строке (в нём могут быть данные)."""
+        _log.error("сторож Б-3: в ответ тула попала строка раннего прохода мимо маскировщика")
+        конверт = {
+            "error": {
+                "code": "internal",
+                "message": "внутренняя ошибка шлюза: ответ 1С не прошёл маскировку",
+                "hint": "это дефект шлюза, а не запроса; сообщите владельцу",
+            }
+        }
+        текст = json.dumps(конверт, ensure_ascii=False)
+        return self._guard.check(текст, mode=self.mode, revealed=revealed).text
 
     def error(
         self, code: str, message: str, hint: str = "", revealed: RevealedValues | None = None
@@ -353,6 +384,27 @@ class BaseGate:
         return self.finish(
             {"error": {"code": code, "message": сообщение, "hint": подсказка}}, revealed
         )
+
+
+def _есть_строка_раннего_прохода(значение) -> bool:
+    """Есть ли в конверте строка `ScrubbedText` — в значениях, в ключах, на любой глубине.
+
+    Обход итеративный (конверт `raw_get` бывает глубоким, рекурсия упёрлась бы в предел стека) и
+    стоит один проход по конверту — дешевле сериализации, которая идёт следом. Проверяются и
+    ключи: разбор с пометками ключей не помечает, но сторож держит правило «строка раннего
+    прохода не выходит», а не знание о том, как устроен сегодняшний разбор."""
+    стек = [значение]
+    while стек:
+        текущее = стек.pop()
+        if isinstance(текущее, str):
+            if isinstance(текущее, ScrubbedText):
+                return True
+        elif isinstance(текущее, dict):
+            стек.extend(текущее.keys())
+            стек.extend(текущее.values())
+        elif isinstance(текущее, list | tuple):
+            стек.extend(текущее)
+    return False
 
 
 def guard_only(guard: Guard, envelope: dict) -> str:

@@ -16,7 +16,7 @@ from odata1c.gate.contact_info import EntityShape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.masking import ПРЕДУПРЕЖДЕНИЕ_КОНТАКТНОЙ_ИНФОРМАЦИИ, Masker
 from odata1c.gate.policy import load_policy
-from odata1c.gate.revealed import RevealedValues, ScrubbedText
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.tokens import TOKEN_RE
 
 СЕКРЕТ = "секрет ровно для тестов контактов".encode()
@@ -600,13 +600,14 @@ def test_ранний_проход_тот_же_токен(маскировщик
     строка = строка_телефона("+7 (4912) 12-34-56", "7", "4912", "12-34-56")
     обычный = маскировщик.mask(dict(строка), entity=КИ_КОНТРАГЕНТОВ, shape=строение).data
     переписанное = dict(строка)
-    переписанное["Значение"] = ScrubbedText.of(
+    набор = RevealedValues()
+    переписанное["Значение"] = набор.scrubbed(
         строка["Значение"].replace("+7 (4912) 12-34-56", "[[phone:X]]"),
         original=строка["Значение"],
         hits=1,
     )
     данные = маскировщик.mask(
-        переписанное, entity=КИ_КОНТРАГЕНТОВ, shape=строение, revealed=RevealedValues()
+        переписанное, entity=КИ_КОНТРАГЕНТОВ, shape=строение, revealed=набор
     ).data
     assert данные["Значение"] == обычный["Значение"] == обычный["Представление"]
 

@@ -9,7 +9,7 @@ from odata1c.gate.masking import (
     Masker,
 )
 from odata1c.gate.policy import load_policy
-from odata1c.gate.revealed import RevealedValues, ScrubbedText
+from odata1c.gate.revealed import RevealedValues
 
 СЕКРЕТ = "секрет ровно для тестов подмены!!".encode()
 
@@ -1171,9 +1171,9 @@ def test_раскрытое_внутри_поля_с_классом_возвра
     набор = RevealedValues()
     набор.add("ООО Ромашка", token=токен_части)
     # Так ответ приходит после раннего прохода (`Guard.scrub_revealed_json`): замена засчитана
-    # стражу, а строка несёт то, что стояло на ЭТОМ месте до замены (Ruling 32).
+    # стражу, а набор помнит, что стояло на ЭТОМ месте до замены (Ruling 32, Б-3).
     набор.note(1)
-    переписанное = ScrubbedText.of(
+    переписанное = набор.scrubbed(
         f"{токен_части} (Москва)", original="ООО Ромашка (Москва)", hits=1
     )
 
@@ -1194,11 +1194,29 @@ def test_исходное_без_токена_не_уходит_из_маски�
     ветки не доходят."""
     набор = RevealedValues()
     набор.note(1)
-    переписанное = ScrubbedText.of("[[org:1]]", original="  ", hits=1)
+    переписанное = набор.scrubbed("[[org:1]]", original="  ", hits=1)
 
     результат = гейт().mask({"ИНН": переписанное}, entity="Catalog_Контрагенты", revealed=набор)
 
     assert результат.data["ИНН"] == "[[org:1]]"
+    assert type(результат.data["ИНН"]) is str
+    assert результат.masked_fields == ["ИНН"]
+    assert набор.replacements == 1
+
+
+def test_строка_чужого_вызова_не_получает_исходного(гейт):
+    """Б-3: исходное значение места хранит набор раскрытого ТОГО вызова, в котором ранний проход
+    переписал строку. Строка, попавшая в маскировщик с другим набором (или вовсе без него),
+    своего исходного не находит — и поле остаётся тем, что сделал ранний проход, а его замены —
+    засчитанными стражу. Подставить «чьё-нибудь» исходное нельзя: это значение чужого места."""
+    чужой = RevealedValues()
+    переписанное = чужой.scrubbed("[[inn:ABCDEFGHJK]]", original="7707083893", hits=1)
+    набор = RevealedValues()
+    набор.note(1)
+
+    результат = гейт().mask({"ИНН": переписанное}, entity="Catalog_Контрагенты", revealed=набор)
+
+    assert результат.data["ИНН"] == "[[inn:ABCDEFGHJK]]"
     assert type(результат.data["ИНН"]) is str
     assert результат.masked_fields == ["ИНН"]
     assert набор.replacements == 1
@@ -1216,12 +1234,13 @@ def test_открытое_поле_закрытое_ранним_проходо�
         маскировщик = Masker(
             словарь, load_policy(tmp_path / "policy.yaml"), mode="identifiers+names", base="ut"
         )
-        переписанное = ScrubbedText.of("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
+        набор = RevealedValues()
+        переписанное = набор.scrubbed("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
 
         результат = маскировщик.mask(
             {"Комментарий": переписанное, "Прочее": "без замен"},
             entity="Catalog_Контрагенты",
-            revealed=RevealedValues(),
+            revealed=набор,
         )
 
         assert результат.data["Комментарий"] == "см. [[org:1]]"
@@ -1237,14 +1256,15 @@ def test_открытое_поле_закрытое_ранним_проходо�
 def test_исходное_значение_не_едет_дальше_маскировщика(гейт):
     """Строка с исходным значением (`ScrubbedText`) не выходит из маскировщика ни в одном поле:
     ни в поле с классом, ни в поле без класса, ни в открытом по политике, ни во вложенном."""
-    переписанное = ScrubbedText.of("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
+    набор = RevealedValues()
+    переписанное = набор.scrubbed("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
     данные = {
-        "Description": ScrubbedText.of("[[org:1]]", original="ООО Ромашка", hits=1),
+        "Description": набор.scrubbed("[[org:1]]", original="ООО Ромашка", hits=1),
         "Комментарий": переписанное,
         "Строки": [{"Содержание": переписанное}, переписанное],
     }
 
-    результат = гейт().mask(данные, entity="Catalog_Контрагенты", revealed=RevealedValues())
+    результат = гейт().mask(данные, entity="Catalog_Контрагенты", revealed=набор)
 
     def строки(значение):
         if isinstance(значение, dict):

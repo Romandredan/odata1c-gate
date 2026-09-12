@@ -156,6 +156,89 @@ async def test_запись_не_повторяется():
     assert route.call_count == 1
 
 
+# --- Б-3 (M-6 ревью 7): ранний проход у пишущих запросов ------------------------------------
+
+_ЗНАЧЕНИЕ = "7707083893"
+_ТОКЕН = "[[inn:ABCDEFGHJK]]"
+
+
+class _Проход:
+    """Ранний проход гейта по протоколу `client1c.client.Scrub`: вызов — по тексту ошибки,
+    `load` — по телу успешного ответа вместе с разбором. Записывает, что ему дали."""
+
+    def __init__(self) -> None:
+        self.тексты: list[str] = []
+        self.тела: list[str] = []
+
+    def __call__(self, text: str) -> str:
+        self.тексты.append(text)
+        return text.replace(_ЗНАЧЕНИЕ, _ТОКЕН)
+
+    def load(self, text: str):
+        self.тела.append(text)
+        return json.loads(text.replace(_ЗНАЧЕНИЕ, _ТОКЕН))
+
+
+def _ошибка_с_эхом() -> dict:
+    return {"odata.error": {"code": "-1", "message": {"lang": "ru", "value": f"ИНН {_ЗНАЧЕНИЕ}"}}}
+
+
+@respx.mock
+@pytest.mark.parametrize("метод", ["post", "patch"])
+async def test_ответ_на_запись_проходит_ранний_проход(метод):
+    """Тело успешного ответа на POST/PATCH — объект 1С целиком, с реальными значениями, и среди
+    них то, что шлюз только что раскрыл. Разбирает его ранний проход (`scrub.load`), как у `get`:
+    иначе ответ на запись шёл бы в модель мимо него (Б-3)."""
+    respx.route(method=метод.upper(), url=f"{URL}Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"ИНН": _ЗНАЧЕНИЕ})
+    )
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    проход = _Проход()
+    client = Client1C(база())
+
+    ответ = await getattr(client, метод)("Catalog_Контрагенты", {"ИНН": _ЗНАЧЕНИЕ}, scrub=проход)
+    await client.close()
+
+    assert ответ == {"ИНН": _ТОКЕН}
+    assert len(проход.тела) == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("метод", ["post", "patch", "delete"])
+async def test_ошибка_записи_проходит_ранний_проход(метод):
+    """1С повторяет переданное значение в тексте ошибки (проба P7), а на записи переданное — это
+    раскрытое шлюзом. Текст ошибки проходит ранний проход до `map_error`, как у `get`."""
+    respx.route(method=метод.upper(), url=f"{URL}Catalog_Контрагенты").mock(
+        return_value=httpx.Response(400, json=_ошибка_с_эхом())
+    )
+    проход = _Проход()
+    client = Client1C(база())
+    аргументы = () if метод == "delete" else ({"ИНН": _ЗНАЧЕНИЕ},)
+
+    with pytest.raises(OdataError) as ошибка:
+        await getattr(client, метод)("Catalog_Контрагенты", *аргументы, scrub=проход)
+    await client.close()
+
+    assert _ЗНАЧЕНИЕ not in ошибка.value.message
+    assert _ТОКЕН in ошибка.value.message
+    assert проход.тексты
+
+
+@respx.mock
+async def test_пустой_ответ_на_запись_не_разбирается():
+    """1С отвечает на PATCH без тела (204) — разбирать нечего, и ранний проход не вызывается."""
+    respx.patch(f"{URL}Catalog_Контрагенты").mock(return_value=httpx.Response(204))
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    проход = _Проход()
+    client = Client1C(база())
+
+    ответ = await client.patch("Catalog_Контрагенты", {"ИНН": _ЗНАЧЕНИЕ}, scrub=проход)
+    await client.close()
+
+    assert ответ == {}
+    assert проход.тела == []
+
+
 @respx.mock
 async def test_таймаут_одного_запроса_передаётся_в_httpx():
     """Таймаут одного запроса (план M1d, задача 2): `get(..., timeout=…)` доходит до httpx как
