@@ -59,7 +59,7 @@ def render(recipe: Recipe, values: dict) -> QueryArgs:
     if неизвестные:
         raise RecipeError(
             "recipe_param",
-            f"рецепт не принимает параметры: {', '.join(неизвестные)}",
+            f"рецепт не принимает часть переданных параметров: {len(неизвестные)}",
             f"параметры рецепта: {', '.join(recipe.params) or 'нет'}",
         )
     недостающие = sorted(

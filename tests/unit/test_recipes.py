@@ -213,7 +213,10 @@ def test_неизвестный_параметр_отклоняется(tmp_path
     with pytest.raises(RecipeError) as отказ:
         render(р, {"регион": "Москва"})
     assert отказ.value.code == "recipe_param"
-    assert "регион" in отказ.value.message
+    # Ruling 53: имя от модели не повторяется (ни в тексте, ни в подсказке), параметры рецепта —
+    # в подсказке: они из файла рецептов, а не из ввода.
+    assert "регион" not in отказ.value.message and "регион" not in отказ.value.hint
+    assert "город" in отказ.value.hint
 
 
 def test_значение_негодного_формата_отклоняется(tmp_path):

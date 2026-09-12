@@ -8,6 +8,7 @@
 адреса под завершение сеанса 1С.
 """
 
+import contextlib
 import json
 import re
 
@@ -291,6 +292,18 @@ def строки_словаря(tools: ToolService) -> dict[str, int]:
     return {
         имя: соединение.execute(f'SELECT COUNT(*) FROM "{имя}"').fetchone()[0] for имя in таблицы
     }
+
+
+@contextlib.contextmanager
+def _строение_индекса(tools: ToolService):
+    """Строение сущностей по индексу базы `ut` — то, что тул передаёт гейту. Нужно, когда тест
+    сверяет текст отказа прямого вызова гейта с текстом тула: имя поля отказ называет, только
+    если индекс его знает (Ruling 53)."""
+    репозиторий = tools._open_index(tools._config.bases["ut"])
+    try:
+        yield tools._строение(репозиторий)
+    finally:
+        репозиторий.close()
 
 
 def ошибка(текст: str) -> dict:
@@ -1210,12 +1223,12 @@ async def test_отказ_по_открытой_дате_рождения_как
         )
         for догадка in ("1985-03-14T00:00:00", "1985-03-15T00:00:00")
     ]
-    with pytest.raises(GateError) as на_чтении:
+    with _строение_индекса(tools) as строение, pytest.raises(GateError) as на_чтении:
         гейт.inbound_filter(
             "ДатаРождения eq datetime'1985-03-14T00:00:00'",
             entity=лица,
             revealed=RevealedValues(),
-            shape=строение_неизвестно,
+            shape=строение,
         )
 
     образец = open_literal_refusal("dob", "ДатаРождения")
@@ -1255,12 +1268,12 @@ async def test_токен_внутри_литерала_даты_рождени�
             data={"ДатаРождения": значение},
         )
     )
-    with pytest.raises(GateError) as на_чтении:
+    with _строение_индекса(tools) as строение, pytest.raises(GateError) as на_чтении:
         гейт.inbound_filter(
             f"ДатаРождения eq '{значение}'",
             entity=лица,
             revealed=RevealedValues(),
-            shape=строение_неизвестно,
+            shape=строение,
         )
 
     assert на_чтении.value.code == "token_partial"
@@ -1965,3 +1978,161 @@ async def test_обрезок_токена_в_имени_поля_ключа_н�
 
     _без_метки(отказ, т)
     assert not одинс.обращались
+
+
+# Ruling 53: отказы по несуществующему имени имя не повторяют — оно вход модели, и эхо прошло бы
+# маску текста или страж (у отказов без гейта — `guard_only`). Метка — цифры телефона из словаря
+# фикстуры, вписанные в имя: слой цифр стража заменил бы их токеном. Имена из индекса (найденная
+# сущность, подсказки похожих) повторяются.
+
+ИМЯ_С_МЕТКОЙ = f"Поле{ЦИФРЫ_ТЕЛЕФОНА}"
+
+
+async def _отказ(вызов) -> dict:
+    return ошибка(await вызов)
+
+
+ОТКАЗЫ_ПО_ИМЕНИ = [
+    pytest.param(
+        lambda tools: tools.query(SessionScope(), base="ut", entity=f"Catalog_{ЦИФРЫ_ТЕЛЕФОНА}"),
+        "entity_unknown",
+        id="сущность",
+    ),
+    pytest.param(
+        lambda tools: tools.describe_entity(
+            SessionScope(), base="ut", entity=f"Catalog_{ЦИФРЫ_ТЕЛЕФОНА}"
+        ),
+        "entity_unknown",
+        id="сущность-describe",
+    ),
+    pytest.param(
+        lambda tools: tools.query(
+            SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, filter=f"ИНН{ЦИФРЫ_ТЕЛЕФОНА} gt 'x'"
+        ),
+        "filter_syntax",
+        id="поле-отбора",
+    ),
+    pytest.param(
+        lambda tools: tools.query(
+            SessionScope(),
+            base="ut",
+            entity=КОНТРАГЕНТЫ,
+            filter=f"Контрагент/ИНН{ЦИФРЫ_ТЕЛЕФОНА} gt 'x'",
+        ),
+        "filter_syntax",
+        id="путь-отбора",
+    ),
+    pytest.param(
+        lambda tools: tools.raw_get(
+            SessionScope(),
+            base="ut",
+            path=f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/{ИМЯ_С_МЕТКОЙ}/{ИМЯ_С_МЕТКОЙ}",
+        ),
+        "entity_unknown",
+        id="сегменты-raw_get",
+    ),
+    pytest.param(
+        lambda tools: tools.raw_get(
+            SessionScope(), base="ut", path=КОНТРАГЕНТЫ, query={ИМЯ_С_МЕТКОЙ: {"a": 1}}
+        ),
+        "params_invalid",
+        id="параметр-raw_get",
+    ),
+    pytest.param(
+        lambda tools: tools.raw_get(
+            SessionScope(), base="ut", path=КОНТРАГЕНТЫ, query={ИМЯ_С_МЕТКОЙ: "[[inn:X]]"}
+        ),
+        "params_invalid",
+        id="токен-в-параметре-raw_get",
+    ),
+    pytest.param(
+        lambda tools: tools.get(
+            SessionScope(),
+            base="ut",
+            entity=КУРСЫ,
+            key={"Period": "2026-01-01T00:00:00", "Валюта_Key": ССЫЛКА, ИМЯ_С_МЕТКОЙ: "x"},
+        ),
+        "params_invalid",
+        id="лишнее-поле-ключа",
+    ),
+    pytest.param(
+        lambda tools: tools.query(
+            SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, expand=ИМЯ_С_МЕТКОЙ
+        ),
+        "params_invalid",
+        id="навигация-expand",
+    ),
+    pytest.param(
+        lambda tools: tools.query(
+            SessionScope(),
+            base="ut",
+            entity=f"{КУРСЫ}_SliceLast",
+            params={ИМЯ_С_МЕТКОЙ: 1},
+        ),
+        "params_invalid",
+        id="параметр-виртуальной-таблицы",
+    ),
+    pytest.param(
+        lambda tools: tools.recipe(SessionScope(), base="ut", name=ИМЯ_С_МЕТКОЙ),
+        "recipe_unknown",
+        id="рецепт",
+    ),
+    pytest.param(lambda tools: tools.info(topic=ИМЯ_С_МЕТКОЙ), "params_invalid", id="тема-info"),
+    pytest.param(
+        lambda tools: tools.query(SessionScope(), base=ИМЯ_С_МЕТКОЙ, entity=КОНТРАГЕНТЫ),
+        "base_unknown",
+        id="база",
+    ),
+]
+
+
+@pytest.mark.parametrize(("вызов", "код"), ОТКАЗЫ_ПО_ИМЕНИ)
+async def test_отказ_по_имени_не_повторяет_имя(среда, одинс, вызов, код):
+    _, _, tools, _ = среда
+    т = _метка_в_словаре(tools)
+
+    отказ = await _отказ(вызов(tools))
+
+    assert отказ["code"] == код, отказ
+    _без_метки(отказ, т)
+    assert not одинс.обращались
+
+
+async def test_отказ_по_полю_тела_не_повторяет_имя(среда, одинс):
+    запись, _, tools, _ = среда
+    т = _метка_в_словаре(tools)
+
+    отказ = await _отказ_записи(запись, КОНТРАГЕНТЫ, ССЫЛКА, {ИМЯ_С_МЕТКОЙ: "x"})
+
+    assert отказ["code"] == "params_invalid" and КОНТРАГЕНТЫ in отказ["message"]
+    _без_метки(отказ, т)
+    assert not одинс.обращались
+
+
+async def test_подсказки_имён_из_индекса_остаются(среда, одинс):
+    """Опечатка в настоящем имени по-прежнему получает подсказку — именами из индекса."""
+    запись, _, tools, _ = среда
+
+    сущность = await _отказ(tools.query(SessionScope(), base="ut", entity="Catalog_Контрагент"))
+    поле = await _отказ_записи(запись, КОНТРАГЕНТЫ, ССЫЛКА, {"ИННН": "x"})
+    навигация = await _отказ(
+        tools.query(SessionScope(), base="ut", entity=РЕАЛИЗАЦИЯ, expand="Контрагнет")
+    )
+
+    assert сущность["code"] == "entity_unknown"
+    assert "Catalog_Контрагенты" in сущность["hint"]
+    assert "odata1c_find_entity" in сущность["message"]
+    assert "Catalog_Контрагент»" not in json.dumps(сущность, ensure_ascii=False)
+    assert "ИНН" in поле["hint"] and "ИННН" not in json.dumps(поле, ensure_ascii=False)
+    assert "Контрагент" in навигация["hint"] and "Контрагнет" not in json.dumps(
+        навигация, ensure_ascii=False
+    )
+
+
+async def test_имя_поля_из_индекса_в_отказе_отбора_остаётся(среда, одинс):
+    """Поле, которое индекс знает, отказ называет — это метаданные базы, а не ввод модели."""
+    _, _, tools, _ = среда
+
+    отказ = await _отказ_чтения(tools, КОНТРАГЕНТЫ, filter="ИНН gt 'x'")
+
+    assert отказ["code"] == "filter_syntax" and "«ИНН»" in отказ["message"]

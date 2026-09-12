@@ -85,7 +85,8 @@ def test_сужение_видимости_до_несуществующей_б�
     with pytest.raises(UnknownBase) as ошибка:
         registry.get("unknown", SessionScope(bases=("unknown",), default=None))
     assert ошибка.value.code == "base_unknown"
-    assert "unknown" in str(ошибка.value)
+    # Ruling 53: имя, которое прислала модель, в тексте не повторяется.
+    assert "unknown" not in str(ошибка.value) and "неизвестна" in str(ошибка.value)
 
 
 def test_обращение_с_пустой_строкой_вместо_имени():
