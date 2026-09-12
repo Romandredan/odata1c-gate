@@ -67,6 +67,7 @@ from odata1c.tools import describe as describe_tool
 from odata1c.tools import info as info_topics
 from odata1c.tools.odata_query import QueryError, build_get, build_query, orderby_fields
 from odata1c.tools.response import fit_result, items_of, page_info, strip_service, truncate_strings
+from odata1c.write.errors import WriteError
 
 _log = logging.getLogger(__name__)
 
@@ -535,6 +536,11 @@ class ToolService:
             PolicyError,
             RecipeError,
             _ServiceError,
+            # Отказ пишущего тула (M2): разрешения SPEC §7.1, поля и типы тела, pending-операция.
+            # Тот же протокол атрибутов, и путь тот же — через гейт, с набором раскрытого этого
+            # вызова. Без этой строки `base_read_only` или `field_write_denied` уходили бы в ветку
+            # ниже и становились `internal` с трассировкой в журнале.
+            WriteError,
         ) as ошибка:
             return self._safe_error(
                 гейт,
