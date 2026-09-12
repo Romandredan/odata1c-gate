@@ -1,6 +1,7 @@
 """Обратная подмена: $filter, тела записи, ключи, ошибки токенов (SPEC §6.7)."""
 
 import pytest
+from conftest import без_класса_пути
 
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.unmasking import GateError, Unmasker
@@ -23,7 +24,7 @@ def связка(tmp_path):
     def класс_поля(сущность, поле, *, strict=False):
         return классы.get((сущность, поле))
 
-    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля)
+    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
     словарь.close()
 
 

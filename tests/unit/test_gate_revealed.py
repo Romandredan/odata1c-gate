@@ -18,7 +18,7 @@ import json
 import urllib.parse
 
 import pytest
-from conftest import ЗНАЧЕНИЯ_КЛАССОВ
+from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_класса_пути
 
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
@@ -356,7 +356,7 @@ def размаскировщик(tmp_path):
     def класс_поля(entity, field, *, strict=False):
         return {"АдресРегистрации": "addr"}.get(field.rsplit("/", 1)[-1])
 
-    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля)
+    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
     словарь.close()
 
 

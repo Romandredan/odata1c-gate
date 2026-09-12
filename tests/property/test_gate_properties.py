@@ -114,6 +114,7 @@ def связка(*, base: str = "ut") -> typing.Iterator[Связка]:
                     словарь,
                     base=base,
                     field_class=lambda сущность, поле, *, strict=False: КЛАССЫ_ПОЛЕЙ.get(поле),
+                    path_class=lambda сущность, путь: None,
                 ),
                 страж=Guard(словарь),
             )

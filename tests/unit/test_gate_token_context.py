@@ -15,6 +15,7 @@
 """
 
 import pytest
+from conftest import без_класса_пути
 
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.tokens import CLASSES
@@ -66,7 +67,7 @@ def связка(tmp_path):
     def класс_поля(entity, field, *, strict=False):
         return классы.get(field)
 
-    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля)
+    yield словарь, Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
     словарь.close()
 
 
@@ -160,7 +161,7 @@ def test_токен_своего_класса_переживает_смену_к
             # Класс того же поля сменился после реиндекса — но не на класс токена.
             return "keep" if field == поле else None
 
-        обратно = Unmasker(словарь, base="ut", field_class=класс_поля)
+        обратно = Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
         assert значение in обратно.filter(f"{поле} eq '{выданный}'", entity=СУЩНОСТЬ)
     finally:
         словарь.close()
@@ -179,7 +180,7 @@ def test_послабление_привязано_к_сущности(tmp_path)
         def класс_поля(entity, field, *, strict=False):
             return "person" if entity == "Catalog_ФизическиеЛица" else "org"
 
-        обратно = Unmasker(словарь, base="ut", field_class=класс_поля)
+        обратно = Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
         assert "Ромашка" in обратно.filter(
             f"Description eq '{выданный}'", entity="Catalog_Контрагенты"
         )
@@ -203,7 +204,7 @@ def test_послабление_через_связанный_объект_ра�
         def класс_поля(entity, field, *, strict=False):
             return "keep" if field == "ИНН" else None
 
-        обратно = Unmasker(словарь, base="ut", field_class=класс_поля)
+        обратно = Unmasker(словарь, base="ut", field_class=класс_поля, path_class=без_класса_пути)
         результат = обратно.filter(
             f"Контрагент/ИНН eq '{выданный}'", entity="Document_РеализацияТоваровУслуг"
         )
