@@ -15,13 +15,16 @@ teardown для тестов, которые закрывают соединен
 from __future__ import annotations
 
 import datetime
+import decimal
+import math
+import sqlite3
 import sys
 
 import pytest
 
 from odata1c.config.home import check_file_permissions, ensure_home
 from odata1c.write.errors import WriteError
-from odata1c.write.journal import Journal
+from odata1c.write.journal import ВЕРСИЯ_СХЕМЫ, Journal
 from odata1c.write.pending import PendingOp
 
 
@@ -348,3 +351,171 @@ def test_отказ_close_commit_не_несёт_after_ни_в_сообщени�
     assert метка not in repr(ошибка.value)
     assert ошибка.value.__cause__ is not None
     assert метка not in repr(ошибка.value.__cause__)
+
+
+# =================================================================================================
+# Раунд 2 (ревью Changes Requested, m2-task4-review.md)
+# =================================================================================================
+
+
+# --- B-1(а): mkdir()/connect() внутри try — файл-каталог, блокированный путь -------------------
+
+
+def test_путь_журнала_это_каталог_даёт_writeerror(tmp_path):
+    путь = tmp_path / "journal.sqlite"
+    путь.mkdir()  # путь существует как директория, а не файл
+
+    with pytest.raises(WriteError) as ошибка:
+        Journal(путь)
+
+    assert ошибка.value.code == "internal"
+
+
+def test_путь_журнала_блокирован_файлом_даёт_writeerror(tmp_path):
+    # mkdir(parents=True) должен создать tmp_path/"blocker"/"sub", но "blocker" — обычный файл,
+    # а не каталог: раньше это падало голым FileExistsError/OSError (B-1а ревью, воспроизведено
+    # ревьюером на Windows как WinError 183).
+    заблокировано = tmp_path / "blocker"
+    заблокировано.write_text("не каталог")
+
+    with pytest.raises(WriteError) as ошибка:
+        Journal(заблокировано / "sub" / "journal.sqlite")
+
+    assert ошибка.value.code == "internal"
+
+
+# --- B-1(б): несериализуемые значения before/after/request — WriteError, не голый Type/ValueError
+
+
+def test_decimal_в_before_даёт_writeerror_не_голый_typeerror(open_journal):
+    журнал = open_journal()
+
+    with pytest.raises(WriteError) as ошибка:
+        журнал.open_commit(
+            операция(), client="claude-code", before={"Сумма": decimal.Decimal("10.50")}
+        )
+
+    assert ошибка.value.code == "internal"
+    assert ошибка.value.__cause__ is not None
+    assert isinstance(ошибка.value.__cause__, TypeError)
+    # После неудавшегося open_commit строки в журнале нет вовсе — запрос к 1С не выполнялся бы.
+    assert журнал.get("c1") is None
+
+
+def test_datetime_в_request_даёт_writeerror_не_голый_typeerror(open_journal):
+    журнал = open_journal()
+
+    with pytest.raises(WriteError) as ошибка:
+        журнал.open_commit(
+            операция(request={"method": "PATCH", "json": {"Дата": datetime.datetime.now()}}),
+            client="claude-code",
+            before=None,
+        )
+
+    assert ошибка.value.code == "internal"
+    assert isinstance(ошибка.value.__cause__, TypeError)
+
+
+def test_nan_в_after_close_commit_даёт_writeerror_не_голый_valueerror(open_journal):
+    журнал = open_journal()
+    журнал.open_commit(операция(), client="claude-code", before=None)
+
+    with pytest.raises(WriteError) as ошибка:
+        журнал.close_commit("c1", after={"Курс": math.nan}, status="committed")
+
+    assert ошибка.value.code == "internal"
+    assert isinstance(ошибка.value.__cause__, ValueError)
+
+
+# --- B-1б (находка исходного ревью): mark_undone не перезаписывает другим undone_by -------------
+
+
+def test_mark_undone_тем_же_undone_by_повторно_идемпотентно(open_journal):
+    журнал = open_journal()
+    журнал.open_commit(операция(commit_id="c1"), client="claude-code", before=None)
+    журнал.mark_undone("c1", "c2")
+
+    журнал.mark_undone("c1", "c2")  # повтор с тем же значением — не ошибка
+
+    assert журнал.get("c1").undone_by == "c2"
+
+
+def test_mark_undone_другим_undone_by_повторно_ошибка_программы(open_journal):
+    журнал = open_journal()
+    журнал.open_commit(операция(commit_id="c1"), client="claude-code", before=None)
+    журнал.mark_undone("c1", "c2")
+
+    with pytest.raises(RuntimeError):
+        журнал.mark_undone("c1", "c3")
+
+    # Первый факт (кто отменил) не потерян при отказе второй попытки.
+    assert журнал.get("c1").undone_by == "c2"
+
+
+# --- B-4: PRAGMA user_version — якорь миграций ---------------------------------------------------
+
+
+def test_новый_журнал_проставляет_версию_схемы(tmp_path, open_journal):
+    путь = tmp_path / "journal.sqlite"
+    open_journal(path=путь)
+
+    проверочное_соединение = sqlite3.connect(путь)
+    try:
+        версия = проверочное_соединение.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        проверочное_соединение.close()
+
+    assert версия == ВЕРСИЯ_СХЕМЫ
+
+
+def test_несовместимая_версия_схемы_даёт_writeerror(tmp_path):
+    путь = tmp_path / "journal.sqlite"
+    # Файл с корректной (для текущего кода) схемой commits, но версией из будущего — тот же
+    # сценарий, что у "устаревшего разбора" индекса
+    # (index/repository.py::require_current_version), только на открытии, а не на отдельном
+    # методе: журнал не поддерживает миграцию "на лету".
+    подготовка = sqlite3.connect(путь)
+    try:
+        подготовка.executescript(
+            """
+            CREATE TABLE commits (
+                commit_id TEXT PRIMARY KEY, base TEXT NOT NULL, entity TEXT NOT NULL,
+                key_json TEXT, op TEXT NOT NULL, session_id TEXT NOT NULL, client TEXT,
+                requested_at TEXT NOT NULL, committed_at TEXT, before_json TEXT,
+                after_json TEXT, request_json TEXT, status TEXT NOT NULL, error TEXT,
+                undone_by TEXT
+            );
+            """
+        )
+        подготовка.execute(f"PRAGMA user_version = {ВЕРСИЯ_СХЕМЫ + 1}")
+        подготовка.commit()
+    finally:
+        подготовка.close()
+
+    with pytest.raises(WriteError) as ошибка:
+        Journal(путь)
+
+    assert ошибка.value.code == "internal"
+    assert str(путь) in str(ошибка.value)
+
+
+# --- B-5: recent(limit) — границы -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("плохой_limit", [0, -1, -100])
+def test_recent_limit_меньше_1_даёт_valueerror(open_journal, плохой_limit):
+    журнал = open_journal()
+    журнал.open_commit(операция(), client="claude-code", before=None)
+
+    with pytest.raises(ValueError):
+        журнал.recent(base=None, limit=плохой_limit)
+
+
+def test_recent_limit_1_работает(open_journal):
+    журнал = open_journal()
+    журнал.open_commit(операция(commit_id="c1"), client="claude-code", before=None)
+    журнал.open_commit(операция(commit_id="c2"), client="claude-code", before=None)
+
+    недавние = журнал.recent(base=None, limit=1)
+
+    assert len(недавние) == 1

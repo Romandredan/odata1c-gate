@@ -54,13 +54,39 @@ CREATE TABLE IF NOT EXISTS commits (
 CREATE INDEX IF NOT EXISTS idx_commits_base ON commits(base, requested_at);
 """
 
+# `PRAGMA user_version` — якорь для будущих миграций схемы (round 2, находка B-4 ревью): у
+# `gate/dictionary.py` такой якорь появился только ПОСЛЕ того, как схема действительно поменялась
+# один раз, а нужный тогда пересчёт задним числом оказался отдельной задачей. Заводим версию сразу
+# на первой схеме — дешевле, чем повторять тот же долг. Файл с версией, отличной от текущей (не 0
+# — 0 значит «файл только что создан этим же кодом, PRAGMA ни разу не проставлялась» — и не
+# ВЕРСИЯ_СХЕМЫ), рассинхронизирован с этим кодом: читать его как есть означало бы либо упасть на
+# отсутствующей колонке при первом же запросе, либо, хуже, успешно прочитать по случайному
+# совпадению структуры и отдать не то. `WriteError` при открытии — тот же принцип, что у
+# повреждённого файла: журналу не нужна миграция «на лету», нужен явный отказ.
+ВЕРСИЯ_СХЕМЫ = 1
+
+
+class _ВерсияСхемыНеСовпадает(Exception):
+    """Внутренний маркер: файл существует и читаем, но его `PRAGMA user_version` — не текущая
+    версия схемы и не 0 (свежесозданная база). Наружу не выходит — `__init__` перехватывает и
+    переводит в `WriteError` тем же способом, что и повреждённый файл (B-4 ревью round 2)."""
+
+    def __init__(self, найдено: int) -> None:
+        super().__init__(f"версия схемы журнала {найдено}, ожидалась {ВЕРСИЯ_СХЕМЫ}")
+        self.найдено = найдено
+
 
 def _default_clock() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
 def _dump(value: dict | None) -> str | None:
-    return None if value is None else json.dumps(value, ensure_ascii=False)
+    # allow_nan=False (round 2, B-1б): по умолчанию json.dumps сериализует nan/inf литералами
+    # `NaN`/`Infinity` — валидный Python, но не валидный JSON (1С такое не примет, а обратное
+    # чтение через json.loads молча проглотило бы то же нарушение). Явный ValueError здесь —
+    # то же решение, что для несериализуемых типов (Decimal, datetime): открытие/close_commit
+    # отказывают до отправки в 1С, а не тихо портят файл журнала синтаксисом не-JSON.
+    return None if value is None else json.dumps(value, ensure_ascii=False, allow_nan=False)
 
 
 def _load(text: str | None) -> dict | None:
@@ -109,10 +135,19 @@ class Journal:
     ) -> None:
         self.path = pathlib.Path(path)
         self._clock = clock
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path)
-        self._connection.row_factory = sqlite3.Row
+        # `_connection` объявлен ДО try — если исключение прилетит раньше присвоения (`connect()`
+        # сам бросил, путь занят каталогом), except ниже должен отличить «соединения не было» от
+        # «соединение есть, но что-то пошло не так после» без AttributeError на пути закрытия.
+        self._connection: sqlite3.Connection | None = None
         try:
+            # round 2, находка B-1(а) ревью: раньше `mkdir()`/`connect()` стояли ДО этого try —
+            # каталог вместо файла (`sqlite3.OperationalError: unable to open database file`) или
+            # файл, блокирующий путь `mkdir(parents=True)` (`FileExistsError`), уходили из
+            # `__init__` голыми исключениями ОС/sqlite, а не `WriteError`. Тот же перехват ниже
+            # закрывает оба случая наравне с повреждённым файлом.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.path)
+            self._connection.row_factory = sqlite3.Row
             # Штатное управление транзакциями (без isolation_level=None) — тот же аргумент, что
             # у index/schema.py::connect() и gate/dictionary.py::Dictionary.__init__: `with
             # self._connection:` в open_commit/close_commit/mark_undone обязано фиксировать или
@@ -131,23 +166,49 @@ class Journal:
             # ограниченном лимитом коммитов на сессию (20–50 за 10 минут, SPEC §3.2) и диалогом
             # подтверждения перед каждым — не то, на чём стоит экономить.
             self._connection.executescript(СХЕМА)
-        except sqlite3.DatabaseError as ошибка:
+            версия = self._connection.execute("PRAGMA user_version").fetchone()[0]
+            if версия == 0:
+                self._connection.execute(f"PRAGMA user_version = {ВЕРСИЯ_СХЕМЫ}")
+            elif версия != ВЕРСИЯ_СХЕМЫ:
+                raise _ВерсияСхемыНеСовпадает(версия)
+        except (sqlite3.DatabaseError, OSError, _ВерсияСхемыНеСовпадает) as ошибка:
             # Если файл существует, но не SQLite-база (или повреждён), sqlite3 узнаёт об этом не
             # на connect(), а только на первой операции — соединение к этому моменту уже открыто
             # и держит файловый дескриптор. Не закрыв его перед тем, как исключение уйдёт
             # наверх, получаем недостижимый, но не закрытый sqlite3.Connection — на сборке
             # мусора ResourceWarning, а filterwarnings=["error"] превращает его в ошибку сессии
             # pytest (тот же дефект и то же решение — index/schema.py, gate/dictionary.py).
-            self._connection.close()
+            # `_connection` может быть `None` (сам `connect()` бросил) — закрываем только если
+            # соединение действительно открыто.
+            if self._connection is not None:
+                self._connection.close()
+            # Текст и подсказка НЕ содержат str(ошибка) (round 2, требование ревью): сообщение
+            # OSError несёт путь (не секрет — тем более он уже назван отдельно), но у общего
+            # перехвата на будущее нет гарантии, что так будет для каждого варианта ОС/sqlite —
+            # проще держать инвариант «наш текст не цитирует исключение» без исключений из
+            # правила, чем проверять это для каждой платформы. Цепочка `from ошибка` сохранена —
+            # трассировка и исходное исключение остаются доступны в логе демона (`__cause__`),
+            # только не пересказываются в тексте, который видит пользователь.
+            if isinstance(ошибка, _ВерсияСхемыНеСовпадает):
+                raise WriteError(
+                    "internal",
+                    f"журнал записи собран другой версией схемы: {self.path}",
+                    hint=(
+                        f"формат журнала не совпадает с этой версией odata1c — обновите пакет"
+                        f" или откатите его до версии, которая создала файл {self.path}. Если"
+                        f" это невозможно, переместите файл в сторону и начните новый журнал"
+                        f" (история выполненных записей и опора отката для них будет потеряна)"
+                    ),
+                ) from ошибка
             raise WriteError(
                 "internal",
                 f"журнал записи повреждён или недоступен: {self.path}",
                 hint=(
-                    f"журнал — единственное место, где хранится история выполненных записей и "
-                    f"опора отката (undo): восстановить его нельзя, только начать заново. "
-                    f"Переместите повреждённый файл {self.path} в сторону и запустите ещё раз — "
-                    f"новый журнал начнёт накапливаться с нуля, но откат записей, сделанных до "
-                    f"сих пор, перестанет быть доступен ({ошибка})"
+                    f"журнал — единственное место, где хранится история выполненных записей и"
+                    f" опора отката (undo): восстановить его нельзя, только начать заново."
+                    f" Переместите повреждённый файл {self.path} в сторону и запустите ещё"
+                    f" раз — новый журнал начнёт накапливаться с нуля, но откат записей,"
+                    f" сделанных до сих пор, перестанет быть доступен"
                 ),
             ) from ошибка
 
@@ -197,7 +258,17 @@ class Journal:
             raise RuntimeError(
                 f"open_commit вызван повторно для commit_id={op.commit_id!r}"
             ) from ошибка
-        except sqlite3.Error as ошибка:
+        except (sqlite3.Error, TypeError, ValueError) as ошибка:
+            # round 2, находка B-1(б) ревью: `_dump()` вызывается как аргумент execute() — то
+            # есть внутри этого же try, — но `json.dumps` бросает `TypeError` на несериализуемый
+            # тип (`Decimal`, `datetime`) и `ValueError` на `nan`/`inf`; ни один не наследник
+            # `sqlite3.Error`, и раньше уходил голым. `before`/`request` формально приходят из
+            # JSON (GET-ответ 1С, тело WriteService), но сама эта гарантия — не то, что обязан
+            # проверять `Journal`: несериализуемое значение здесь останавливает запрос к 1С тем
+            # же способом, что и отказ диска — строки журнала всё равно не будет. Текст ошибки
+            # не цитирует `ошибка` (см. `__init__`) — сообщение `TypeError`/`ValueError` от
+            # `json.dumps` не несёт реальное значение (только имя типа), но и это не проверяется
+            # каждый раз индивидуально, правило общее.
             raise WriteError(
                 "internal",
                 "не удалось записать журнал перед выполнением записи",
@@ -230,7 +301,9 @@ class Journal:
                         commit_id,
                     ),
                 )
-        except sqlite3.Error as ошибка:
+        except (sqlite3.Error, TypeError, ValueError) as ошибка:
+            # round 2, находка B-1(б) ревью — тот же случай, что в open_commit, только для
+            # `_dump(after)`.
             raise WriteError(
                 "internal",
                 "не удалось дописать журнал после выполненной записи",
@@ -249,13 +322,34 @@ class Journal:
 
         Откат — сама pending-операция со своим собственным `commit_id` (решение 9 плана M2) и
         проходит `commit` как любая другая запись; эта строка только связывает исходную запись
-        с той, что её откатила — статус исходной записи (`committed`/`failed`) не меняется."""
+        с той, что её откатила — статус исходной записи (`committed`/`failed`) не меняется.
+
+        round 2, находка B-1б ревью: раньше второй вызов с ДРУГИМ `undone_by` молча
+        перезатирал первый — факт «`c1` отменён откатом `c2`» терялся без следа и без ошибки,
+        стоило кому-то (по ошибке) вызвать `mark_undone("c1", "c3")`. В проде второй откат для
+        уже отменённого коммита не должна готовить сама задача 8 — но раз журнал существует
+        именно для того, чтобы такие факты не терялись бесследно, это тот же класс «ошибка
+        программы», что и повторный `open_commit`/`close_commit` без предшественника:
+        `RuntimeError`, а не тихая перезапись. Повторный вызов с ТЕМ ЖЕ `undone_by` — идемпотентный
+        повтор (например, после обрыва связи между записью в журнал и ответом вызывающему коду) и
+        остаётся no-op, как раньше."""
+        строка = self._connection.execute(
+            "SELECT undone_by FROM commits WHERE commit_id = ?", (commit_id,)
+        ).fetchone()
+        if строка is None:
+            raise RuntimeError(f"mark_undone: commit_id={commit_id!r} не найден в журнале")
+        прежний = строка["undone_by"]
+        if прежний == undone_by:
+            return
+        if прежний is not None:
+            raise RuntimeError(
+                f"mark_undone: commit_id={commit_id!r} уже отменён {прежний!r}, повторная"
+                f" попытка отметить отмену {undone_by!r} — ошибка программы"
+            )
         with self._connection:
-            курсор = self._connection.execute(
+            self._connection.execute(
                 "UPDATE commits SET undone_by = ? WHERE commit_id = ?", (undone_by, commit_id)
             )
-        if курсор.rowcount == 0:
-            raise RuntimeError(f"mark_undone: commit_id={commit_id!r} не найден в журнале")
 
     def get(self, commit_id: str) -> JournalEntry | None:
         строка = self._connection.execute(
@@ -274,7 +368,16 @@ class Journal:
         не гарантируют разрешение точнее миллисекунд на всех платформах). `rowid` — неявный
         столбец обычной (не `WITHOUT ROWID`) таблицы; монотонен по порядку вставки, пока строки
         не удаляются, а журнал строки не удаляет никогда — `close_commit`/`mark_undone` только
-        обновляют существующую."""
+        обновляют существующую.
+
+        round 2, находка B-5 ревью: `limit < 1` — `ValueError`, а не молчаливое поведение
+        SQLite. `LIMIT 0` вернул бы пустой список — не ошибка, но и не то, что вызывающий код
+        почти наверняка имел в виду; `LIMIT -1` для SQLite означает «без ограничения», то есть
+        отрицательный `limit` тихо вернул бы ВЕСЬ журнал целиком вместо отказа или пустого
+        ответа — неожиданно и потенциально дорого для `odata1c_journal` (задача 8), если та
+        передаст пользовательский `limit` без собственной проверки границ."""
+        if limit < 1:
+            raise ValueError(f"limit должен быть не меньше 1, получено {limit}")
         sql = "SELECT * FROM commits"
         параметры: tuple = ()
         if base is not None:
