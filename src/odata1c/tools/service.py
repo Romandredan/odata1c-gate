@@ -1202,6 +1202,7 @@ class ToolService:
             **page_info(count=len(записи), total=всего, top=spec.top, skip=spec.skip),
             "items": усечённые,
             "masked_fields": маска.masked_fields,
+            "partially_masked_fields": маска.partially_masked_fields,
             "warnings": _без_повторов([*spec.warnings, *обрезка, *маска.warnings]),
         }
         return fit_result(конверт, self._config.daemon.limits.result_chars, skip=spec.skip)
@@ -1276,6 +1277,7 @@ class ToolService:
                 "gate": гейт.mode,
                 "item": усечённые[0] if усечённые else None,
                 "masked_fields": маска.masked_fields,
+                "partially_masked_fields": маска.partially_masked_fields,
                 "warnings": _без_повторов([*обрезка, *маска.warnings]),
             }
             return fit_result(конверт, self._config.daemon.limits.result_chars)
@@ -1854,6 +1856,7 @@ class ToolService:
                 "role": base_config.role,
                 "gate": гейт.mode,
                 "masked_fields": маска.masked_fields,
+                "partially_masked_fields": маска.partially_masked_fields,
                 "warnings": предупреждения,
             }
             if список:

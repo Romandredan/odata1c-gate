@@ -731,7 +731,7 @@ async def test_накрывающее_название_побеждает_рас
     # говорит правду о поле, которое закрыл ранний проход (находка M-2).
     assert с["warnings"] == без["warnings"]
     assert с["masked_fields"] == без["masked_fields"]
-    assert "ДополнительнаяИнформация" in с["masked_fields"]
+    assert "ДополнительнаяИнформация" in с["partially_masked_fields"]
     assert "guard_replaced" not in текст_с + текст_без
 
 
@@ -886,7 +886,8 @@ async def test_поле_закрытое_только_ранним_проход�
         "ИНН",
     )
 
-    assert "Комментарий" in второй["masked_fields"]
+    # Замена внутри текста — поле частичное (`УчётПолей`, раунд 2): текст вокруг открыт.
+    assert "Комментарий" in второй["partially_masked_fields"]
 
 
 async def test_get_не_выносит_раскрытое_в_эхе_ключа(сервис, дом, respx_ut):
@@ -4434,3 +4435,27 @@ async def test_r35_describe_показывает_класс_contact(сервис
     классы = {поле["name"]: поле["gate_class"] for поле in описание["fields"]}
     assert классы["Представление"] == классы["НомерТелефона"] == "contact"
     assert классы["Тип"] is None and классы["LineNumber"] is None
+
+
+async def test_конверт_называет_частичные_поля_отдельно(сервис, respx_ut):
+    """Раунд 2: `masked_fields` — только поля, закрытые целиком в каждой записи; поле, где закрыта
+    часть значений, — в `partially_masked_fields`. Ключ есть в конверте всегда."""
+    respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "value": [
+                    {"Ref_Key": ССЫЛКА, "ИНН": ИНН, "Комментарий": "без реквизитов"},
+                    {"Ref_Key": ССЫЛКА, "ИНН": ИНН, "Комментарий": f"сверено по ИНН {ИНН}"},
+                ]
+            },
+        )
+    )
+    ответ = json.loads(
+        await сервис.query(SessionScope(), base="ut", entity="Catalog_Контрагенты", top=5)
+    )
+    assert "error" not in ответ, ответ
+    assert "ИНН" in ответ["masked_fields"]
+    assert "Комментарий" not in ответ["masked_fields"]
+    assert ответ["partially_masked_fields"] == ["Комментарий"]
+    assert ИНН not in json.dumps(ответ, ensure_ascii=False)

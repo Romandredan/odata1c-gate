@@ -1226,7 +1226,10 @@ def test_открытое_поле_закрытое_ранним_проходо�
 
         assert результат.data["Комментарий"] == "см. [[org:1]]"
         assert type(результат.data["Комментарий"]) is str
-        assert результат.masked_fields == ["Комментарий"]
+        # Замена внутри текста: реального значения нет, но и поле не закрыто целиком — список
+        # частичных (раунд 2 правки контактной информации, `УчётПолей`).
+        assert результат.masked_fields == []
+        assert результат.partially_masked_fields == ["Комментарий"]
     finally:
         словарь.close()
 
@@ -1255,4 +1258,99 @@ def test_исходное_значение_не_едет_дальше_маски
             yield значение
 
     assert all(type(строка) is str for строка in строки(результат.data))
-    assert "Комментарий" in результат.masked_fields
+    assert "Комментарий" in результат.partially_masked_fields
+
+
+# --- masked_fields правдив: поле в списке — каждое значение закрыто целиком (раунд 2) ------------
+
+
+def _маскировщик_учёта(tmp_path, политика: str = "version: 2\n"):
+    (tmp_path / "policy.yaml").write_text(политика, encoding="utf-8")
+    словарь = Dictionary(tmp_path / "gate.sqlite", СЕКРЕТ)
+    return словарь, Masker(
+        словарь, load_policy(tmp_path / "policy.yaml"), mode="identifiers+names", base="ut"
+    )
+
+
+def test_masked_fields_не_называет_поле_с_двумя_закрытыми_из_тридцати(tmp_path):
+    """Находка координатора на `Catalog_КонтактныеЛицаПартнеров`: в двух записях из тридцати
+    `Description` был целиком телефоном, детектор заменил его токеном, и список говорил
+    «Description замаскирован», хотя остальные имена стояли открытыми. Каждое из двух значений
+    закрыто целиком — частичным поле делает именно счёт значений."""
+    словарь, маскировщик = _маскировщик_учёта(tmp_path)
+    try:
+        записи = [{"Description": f"Сотрудник номер {н}"} for н in range(28)]
+        записи += [{"Description": "+7 (916) 123-45-67"}, {"Description": "8 (495) 765-43-21"}]
+        результат = маскировщик.mask(записи, entity="Catalog_Прочее")
+        assert результат.data[-1]["Description"].startswith("[[phone:")
+        assert "Description" not in результат.masked_fields
+        assert результат.partially_masked_fields == ["Description"]
+    finally:
+        словарь.close()
+
+
+def test_masked_fields_полное_поле_с_пустыми_и_guid(tmp_path):
+    """Пустые строки и GUID в знаменатель не входят: маскировать в них нечего по замыслу."""
+    словарь, маскировщик = _маскировщик_учёта(
+        tmp_path, "version: 2\nfields:\n  Catalog_Прочее.ИНН: inn\n"
+    )
+    try:
+        записи = [
+            {"ИНН": "7707083893"},
+            {"ИНН": ""},
+            {"ИНН": "a103cb54-42ee-11ec-a7a0-f10ab59a067e"},
+            {"ИНН": "500100732259"},
+        ]
+        результат = маскировщик.mask(записи, entity="Catalog_Прочее")
+        assert результат.masked_fields == ["ИНН"]
+        assert результат.partially_masked_fields == []
+    finally:
+        словарь.close()
+
+
+def test_masked_fields_замена_внутри_текста_частичная(tmp_path):
+    """Реквизит, найденный внутри комментария, заменён, а комментарий открыт — поле частичное,
+    даже если так в каждой записи."""
+    словарь, маскировщик = _маскировщик_учёта(tmp_path)
+    try:
+        записи = [{"Комментарий": "сверено по ИНН 7707083893"}] * 3
+        результат = маскировщик.mask(записи, entity="Catalog_Прочее")
+        assert результат.masked_fields == []
+        assert результат.partially_masked_fields == ["Комментарий"]
+    finally:
+        словарь.close()
+
+
+def test_masked_fields_свойство_каждое_значение_токен_целиком(tmp_path):
+    """Свойство по всему ответу, а не по названным полям: для каждого поля из `masked_fields`
+    каждое непустое значение (не GUID) — токен целиком; каждое поле, где что-то заменено, есть в
+    одном из двух списков."""
+    from odata1c.gate.tokens import GUID_RE, TOKEN_RE
+
+    словарь, маскировщик = _маскировщик_учёта(
+        tmp_path,
+        "version: 2\nfields:\n  Catalog_Прочее.ИНН: inn\n  Catalog_Прочее.Телефон: phone\n",
+    )
+    try:
+        записи = [
+            {"ИНН": "7707083893", "Телефон": "+7 916 123-45-67", "Комментарий": "без реквизитов"},
+            {"ИНН": "", "Телефон": "", "Комментарий": "ИНН 500100732259 в тексте"},
+            {"ИНН": "500100732259", "Телефон": "8 (495) 123-45-67", "Комментарий": ""},
+        ]
+        результат = маскировщик.mask(записи, entity="Catalog_Прочее")
+        for поле in результат.masked_fields:
+            for запись in результат.data:
+                значение = запись.get(поле)
+                if значение and not GUID_RE.fullmatch(значение.strip()):
+                    assert TOKEN_RE.fullmatch(значение), (поле, значение)
+        изменённые = {
+            поле
+            for исходная, итоговая in zip(записи, результат.data, strict=True)
+            for поле in исходная
+            if исходная[поле] != итоговая[поле]
+        }
+        assert изменённые == set(результат.masked_fields) | set(результат.partially_masked_fields)
+        assert set(результат.masked_fields) == {"ИНН", "Телефон"}
+        assert результат.partially_masked_fields == ["Комментарий"]
+    finally:
+        словарь.close()
