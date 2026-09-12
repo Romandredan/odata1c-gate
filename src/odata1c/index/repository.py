@@ -272,6 +272,17 @@ class IndexRepository:
         результаты.sort(key=lambda найдено: (-найдено.score, найдено.name))
         return результаты[:limit]
 
+    def side_effecting_actions(self) -> frozenset[str]:
+        """Имена действий, которые `$metadata` базы помечает изменяющими данные (`IsSideEffecting`),
+        по всем сущностям, без учёта регистра. Нужно `raw_get`: 1С выполняет такие действия и по
+        запросу GET (проба P8), а у конфигурации могут быть свои действия сверх Post/Unpost."""
+        return frozenset(
+            строка[0].casefold()
+            for строка in self._connection.execute(
+                "SELECT DISTINCT name FROM actions WHERE side_effecting = 1"
+            )
+        )
+
     def describe(self, entity: str) -> EntityDescription | None:
         строка = self._connection.execute(
             "SELECT * FROM entities WHERE name = ?", (entity,)

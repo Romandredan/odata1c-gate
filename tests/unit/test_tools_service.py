@@ -2308,6 +2308,91 @@ async def test_raw_get_отклоняет_негодный_путь(сервис
     assert json.loads(текст)["error"]["code"] == "params_invalid"
 
 
+ДОК = "Document_РеализацияТоваровУслуг(guid'0c4320aa-624f-11f0-a7a0-fa78dd2b3d42')"
+
+
+@pytest.mark.parametrize(
+    "путь",
+    [
+        f"{ДОК}/Post",
+        f"{ДОК}/Post()",
+        f"{ДОК}/Unpost",
+        f"{ДОК}/post",
+        f"{ДОК}/POST()",
+        "BusinessProcess_Задание(guid'0c4320aa-624f-11f0-a7a0-fa78dd2b3d42')/Start",
+        "Task_ЗадачаИсполнителя(guid'0c4320aa-624f-11f0-a7a0-fa78dd2b3d42')/ExecuteTask",
+        f"{ДОК}/Контрагент/Post",
+    ],
+)
+async def test_raw_get_не_вызывает_действие_с_побочным_эффектом(сервис, любой_get, путь):
+    """Проба P8 (план M2, задача 1): 1С выполняет `Post`/`Unpost` и по запросу GET — живой
+    `GET …/Unpost` отменил проведение документа, `GET …/Post` провёл его заново. `raw_get` —
+    инструмент ТОЛЬКО ЧТЕНИЯ, и такой путь проводил документ в обход двухфазной записи
+    (инвариант 2), `write: false`, `post_documents` и роли `prod`; ответ модель не видела, но
+    проведение уже случалось. Опасен сам запрос, а не ответ, поэтому проверка — по числу
+    обращений к 1С: ни одного."""
+    маршрут = любой_get({"value": []})
+
+    текст = await сервис.raw_get(SessionScope(), base="ut", path=путь)
+
+    assert json.loads(текст)["error"]["code"] == "params_invalid"
+    assert маршрут.call_count == 0
+
+
+def test_изменяющее_действие_из_индекса_отклоняется_сверх_списка_платформы():
+    """Второй слой: у конфигурации может быть своё действие с побочным эффектом, которого нет в
+    неизменяемом списке платформы, — его запрещает пометка `side_effecting` в индексе базы."""
+    from odata1c.tools.service import _ServiceError, _проверить_действия
+
+    with pytest.raises(_ServiceError) as отказ:
+        _проверить_действия(["Document_X(guid'1')", "ЗакрытьМесяц()"], frozenset({"закрытьмесяц"}))
+    assert отказ.value.code == "params_invalid"
+    # тот же сегмент без пометки в индексе — не действие, пропускается
+    _проверить_действия(["Document_X(guid'1')", "ЗакрытьМесяц"], frozenset())
+
+
+@pytest.mark.parametrize("действие", ["Post", "Unpost()", "start", "EXECUTETASK"])
+def test_действия_платформы_отклоняются_без_индекса(действие):
+    """Первый слой сам по себе: действия платформы отклоняются при ПУСТОМ наборе изменяющих из
+    индекса — на случай, когда разбор `$metadata` не пометил их `side_effecting`. Слои страхуют
+    друг друга, поэтому сквозной тест первый слой не сторожит: сними его — сквозной останется
+    зелёным за счёт второго. Этот тест краснеет."""
+    from odata1c.tools.service import _ServiceError, _проверить_действия
+
+    with pytest.raises(_ServiceError):
+        _проверить_действия(["Document_X(guid'1')", действие], frozenset())
+
+
+def test_индекс_отдаёт_изменяющие_действия_базы(дом):
+    """Индекс фикстуры (ut-real.edmx) знает Post/Unpost как изменяющие, а виртуальные таблицы —
+    нет: иначе второй слой запретил бы и чтение остатков."""
+    from odata1c.index.repository import IndexRepository
+
+    путь = next((дом / "bases" / "ut").glob("metadata.sqlite"), None)
+    if путь is None:
+        pytest.skip("индекс фикстуры не построен в этом доме")
+    репозиторий = IndexRepository(путь)
+    try:
+        изменяющие = репозиторий.side_effecting_actions()
+    finally:
+        репозиторий.close()
+    assert {"post", "unpost"} <= изменяющие
+    assert not {"balance", "turnovers", "slicelast"} & изменяющие
+
+
+async def test_raw_get_виртуальные_таблицы_не_считаются_действием(сервис, любой_get):
+    """Обратная сторона: `Balance`, `Turnovers`, `SliceLast` в `$metadata` — тоже действия
+    (FunctionImport), но только читают (`side_effecting = 0`) — их запрет не касается."""
+    маршрут = любой_get({"value": []})
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path="InformationRegister_КурсыВалют/SliceLast()"
+    )
+
+    assert json.loads(текст).get("error", {}).get("code") != "params_invalid"
+    assert маршрут.call_count == 1
+
+
 async def test_raw_get_маскирует_ответ(сервис, respx_ut):
     respx_ut.get("Catalog_Контрагенты").mock(
         return_value=httpx.Response(
