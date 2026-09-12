@@ -2,9 +2,11 @@
 
 Порядок (первый отказ побеждает): 1) сущность скрыта гейтом → `entity_hidden`; 2) база только для
 чтения → `base_read_only`; 3) флаг операции (`post_documents`/`mark_deletion`/
-`register_direct_write`) → `permission_denied`; 4) виртуальная таблица или запись зависимого
-регистра сведений — отказ всегда, флаг не спасает → `permission_denied`; 5) `deny_entities`/
-`allow_entities` → `permission_denied`; 6) поле из `deny_fields` → `field_write_denied`.
+`register_direct_write` — единственный рубеж для прямой записи в набор записей любого регистра,
+независимого или зависимого) → `permission_denied`; 4) виртуальная таблица — отказ всегда, флаг
+не спасает → `permission_denied` (Ruling 39: это единственный безусловный случай — регистр таким
+не является, его открывает флаг шага 3); 5) `deny_entities`/`allow_entities` → `permission_denied`;
+6) поле из `deny_fields` → `field_write_denied`.
 """
 
 from __future__ import annotations
@@ -109,7 +111,9 @@ def test_независимый_регистр_сведений_на_create_пр
     """Независимый регистр сведений пишется по одному `write: true`, флаг `register_direct_write`
     его не касается вовсе (SPEC §7.1) — в отличие от любого набора записей регистра с
     обязательным регистратором (накопления, бухгалтерии, расчёта, регистра сведений с
-    регистратором), для которого шаг 4 отказывает всегда, каким бы ни было значение флага."""
+    регистратором), которому этот же флаг нужен явно включённым (Ruling 39, тесты
+    `test_накопления_с_флагом_включён_разрешено` и
+    `test_зависимый_регистр_сведений_с_флагом_включён_разрешён`)."""
     b = база(permissions=Permissions(register_direct_write=False))
     e = сущность(
         "InformationRegister_КурсыВалют",
@@ -120,18 +124,41 @@ def test_независимый_регистр_сведений_на_create_пр
     проверить(b, e, "create")
 
 
-def test_накопления_с_флагом_включён_всё_равно_permission_denied():
-    """Регистр накопления (как и бухгалтерии, расчёта) не бывает независимым — у него нет
-    собственного понятия «независимый/зависимый» (оно есть только у регистра сведений,
-    CONTEXT.md «Независимый регистр»): регистратор обязателен всегда. Поэтому он подпадает под
-    тот же безусловный отказ шага 4, что и зависимый регистр сведений — `register_direct_write`
-    только выбирает текст отказа (шаг 3 при выключенном флаге против шага 4 при включённом), но
-    не открывает прямую запись ни при каком его значении."""
+def test_накопления_с_флагом_включён_разрешено():
+    """Ruling 39: `register_direct_write` — единственный рубеж прямой записи в набор записей
+    регистра, включая накопление (у него нет понятия «независимый/зависимый» вовсе — регистратор
+    обязателен всегда, CONTEXT.md «Независимый регистр»). Включённый флаг разрешает запись, шаг 4
+    («отказ всегда») его не касается — он только про виртуальные таблицы."""
     b = база(permissions=Permissions(register_direct_write=True))
     e = сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister", is_records=True)
+    проверить(b, e, "update")
+
+
+def test_зависимый_регистр_сведений_с_флагом_включён_разрешён():
+    """Тот же рубеж — для регистра сведений с регистратором («зависимого» в терминах CONTEXT.md):
+    включённый `register_direct_write` разрешает прямую запись, несмотря на регистратор."""
+    b = база(permissions=Permissions(register_direct_write=True))
+    e = сущность(
+        "InformationRegister_СтоимостьТоваров",
+        "InformationRegister",
+        is_records=True,
+        is_independent_register=False,
+    )
+    проверить(b, e, "update")
+
+
+def test_зависимый_регистр_сведений_с_флагом_выключен_permission_denied():
+    b = база(permissions=Permissions(register_direct_write=False))
+    e = сущность(
+        "InformationRegister_СтоимостьТоваров",
+        "InformationRegister",
+        is_records=True,
+        is_independent_register=False,
+    )
     with pytest.raises(WriteError) as инфо:
         проверить(b, e, "update")
     assert инфо.value.code == "permission_denied"
+    assert "register_direct_write" in инфо.value.hint
 
 
 # --- каждый код отказа -----------------------------------------------------------------------
@@ -178,27 +205,6 @@ def test_запрет_прямой_записи_в_регистр_register_direc
         проверить(b, e, "create")
     assert инфо.value.code == "permission_denied"
     assert "register_direct_write" in инфо.value.hint
-
-
-@pytest.mark.parametrize("register_direct_write", [True, False])
-def test_зависимый_регистр_отказ_всегда(register_direct_write):
-    """Регистр сведений с регистратором (`is_independent_register=False`) — «зависимый» в терминах
-    CONTEXT.md, у него единственный путь изменения — через документ-регистратор. Флаг
-    `register_direct_write` тут не спасает ни при каком значении: `False` отказывает на шаге 3
-    (сообщение про сам флаг), `True` пропускает шаг 3 и отказывает на шаге 4 (сообщение про
-    регистратор) — код в обоих случаях один и тот же, `permission_denied`. Та же логика — не
-    только для регистра сведений, но и для накопления/бухгалтерии/расчёта (отдельный тест
-    `test_накопления_с_флагом_включён_всё_равно_permission_denied`)."""
-    b = база(permissions=Permissions(register_direct_write=register_direct_write))
-    e = сущность(
-        "InformationRegister_СтоимостьТоваров",
-        "InformationRegister",
-        is_records=True,
-        is_independent_register=False,
-    )
-    with pytest.raises(WriteError) as инфо:
-        проверить(b, e, "update")
-    assert инфо.value.code == "permission_denied"
 
 
 def test_виртуальная_таблица_отказ_всегда():
