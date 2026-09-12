@@ -4,9 +4,11 @@ import sqlite3
 
 import pytest
 
+from odata1c.gate import dictionary as dictionary_module
 from odata1c.gate.dictionary import (
     СХЕМА,
     Dictionary,
+    DictionaryBusyError,
     DictionaryCorruptError,
     name_variants_of,
     normalize_text_with_map,
@@ -197,6 +199,60 @@ def test_повреждённый_файл_словаря_даёт_понятн�
     assert str(путь) in str(ошибка.value)
     assert ошибка.value.code == "dictionary_corrupt"
     assert str(путь) in ошибка.value.hint
+
+
+def _словарь_прежнего_ключа(путь) -> None:
+    """Словарь версии 2 с ключом `variants` без сущности: открытие новым кодом его перестраивает,
+    то есть пишет."""
+    Dictionary(путь, СЕКРЕТ).close()
+    соединение = sqlite3.connect(путь, isolation_level=None)
+    соединение.executescript(
+        "BEGIN; CREATE TABLE v2 (token TEXT NOT NULL, base TEXT NOT NULL, entity TEXT NOT NULL,"
+        " field TEXT NOT NULL, raw_value TEXT NOT NULL, seen_at TEXT NOT NULL,"
+        " PRIMARY KEY (token, base, field, raw_value)); DROP TABLE variants;"
+        " ALTER TABLE v2 RENAME TO variants; PRAGMA user_version = 2; COMMIT;"
+    )
+    соединение.close()
+
+
+def test_занятый_словарь_не_объявляется_повреждённым(tmp_path, monkeypatch):
+    """Р4-3 ревью раунда 4 (воспроизведение ревьюера, ожидание блокировки укорочено): чужая
+    пишущая транзакция держит словарь дольше, чем ждёт открытие, — это «занят», а не «повреждён».
+    Прежде такой словарь получал `dictionary_corrupt` с советом переместить файл в сторону, то есть
+    потерять все выданные токены."""
+    monkeypatch.setattr(dictionary_module, "ОЖИДАНИЕ_БЛОКИРОВКИ", 0.2)
+    путь = tmp_path / "gate.sqlite"
+    _словарь_прежнего_ключа(путь)
+    чужое = sqlite3.connect(путь, isolation_level=None)
+    чужое.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(DictionaryBusyError) as ошибка:
+            Dictionary(путь, СЕКРЕТ)
+    finally:
+        чужое.execute("ROLLBACK")
+        чужое.close()
+
+    assert ошибка.value.code == "dictionary_busy"
+    assert "в сторону" not in ошибка.value.hint
+    assert "повторите" in ошибка.value.hint
+    assert "второй процесс" in ошибка.value.hint
+    # Файл не тронут: после снятия блокировки словарь открывается и перестраивается.
+    Dictionary(путь, СЕКРЕТ).close()
+
+
+def test_занятость_и_ввод_вывод_различаются_с_порчей():
+    """Код ошибки SQLite решает, что сказать владельцу: занят и ошибка ввода-вывода — «повторите»,
+    не база и повреждённая база — «повреждён» (совет переместить файл — только здесь)."""
+    занят = sqlite3.OperationalError("database is locked")
+    занят.sqlite_errorname = "SQLITE_BUSY"
+    ввод_вывод = sqlite3.OperationalError("disk I/O error")
+    ввод_вывод.sqlite_errorname = "SQLITE_IOERR_READ"
+    не_база = sqlite3.DatabaseError("file is not a database")
+    не_база.sqlite_errorname = "SQLITE_NOTADB"
+
+    assert dictionary_module._словарь_занят(занят)
+    assert dictionary_module._словарь_занят(ввод_вывод)
+    assert not dictionary_module._словарь_занят(не_база)
 
 
 def test_одно_название_в_разных_регистрах_даёт_один_токен(словарь):

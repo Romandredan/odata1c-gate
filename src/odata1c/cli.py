@@ -27,7 +27,7 @@ from odata1c.config.models import ИМЯ_БАЗЫ, BaseConfig
 from odata1c.config.writer import append_base, ensure_gate_secret, ensure_templates
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
 from odata1c.daemon import остановить as остановить_демон
-from odata1c.gate.dictionary import DictionaryCorruptError
+from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
 from odata1c.index.edmx import EdmxError
@@ -176,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         IndexCorruptError,
         PolicyError,
         DictionaryCorruptError,
+        DictionaryBusyError,
         DaemonError,
     ) as ошибка:
         # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать

@@ -430,6 +430,43 @@ class DictionaryCorruptError(Exception):
         )
 
 
+class DictionaryBusyError(Exception):
+    """Словарь занят другим процессом или временно недоступен на чтение-запись (Р4-3 ревью
+    раунда 4 блокеров M2). Прежде это тоже был `dictionary_corrupt` — с советом переместить файл в
+    сторону, то есть потерять все выданные токены, хотя с файлом всё в порядке: чужая пишущая
+    транзакция (второй процесс шлюза, перестройка словаря при открытии, CLI `reveal`) держит его
+    дольше, чем открытие ждёт блокировку. Протокол атрибутов тот же (code, message, hint)."""
+
+    def __init__(self, path: pathlib.Path, детали: str) -> None:
+        message = f"словарь гейта занят другим процессом или временно недоступен: {path}"
+        super().__init__(message)
+        self.code = "dictionary_busy"
+        self.message = message
+        self.hint = (
+            "файл не повреждён и трогать его не нужно: повторите; если не проходит — проверьте, "
+            "не работает ли второй процесс шлюза (демон, `odata1c reveal`, `reindex`) с тем же "
+            f"домашним каталогом, и нет ли ошибок диска ({детали})"
+        )
+
+
+# Сколько открытие словаря ждёт чужую блокировку, секунд (умолчание `sqlite3.connect`). Имя —
+# чтобы тест занятого словаря не ждал по-настоящему.
+ОЖИДАНИЕ_БЛОКИРОВКИ = 5.0
+# Коды SQLite, при которых файл цел, а словарь занят или диск временно не ответил: повторить.
+_ЗАНЯТ = ("SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR")
+
+
+def _словарь_занят(ошибка: sqlite3.DatabaseError) -> bool:
+    """Занят (или ошибка ввода-вывода), а не повреждён: по коду ошибки SQLite
+    (`sqlite_errorname`, в том числе расширенному — `SQLITE_BUSY_SNAPSHOT`, `SQLITE_IOERR_READ`).
+    Без кода — по тексту сообщения, тем же признакам."""
+    имя = getattr(ошибка, "sqlite_errorname", "") or ""
+    if имя:
+        return имя.startswith(_ЗАНЯТ)
+    текст = str(ошибка).lower()
+    return "locked" in текст or "busy" in текст or "disk i/o" in текст
+
+
 class Dictionary:
     def __init__(self, path: pathlib.Path, secret: bytes) -> None:
         self.path = pathlib.Path(path)
@@ -445,7 +482,7 @@ class Dictionary:
         # означает токены, которые невозможно раскрыть. При штатном управлении первая же
         # DML-команда открывает транзакцию неявно, и `with self._connection:` в _создать()
         # и _запомнить_вариант() действительно фиксирует или откатывает её целиком.
-        self._connection = sqlite3.connect(self.path)
+        self._connection = sqlite3.connect(self.path, timeout=ОЖИДАНИЕ_БЛОКИРОВКИ)
         self._connection.row_factory = sqlite3.Row
         # Если файл существует, но не является SQLite-базой (или повреждён), sqlite3 узнаёт об
         # этом не на connect(), а только на первой операции — здесь на PRAGMA/executescript.
@@ -478,6 +515,9 @@ class Dictionary:
             self._пересчитать_названия()
         except sqlite3.DatabaseError as ошибка:
             self._connection.close()
+            # Занят — не повреждён (Р4-3): совет «переместите в сторону» стоил бы всех токенов.
+            if _словарь_занят(ошибка):
+                raise DictionaryBusyError(self.path, str(ошибка)) from ошибка
             raise DictionaryCorruptError(self.path, str(ошибка)) from ошибка
         self._revision = self._count()
         # Кэш `_мусорные_токены` на ревизию словаря (находки П2 и П1).
