@@ -4638,3 +4638,147 @@ async def test_r37_ручной_keep_действует_через_навига�
     )
     assert "error" not in ответ, ответ
     assert маршрут.calls.last.request.url.params["$filter"] == отбор
+
+
+# Раунд 3, I-1: одно значение контактной информации — один токен при любом наборе полей
+
+НОМЕР_С_ДОБАВОЧНЫМ = "+7 (4912) 12-34-56, доб. 12"
+СТРОКИ_КИ = [
+    {
+        "Ref_Key": ССЫЛКА,
+        "LineNumber": "1",
+        "Тип": "Телефон",
+        "Представление": НОМЕР_С_ДОБАВОЧНЫМ,
+        "НомерТелефона": "74912123456",
+        "АдресЭП": "",
+    },
+    {
+        "Ref_Key": ССЫЛКА,
+        "LineNumber": "2",
+        "Тип": "АдресЭлектроннойПочты",
+        "Представление": "ivan@example.com",
+        "НомерТелефона": "",
+        "АдресЭП": "ivan@example.com",
+    },
+]
+
+
+def _выбрать(запись: dict, поля: list[str]) -> dict:
+    """Что вернула бы 1С на `$select`: только выбранные поля, пути — внутрь вложенного."""
+    итог: dict = {}
+    for поле in поля:
+        голова, _, хвост = поле.partition("/")
+        if голова not in запись:
+            continue
+        значение = запись[голова]
+        if not хвост:
+            итог[голова] = значение
+        elif isinstance(значение, list):
+            прежнее = итог.setdefault(голова, [{} for _ in значение])
+            for цель, источник in zip(прежнее, значение, strict=True):
+                цель.update(_выбрать(источник, [хвост]))
+        elif isinstance(значение, dict):
+            итог.setdefault(голова, {}).update(_выбрать(значение, [хвост]))
+    return итог
+
+
+def _как_1С(записи: list[dict], *, одна: bool = False):
+    def ответ(request):
+        выбор = request.url.params.get("$select")
+        строки = [_выбрать(з, выбор.split(",")) if выбор else з for з in записи]
+        return httpx.Response(200, json=строки[0] if одна else {"value": строки})
+
+    return ответ
+
+
+@pytest.mark.parametrize(
+    ("выборы", "поле"),
+    [
+        (
+            [["Представление"], ["Представление", "Тип"], ["Тип", "Значение", "Представление"]],
+            "Представление",
+        ),
+        ([["НомерТелефона"], ["НомерТелефона", "Тип"]], "НомерТелефона"),
+        ([["АдресЭП"], ["Тип", "АдресЭП"]], "АдресЭП"),
+    ],
+)
+async def test_i1_query_один_токен_при_любом_выборе_полей(сервис, respx_ut, выборы, поле):
+    маршрут = respx_ut.get(КИ).mock(side_effect=_как_1С(СТРОКИ_КИ))
+    токены = []
+    for выбор in выборы:
+        ответ = json.loads(
+            await сервис.query(SessionScope(), base="ut", entity=КИ, select=выбор, top=5)
+        )
+        assert "error" not in ответ, ответ
+        assert "Тип" in маршрут.calls.last.request.url.params["$select"].split(",")
+        токены.append([строка.get(поле) for строка in ответ["items"]])
+    assert all(набор == токены[0] for набор in токены), токены
+    непустые = [т for т in токены[0] if т]
+    assert непустые and all(т.startswith(("[[phone:", "[[email:")) for т in непустые), токены
+
+
+async def test_i1_путь_через_владельца_даёт_тот_же_токен(сервис, respx_ut):
+    """`КонтактнаяИнформация/НомерТелефона` у `Catalog_Контрагенты` (query и raw_get) — тот же
+    токен, что при запросе прямо в табличную часть с `Тип`."""
+    respx_ut.get(КИ).mock(side_effect=_как_1С(СТРОКИ_КИ))
+    respx_ut.get("Catalog_Контрагенты").mock(
+        side_effect=_как_1С([{"Ref_Key": ССЫЛКА, "КонтактнаяИнформация": СТРОКИ_КИ}])
+    )
+    прямой = json.loads(
+        await сервис.query(
+            SessionScope(), base="ut", entity=КИ, select=["Тип", "НомерТелефона"], top=5
+        )
+    )["items"][0]["НомерТелефона"]
+    assert прямой.startswith("[[phone:")
+
+    через_query = json.loads(
+        await сервис.query(
+            SessionScope(),
+            base="ut",
+            entity="Catalog_Контрагенты",
+            select=["Ref_Key", "КонтактнаяИнформация/НомерТелефона"],
+            top=5,
+        )
+    )
+    assert через_query["items"][0]["КонтактнаяИнформация"][0]["НомерТелефона"] == прямой
+    через_raw = json.loads(
+        await сервис.raw_get(
+            SessionScope(),
+            base="ut",
+            path="Catalog_Контрагенты",
+            query={"$select": "Ref_Key,КонтактнаяИнформация/НомерТелефона"},
+        )
+    )
+    assert через_raw["items"][0]["КонтактнаяИнформация"][0]["НомерТелефона"] == прямой
+
+
+async def test_i1_get_добавляет_тип(сервис, respx_ut):
+    маршрут = respx_ut.route(method="GET").mock(
+        side_effect=_как_1С([{"Ref_Key": ССЫЛКА, "КонтактнаяИнформация": СТРОКИ_КИ}], одна=True)
+    )
+    ответ = json.loads(
+        await сервис.get(
+            SessionScope(),
+            base="ut",
+            entity="Catalog_Контрагенты",
+            key=ССЫЛКА,
+            select=["Ref_Key", "КонтактнаяИнформация/АдресЭП"],
+        )
+    )
+    assert "error" not in ответ, ответ
+    выбор = маршрут.calls.last.request.url.params["$select"].split(",")
+    assert "КонтактнаяИнформация/Тип" in выбор
+    assert ответ["item"]["КонтактнаяИнформация"][1]["АдресЭП"].startswith("[[email:")
+
+
+async def test_i1_добавленный_тип_не_меняет_списки_полей(сервис, respx_ut):
+    """`Тип` открыт и не маскируется: списки `masked_fields` и `partially_masked_fields` одни и
+    те же, выбран `Тип` явно или добавлен шлюзом."""
+    respx_ut.get(КИ).mock(side_effect=_как_1С(СТРОКИ_КИ))
+    ответы = [
+        json.loads(await сервис.query(SessionScope(), base="ut", entity=КИ, select=выбор, top=5))
+        for выбор in (["Представление", "НомерТелефона"], ["Тип", "Представление", "НомерТелефона"])
+    ]
+    assert ответы[0]["masked_fields"] == ответы[1]["masked_fields"]
+    assert ответы[0]["partially_masked_fields"] == ответы[1]["partially_masked_fields"]
+    assert "Тип" not in ответы[0]["masked_fields"]

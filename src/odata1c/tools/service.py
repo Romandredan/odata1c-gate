@@ -30,7 +30,7 @@ from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
 from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
-from odata1c.gate.contact_info import КЛАСС_НА_ВХОДЕ, EntityShape, Shape
+from odata1c.gate.contact_info import КЛАСС_НА_ВХОДЕ, EntityShape, Shape, select_with_type
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import (
@@ -795,6 +795,18 @@ class ToolService:
 
         return строение
 
+    def _выбор_с_типом(
+        self, repo: IndexRepository, entity: str, select: list[str] | str | None
+    ) -> list[str] | None:
+        """`select` с `Тип` у каждой табличной части контактной информации, из которой выбрано
+        поле значения (раунд 3, I-1, `contact_info.select_with_type`): класс строки и токен её
+        значения не должны зависеть от того, выбрала ли модель `Тип`. Пустой `select` — 1С
+        отдаёт все поля, и `Тип` среди них."""
+        выбор = _как_список(select)
+        if not выбор:
+            return None
+        return select_with_type(entity, выбор, self._строение(repo))
+
     def _обрезать_expand(
         self,
         repo: IndexRepository,
@@ -1169,7 +1181,7 @@ class ToolService:
             limits=self._config.daemon.limits,
             virtual_timeout_s=base_config.virtual_timeout_s,
             filter=filter,
-            select=select,
+            select=self._выбор_с_типом(репозиторий, описание.name, select),
             expand=раскрытия,
             orderby=orderby,
             top=top,
@@ -1244,7 +1256,7 @@ class ToolService:
                 реальный_ключ,
                 describe=репозиторий.describe,
                 limits=self._config.daemon.limits,
-                select=select,
+                select=self._выбор_с_типом(репозиторий, описание.name, select),
                 expand=раскрытия,
             )
 
@@ -2151,6 +2163,12 @@ class ToolService:
                     "полей",
                 )
             готовые[имя] = текст
+
+        # Раунд 3, I-1: тот же `Тип` к выбору полей контактной информации, что у `query`/`get`
+        # (`_выбор_с_типом`), — иначе один номер получал бы через `raw_get` другой токен.
+        if готовые.get("$select"):
+            выбор = self._выбор_с_типом(repo, цель.entity, готовые["$select"])
+            готовые["$select"] = ",".join(выбор or [])
 
         сортировка = готовые.get("$orderby")
         if сортировка:
