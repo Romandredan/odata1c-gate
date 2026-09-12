@@ -646,3 +646,91 @@ def test_квадратные_скобки_без_токена_не_мусор(�
     )
 
     assert словарь.number_tokens().get("1234567") == токен
+
+
+# --- Ruling 48: токен без записи (`persist=False`) — для текста ошибок и отказов --------------
+
+
+def _строки(словарь) -> dict[str, int]:
+    """Число строк во всех таблицах словаря — снимок «словарь не пополнялся»."""
+    таблицы = [
+        строка[0]
+        for строка in словарь._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    ]
+    return {
+        т: словарь._connection.execute(f'SELECT COUNT(*) FROM "{т}"').fetchone()[0] for т in таблицы
+    }
+
+
+def test_токен_без_записи_совпадает_с_токеном_при_записи(словарь):
+    """Сухой расчёт — тот же `token_for`, только без вставки: форма токена одна."""
+    до, ревизия = _строки(словарь), словарь.revision()
+
+    сухой = словарь.token_for(
+        "phone", "+7 916 000-07-11", base="ut", entity="", field="error", persist=False
+    )
+
+    assert сухой.startswith("[[phone:")
+    assert _строки(словарь) == до and словарь.revision() == ревизия
+    assert словарь.reveal(сухой) is None
+    assert сухой == словарь.token_for(
+        "phone", "+7 916 000-07-11", base="ut", entity="E", field="Телефон"
+    )
+
+
+def test_токен_без_записи_известного_значения_не_добавляет_написания(словарь):
+    """Известное значение в новом написании — его токен, и второго написания в словаре нет:
+    иначе запись этим токеном в поле без своих написаний стала бы `token_ambiguous` (B4)."""
+    токен = словарь.token_for("phone", "+7 495 700-00-00", base="ut", entity="E", field="Т")
+    до = _строки(словарь)
+
+    сухой = словарь.token_for(
+        "phone", "+7 (495) 700-00-00", base="ut", entity="", field="error", persist=False
+    )
+
+    assert сухой == токен
+    assert _строки(словарь) == до
+    assert словарь.spellings(токен) == ["+7 495 700-00-00"]
+
+
+def test_токен_без_записи_при_коллизии_хвоста_тот_же_что_при_записи(словарь, monkeypatch):
+    """Коллизия: занятость хвоста проверяется только чтением (`_свободный_токен`), поэтому сухой
+    токен — тот, что запись выдала бы в этот момент (удлинённый до 16)."""
+    from odata1c.gate import dictionary as модуль
+    from odata1c.gate.tokens import make_token as настоящий_make_token
+
+    def сталкивающийся_make_token(secret, type_, normalized, tail_length=10):
+        if tail_length == 10:
+            return f"[[{type_}:COLLISION1]]"
+        return настоящий_make_token(secret, type_, normalized, tail_length=tail_length)
+
+    monkeypatch.setattr(модуль, "make_token", сталкивающийся_make_token)
+    словарь.token_for("inn", "1111111111", base="ut", entity="E", field="F")
+    до = _строки(словарь)
+
+    сухой = словарь.token_for(
+        "inn", "2222222222", base="ut", entity="", field="error", persist=False
+    )
+
+    assert len(сухой[len("[[inn:") : -2]) == 16
+    assert _строки(словарь) == до
+    assert сухой == словарь.token_for("inn", "2222222222", base="ut", entity="E", field="F")
+
+
+@pytest.mark.parametrize("класс", ["org", "person"])
+def test_токен_без_записи_нового_названия_не_выдаётся(словарь, класс):
+    """Номер названия (`[[org:N]]`) без вставки не выдать: следующий номер получило бы и другое
+    значение. На пути текста ошибки названий нет (детекторы их не ищут), поэтому — отказ, а не
+    выдуманный токен."""
+    известное = словарь.token_for(класс, "ООО Ромашка", base="ut", entity="E", field="F")
+    до = _строки(словарь)
+
+    assert (
+        словарь.token_for(класс, "ООО Ромашка", base="ut", entity="", field="e", persist=False)
+        == известное
+    )
+    with pytest.raises(ValueError):
+        словарь.token_for(класс, "АО Вектор", base="ut", entity="", field="e", persist=False)
+    assert _строки(словарь) == до
