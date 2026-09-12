@@ -230,14 +230,18 @@ def test_голое_число_в_таблице_вариантов_не_идё�
     путь = tmp_path / "gate.sqlite"
     словарь = Dictionary(путь, СЕКРЕТ)
     токен = словарь.token_for("org", 'ООО "2020"', base="ut", entity=К, field="Description")
+    второй = словарь.token_for("org", 'АО "2021"', base="ut", entity=К, field="Description")
     соединение = sqlite3.connect(путь)
     with соединение:
-        соединение.execute(
-            "INSERT INTO name_variants (token, variant_norm) VALUES (?, ?)", (токен, "2020")
+        соединение.executemany(
+            "INSERT INTO name_variants (token, variant_norm) VALUES (?, ?)",
+            [(токен, "2020"), (второй, "2021"), (токен, "2021")],
         )
     соединение.close()
     try:
         assert "2020" not in словарь.name_variants()
+        # И в перечень неоднозначных для предупреждения — тоже: это не ключ поиска.
+        assert "2021" not in словарь.ambiguous_name_variants()
     finally:
         словарь.close()
 
