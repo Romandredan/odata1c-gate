@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import sys
 import urllib.parse
 
@@ -1376,6 +1377,98 @@ async def test_внутренняя_ошибка_не_отдаёт_текст_и
 
     assert ИНН not in текст
     assert json.loads(текст)["error"]["code"] == "internal"
+
+
+# M-4 ревью 6 (остаток Ruling 31): трассировка неожиданной ошибки идёт в журнал демона через ту же
+# защиту, что и ответ. Сегодня путь недостижим (httpx кладёт адрес запроса только в исключение
+# `raise_for_status`, которое шлюз не вызывает), но форма канала реальна: исключение с текстом
+# запроса — а в запросе раскрытые гейтом значения — легло бы в журнал дословно.
+ЖУРНАЛ_СЕРВИСА = "odata1c.tools.service"
+
+
+async def test_трассировка_ошибки_тела_идёт_в_журнал_через_защиту(сервис, respx_ut, caplog):
+    адрес = ЗНАЧЕНИЯ_КЛАССОВ["addr"]
+    токен = _токен_поля(сервис, "addr", "АдресРегистрации", адрес)
+    respx_ut.get(ЛИЦА).mock(
+        side_effect=RuntimeError(f"сбой запроса: АдресРегистрации eq '{адрес}'")
+    )
+
+    with caplog.at_level(logging.ERROR, logger=ЖУРНАЛ_СЕРВИСА):
+        текст = await сервис.query(
+            SessionScope(), base="ut", entity=ЛИЦА, filter=f"АдресРегистрации eq '{токен}'"
+        )
+
+    assert json.loads(текст)["error"]["code"] == "internal"
+    assert "RuntimeError" in caplog.text, "трассировка не записана — сторож ничего не доказывает"
+    assert токен in caplog.text
+    assert адрес not in caplog.text
+
+
+async def test_трассировка_сбоя_построения_гейта_идёт_через_стража(сервис, monkeypatch, caplog):
+    """Гейта базы ещё нет — раскрытого тоже (тело вызова не выполнялось), но известные словарю
+    значения всё равно проходят через стража сервиса на строжайшем уровне."""
+    токен = await токен_инн(сервис, ИНН)
+    сервис._gates.clear()
+
+    def взрыв(*a, **k):
+        raise RuntimeError(f"сбой политики рядом с {ИНН}")
+
+    monkeypatch.setattr("odata1c.tools.service.BaseGate", взрыв)
+
+    with caplog.at_level(logging.ERROR, logger=ЖУРНАЛ_СЕРВИСА):
+        await сервис.query(SessionScope(), base="ut", entity="Catalog_Валюты")
+
+    assert "RuntimeError" in caplog.text
+    assert токен in caplog.text
+    assert ИНН not in caplog.text
+
+
+async def test_трассировка_сбоя_ошибки_гейта_идёт_через_защиту(
+    сервис, respx_ut, monkeypatch, caplog
+):
+    """Третий путь в журнал: упал сам `gate.error` на пути ошибки 1С — ровно там, где 1С
+    повторяет раскрытое значение в тексте отказа. Сообщение 1С к этому месту уже вычищено ранним
+    проходом, поэтому раскрытое несёт само исключение — как несло бы исключение с текстом
+    запроса."""
+    адрес = ЗНАЧЕНИЯ_КЛАССОВ["addr"]
+    токен = _токен_поля(сервис, "addr", "АдресРегистрации", адрес)
+    respx_ut.get(ЛИЦА).mock(side_effect=эхо_отбора)
+
+    def взрыв(self, code, message, hint="", revealed=None):
+        raise RuntimeError(f"не смог обработать отбор АдресРегистрации eq '{адрес}'")
+
+    monkeypatch.setattr("odata1c.gate.pipeline.BaseGate.error", взрыв)
+
+    with caplog.at_level(logging.ERROR, logger=ЖУРНАЛ_СЕРВИСА):
+        текст = await сервис.query(
+            SessionScope(), base="ut", entity=ЛИЦА, filter=f"АдресРегистрации eq '{токен}'"
+        )
+
+    assert адрес not in текст
+    assert "RuntimeError" in caplog.text
+    assert токен in caplog.text
+    assert адрес not in caplog.text
+
+
+async def test_упавшая_защита_журнала_пишет_только_класс_исключения(сервис, monkeypatch, caplog):
+    """Если сама защита журнала упала, трассировка не пишется вовсе — только класс исключения:
+    непроверенный текст в журнал не идёт ни при каком сбое."""
+
+    def взрыв_тела(*a, **k):
+        raise RuntimeError(f"секрет {ИНН}")
+
+    def взрыв_стража(*a, **k):
+        raise ValueError("страж не смог")
+
+    monkeypatch.setattr("odata1c.tools.service.build_query", взрыв_тела)
+    monkeypatch.setattr(сервис._guard, "check", взрыв_стража)
+
+    with caplog.at_level(logging.ERROR, logger=ЖУРНАЛ_СЕРВИСА):
+        await сервис.query(SessionScope(), base="ut", entity="Catalog_Валюты")
+
+    assert "RuntimeError" in caplog.text
+    assert ИНН not in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 # ---------------------------------------------------------------------------------------------

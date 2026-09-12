@@ -23,6 +23,8 @@ import dataclasses
 import json
 import logging
 import sqlite3
+import sys
+import traceback
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
@@ -35,7 +37,7 @@ from odata1c.gate.masking import (
     ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ,
     Resolve,
 )
-from odata1c.gate.pipeline import BaseGate, guard_only
+from odata1c.gate.pipeline import СТРОЖАЙШИЙ_УРОВЕНЬ, BaseGate, guard_only
 from odata1c.gate.policy import PolicyError, redact_policy
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
@@ -371,8 +373,42 @@ class ToolService:
         try:
             return gate.error(code, message, hint, revealed)
         except Exception:
-            _log.exception("gate.error упал при обработке ошибки тула — отдан отказ без данных")
+            self._записать_трассировку(
+                "gate.error упал при обработке ошибки тула — отдан отказ без данных",
+                раскрытое=revealed,
+            )
             return _ОТКАЗ_НА_КРАЙНИЙ_СЛУЧАЙ
+
+    def _записать_трассировку(
+        self, сообщение: str, *, раскрытое: RevealedValues | None = None
+    ) -> None:
+        """Трассировка неожиданной ошибки — в журнал демона через ту же защиту, что и ответ
+        (находка M-4 ревью 6, остаток Ruling 31). Вызывается только из `except`.
+
+        Журнал локальный, но в нём не место раскрытым гейтом значениям: исключение может нести
+        текст запроса к 1С, а в запросе стоят уже раскрытые значения. Сегодня такого исключения нет
+        (httpx кладёт адрес только в `raise_for_status`, который шлюз не вызывает, а все его
+        `HTTPError` клиент превращает в `OdataError`), но достижимым этот путь делает любая
+        будущая правка. Поэтому текст трассировки проходит страж с набором раскрытого этого вызова
+        — слой раскрытого у стража первый, а между трассировкой и стражем преобразований нет, так
+        что отдельный ранний проход здесь ничего не добавил бы. Уровень — строжайший: у журнала
+        нет уровня базы, и владельцу нужна одна защита на любой базе. Упал сам гейт базы — набора
+        раскрытого нет (тело вызова не выполнялось), и страж прячет известные словарю значения.
+        Упала сама защита — пишется только класс исключения, без его текста."""
+        исключение = sys.exc_info()[1]
+        трассировка = traceback.format_exc()
+        try:
+            трассировка = self._guard.check(
+                трассировка, mode=СТРОЖАЙШИЙ_УРОВЕНЬ, revealed=раскрытое
+            ).text
+        except Exception:
+            _log.error(
+                "%s (%s; трассировка не записана: защита журнала не сработала)",
+                сообщение,
+                type(исключение).__name__,
+            )
+            return
+        _log.error("%s\n%s", сообщение, трассировка)
 
     def note_error(self, base: str, message: str) -> None:
         """Запомнить последнюю ошибку базы в реестре — её показывает `odata1c base list` и
@@ -446,7 +482,7 @@ class ToolService:
                 getattr(ошибка, "code", "internal"), str(ошибка), getattr(ошибка, "hint", "")
             )
         except Exception:
-            _log.exception(
+            self._записать_трассировку(
                 "внутренняя ошибка при построении гейта базы odata1c — детали в журнале демона"
             )
             return self._guard_error(
@@ -478,7 +514,10 @@ class ToolService:
                 revealed=раскрытое,
             )
         except Exception:
-            _log.exception("внутренняя ошибка тула odata1c — детали в журнале демона")
+            self._записать_трассировку(
+                "внутренняя ошибка тула odata1c — детали в журнале демона",
+                раскрытое=раскрытое,
+            )
             return self._safe_error(
                 гейт,
                 "internal",
