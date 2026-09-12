@@ -520,7 +520,10 @@ class Unmasker:
             self._dictionary.spellings(токен, base=self._base, field=сегмент) if сегмент else []
         )
         if not написания:
-            написания = _текстом(self._dictionary.spellings(токен))
+            написания = _текстом(
+                self._dictionary.spellings(токен),
+                lambda написание: self._dictionary.structure_of(токен, написание),
+            )
         if len(написания) == 1:
             return написания[0]
         if в_тексте is not None and len(написания) > 1:
@@ -1164,7 +1167,9 @@ class Unmasker:
         if структурное:
             кандидаты = [написание for написание in все if contact_info.is_structure(написание)]
         else:
-            кандидаты = _текстом(все)
+            кандидаты = _текстом(
+                все, lambda написание: self._dictionary.structure_of(токен, написание)
+            )
         нормализованное = self._dictionary.reveal(токен)
         if (отбор or not кандидаты) and нормализованное is not None:
             кандидаты = list(dict.fromkeys([*кандидаты, нормализованное]))
@@ -1456,16 +1461,20 @@ def _развернуть(текущее, revealed: RevealedValues | None) -> st
     return текущее if isinstance(текущее, str) else None
 
 
-def _текстом(написания: list[str]) -> list[str]:
+def _текстом(написания: list[str], структура: Callable[[str], bool]) -> list[str]:
     """Написания для текстового поля (Ruling 38, пункт 2): текст — как есть, структура
     (`contact_info.is_structure`: из неё извлекается представление, с `type` из перечисления или
     без, Р2-2) — её представлением, той же основой, по которой построен токен. Без повторов и по
     порядку: текст «+7 (495) …» из `Представление` и JSON с тем же `value` из `Значение` — одно
     написание, а не два. Структура без представления (JSON БСП без `value`) в текстовое поле не
-    идёт вовсе: подставить из неё нечего."""
+    идёт вовсе: подставить из неё нечего.
+
+    `структура` — формат написания для этого токена (`Dictionary.structure_of`): JSON без
+    `type`, по которому токен построен целиком (поле с классом вне контактной информации), —
+    само значение, а не структура с ним, и идёт как есть."""
     результат: set[str] = set()
     for написание in написания:
-        if not contact_info.is_structure(написание):
+        if not структура(написание):
             результат.add(написание)
             continue
         представление = contact_info.representation(написание)

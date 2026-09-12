@@ -626,15 +626,36 @@ class Dictionary:
         же именем в другой сущности той же базы тоже засчитывается: так поле скорее будет принято
         за структурное лишний раз (отказ на записи), чем пропущено (текст в структуре). Кандидаты
         отбираются в SQL по первому значащему символу (`{` или `<`), содержимое проверяется уже
-        здесь — у текстового поля с тысячами написаний разбирать нечего."""
+        здесь — у текстового поля с тысячами написаний разбирать нечего.
+
+        Структурой засчитывается написание, которое структура и для своего токена
+        (`structure_of`): JSON без `type` в поле с классом вне контактной информации маскировщик
+        кладёт в токен целиком, и для этого токена он текст, а не структура."""
         for строка in self._connection.execute(
-            "SELECT raw_value FROM variants WHERE base = ? AND field = ?"
-            " AND substr(ltrim(raw_value, ' ' || char(9, 10, 13)), 1, 1) IN ('{', '<')",
+            "SELECT v.raw_value, t.type, t.normalized FROM variants v"
+            " JOIN tokens t ON t.token = v.token WHERE v.base = ? AND v.field = ?"
+            " AND substr(ltrim(v.raw_value, ' ' || char(9, 10, 13)), 1, 1) IN ('{', '<')",
             (base, field),
         ):
-            if contact_info.is_structure(строка["raw_value"]):
+            if _структура_для(строка["raw_value"], строка["type"], строка["normalized"]):
                 return True
         return False
+
+    def structure_of(self, token: str, text: str) -> bool:
+        """Структура ли написание `text` для ЭТОГО токена — формат тем же признаком, что основа
+        токена (Р2-2 и его обратная сторона). Основа зависит не только от строки, но и от места,
+        где маскировщик её встретил: в строке контактной информации представление извлекается
+        всегда, в поле с классом вне её — только из значения БСП с `type`
+        (`Masker._класс_самоописанного_значения`). JSON `{"value": …}` без `type` из такого поля
+        — токен целиком: для этого токена он текст и в текстовое поле идёт дословно, а тот же JSON
+        из строки контактной информации — структура, и в текстовое поле идёт представление.
+        Подробнее — `_структура_для`."""
+        строка = self._connection.execute(
+            "SELECT type, normalized FROM tokens WHERE token = ?", (token,)
+        ).fetchone()
+        if строка is None:
+            return contact_info.is_structure(text)
+        return _структура_для(text, строка["type"], строка["normalized"])
 
     def matches(self, token: str, text: str) -> bool:
         """Написание ли `text` значения этого токена: сохранённое словарём написание или строка
@@ -651,7 +672,9 @@ class Dictionary:
         Структура контактной информации (JSON или XML БСП) сравнивается по представлению — той же
         основе, по которой `token_for(source=…)` строит её токен (Ruling 33 и Ruling 38, пункт 3):
         JSON адреса в поле заказа — написание значения, даже если словарь видел этот адрес только
-        текстом или JSON другой записи с другим `comment`."""
+        текстом или JSON другой записи с другим `comment`. Строка целиком сравнивается тоже:
+        токен JSON без `type` из поля вне контактной информации построен по нему самому
+        (`structure_of`)."""
         строка = self._connection.execute(
             "SELECT type, normalized FROM tokens WHERE token = ?", (token,)
         ).fetchone()
@@ -659,11 +682,15 @@ class Dictionary:
             return False
         if text in self.spellings(token):
             return True
-        основа = contact_info.representation(text) if contact_info.is_structure(text) else text
-        if TOKEN_RE.search(основа) and not TOKEN_RE.search(строка["normalized"]):
-            return False
-        нормализованное = normalize_value(строка["type"], основа) or " ".join(основа.split())
-        return нормализованное == строка["normalized"]
+        основы = [text]
+        if contact_info.is_structure(text):
+            основы.append(contact_info.representation(text))
+        for основа in основы:
+            if TOKEN_RE.search(основа) and not TOKEN_RE.search(строка["normalized"]):
+                continue
+            if _свёртка(строка["type"], основа) == строка["normalized"]:
+                return True
+        return False
 
     def issued_for(self, token: str, *, base: str, field: str, entity: str | None = None) -> bool:
         """Выдавался ли ЭТОТ токен этой базой для этого поля (Ruling 19, раунд правок 1
@@ -958,3 +985,29 @@ class Dictionary:
         return int(
             self._connection.execute("SELECT COUNT(*) AS всего FROM tokens").fetchone()["всего"]
         )
+
+
+def _свёртка(type_: str, основа: str) -> str:
+    """Нормализованная форма, по которой написание сравнивается со значением токена, — та же
+    свёртка, что у `token_for` (без запасного шага по `raw_value`: здесь основа и есть строка)."""
+    return normalize_value(type_, основа) or " ".join(основа.split())
+
+
+def _структура_для(text: str, type_: str, normalized: str) -> bool:
+    """Структура ли написание для токена с нормализованной формой `normalized`.
+
+    Значение БСП (`contact_info.is_contact_value`) — структура всегда: маскировщик строит его
+    токен по представлению, а без представления (JSON без `value`) подставить из него в текст
+    нечего (Ruling 38). Строка, из которой представление не извлекается, — текст. Остаётся JSON
+    `{"value": …}` без `type`: он текст, только если токен построен по нему целиком (свёртка
+    строки совпала со значением токена, а свёртка представления — нет). Совпали обе — у класса с
+    цифровой свёрткой (телефон без других цифр в JSON) токен от места не зависит, и написание
+    считается структурой: в текстовое поле идёт представление с тем же значением."""
+    if contact_info.is_contact_value(text):
+        return True
+    представление = contact_info.representation(text)
+    if представление == text:
+        return False
+    return not (
+        _свёртка(type_, text) == normalized and _свёртка(type_, представление) != normalized
+    )
