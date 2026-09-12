@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import http.server
 import json
 import os
 import pathlib
@@ -46,7 +47,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 
 import httpx
@@ -57,6 +60,7 @@ from mcp.client.session import ClientSession
 
 БАЗА = "trade_dev"
 ПОРТ = 7191
+ПОРТ_ПРОКСИ = 7192
 ТАЙМАУТ = 240.0
 СТРАНИЦА = 20
 
@@ -219,14 +223,82 @@ def открытый_адрес(строка: dict, поля=("Представ�
 # --- временный дом ---------------------------------------------------------------------------
 
 
-def собрать_дом(рабочий: pathlib.Path) -> pathlib.Path:
+class СчётчикЗапросов:
+    """Прокси между временным демоном и 1С: пропускает GET как есть и считает обращения.
+
+    Отказ «до обращения к 1С» (Ruling 35) проверяется счётчиком, а не журналом демона: журнал
+    адресов запросов не пишет (Ruling 31), а отсутствие строки в журнале — не доказательство.
+    Прокси слушает только 127.0.0.1 и живёт, пока идёт прогон; значения через него идут, но не
+    печатаются и не пишутся никуда."""
+
+    def __init__(self, настоящий_адрес: str) -> None:
+        разбор = urllib.parse.urlsplit(настоящий_адрес)
+        self.источник = f"{разбор.scheme}://{разбор.netloc}"
+        self.адрес = f"http://127.0.0.1:{ПОРТ_ПРОКСИ}{разбор.path}"
+        self.счёт = 0
+        self._клиент = httpx.Client(timeout=120)
+        прокси = self
+
+        class Обработчик(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — имя метода задаёт http.server
+                прокси.счёт += 1
+                заголовки = {
+                    к: з
+                    for к, з in self.headers.items()
+                    if к.lower() not in ("host", "accept-encoding", "connection")
+                }
+                ответ = прокси._клиент.get(прокси.источник + self.path, headers=заголовки)
+                тело = ответ.content
+                self.send_response(ответ.status_code)
+                for к, з in ответ.headers.multi_items():
+                    if к.lower() not in (
+                        "content-length",
+                        "transfer-encoding",
+                        "content-encoding",
+                        "connection",
+                    ):
+                        self.send_header(к, з)
+                self.send_header("Content-Length", str(len(тело)))
+                self.end_headers()
+                self.wfile.write(тело)
+
+            def log_message(self, *аргументы):
+                return
+
+        self._сервер = http.server.ThreadingHTTPServer(("127.0.0.1", ПОРТ_ПРОКСИ), Обработчик)
+        self._поток = threading.Thread(target=self._сервер.serve_forever, daemon=True)
+        self._поток.start()
+
+    def закрыть(self) -> None:
+        self._сервер.shutdown()
+        self._клиент.close()
+
+
+# Пробный рецепт для раздела «оракул»: параметр сравнивается с полем контактной информации.
+# Кладётся только во временный дом — рецепты владельца не трогаются.
+РЕЦЕПТ_ПРОБЫ = {
+    "title": "Проба Ruling 35: строка контактной информации по номеру",
+    "entity": "Catalog_Контрагенты_КонтактнаяИнформация",
+    "params": {"номер": {"type": "string", "required": True, "description": "номер"}},
+    "filter": "Представление eq {номер}",
+    "select": ["Ref_Key", "Тип", "Представление"],
+}
+
+
+def собрать_дом(
+    рабочий: pathlib.Path, *, адрес: str | None = None, перестроить_политику: bool = False
+) -> pathlib.Path:
     """Временный домашний каталог: запись базы, индекс и политика — копией из рабочего дома;
-    словарь — пустой, секрет — свой."""
+    словарь — пустой, секрет — свой. `адрес` — адрес публикации вместо настоящего (прокси-счётчик).
+    `перестроить_политику` — пересобрать раздел `auto` политики по индексу текущим кодом, как это
+    сделает реиндекс владельца (Ruling 36: новые справочники людей попадают в `auto` только так)."""
     дом = pathlib.Path(tempfile.mkdtemp(prefix="odata1c-ci-"))
     for имя in ("bases", "logs"):
         (дом / имя).mkdir()
     настройки = yaml.safe_load((рабочий / "bases.yaml").read_text(encoding="utf-8"))
     запись = dict(настройки["bases"][БАЗА])
+    if адрес is not None:
+        запись["url"] = адрес
     (дом / "bases.yaml").write_text(
         yaml.safe_dump({"default": БАЗА, "bases": {БАЗА: запись}}, allow_unicode=True),
         encoding="utf-8",
@@ -241,6 +313,17 @@ def собрать_дом(рабочий: pathlib.Path) -> pathlib.Path:
     for имя in ("metadata.sqlite", "policy.yaml", "recipes.yaml"):
         if (исходный / имя).exists():
             shutil.copy2(исходный / имя, каталог / имя)
+    рецепты_путь = каталог / "recipes.yaml"
+    рецепты = (
+        yaml.safe_load(рецепты_путь.read_text(encoding="utf-8")) if рецепты_путь.exists() else None
+    ) or {"version": 1, "recipes": {}}
+    рецепты.setdefault("recipes", {})["проба_ки_по_номеру"] = РЕЦЕПТ_ПРОБЫ
+    рецепты_путь.write_text(yaml.safe_dump(рецепты, allow_unicode=True), encoding="utf-8")
+    if перестроить_политику:
+        from odata1c.config.loader import load_config
+        from odata1c.gate.service import refresh_policy
+
+        refresh_policy(дом, load_config(дом).bases[БАЗА])
     return дом
 
 
@@ -672,8 +755,7 @@ async def путь_владельца(сеанс, итог: dict) -> None:
                 счёт["адресов не-юрлиц"] += 1
                 счёт["адресов не-юрлиц открыто"] += bool(открытый_адрес(строка))
                 счёт["адресов не-юрлиц с открытыми Город/Регион"] += any(
-                    без_токенов(str(строка.get(поле) or "")).strip()
-                    for поле in ("Город", "Регион")
+                    без_токенов(str(строка.get(поле) or "")).strip() for поле in ("Город", "Регион")
                 )
     print(f"  владельцев {len(владельцы)}, сущность в ответе {dict(сущности)}")
     for метка in (
@@ -691,6 +773,163 @@ async def путь_владельца(сеанс, итог: dict) -> None:
         if метка.startswith("ошибка"):
             print(f"  {метка}: {число}")
     итог["путь_владельца"] = {"владельцев": len(владельцы), "сущности": dict(сущности), **счёт}
+
+
+ФИО_ПОХОЖЕ = re.compile(r"^[А-ЯЁ][а-яё\-]+\s+[А-ЯЁ](?:[а-яё\-]+|\.)\s*(?:[А-ЯЁ](?:[а-яё\-]+|\.))?$")
+
+
+async def оракул(сеанс, итог: dict, прокси: СчётчикЗапросов) -> None:
+    """Ruling 35: отбор по полю контактной информации открытым литералом отклоняется ДО 1С —
+    счётчик прокси не растёт. Положительный контроль в том же прогоне: разрешённый отбор (`Тип`) и
+    отбор токеном из ответа до 1С доходят (счётчик растёт), иначе «ноль запросов» мог бы значить
+    сломанный прокси, а не отказ."""
+    print("\n=== 6. Оракул отбора (Ruling 35): отказ до 1С по счётчику прокси ===")
+    ки = "Catalog_Контрагенты_КонтактнаяИнформация"
+    строки: list[tuple] = []
+
+    async def вызов(метка: str, имя: str, аргументы: dict) -> dict:
+        до = прокси.счёт
+        ответ = await тул(сеанс, имя, аргументы)
+        код = (ответ.get("error") or {}).get("code") or "ok"
+        найдено = len(ответ.get("items") or [])
+        строки.append((метка, код, прокси.счёт - до, найдено))
+        return ответ
+
+    контроль = await вызов(
+        "контроль: query Тип eq 'Телефон'",
+        "odata1c_query",
+        {
+            "entity": ки,
+            "filter": "Тип eq 'Телефон'",
+            "select": ["Ref_Key", "Тип", "Представление"],
+            "top": 3,
+        },
+    )
+    элементы = контроль.get("items") or []
+    токен = элементы[0]["Представление"] if элементы else None
+    владелец = элементы[0]["Ref_Key"] if элементы else None
+
+    номер = "84951234567"
+    отказы = [
+        (
+            "query substringof('495', Представление)",
+            "odata1c_query",
+            {"entity": ки, "filter": "substringof('495', Представление)", "top": 3},
+        ),
+        (
+            "query Представление eq открытый номер",
+            "odata1c_query",
+            {"entity": ки, "filter": f"Представление eq '{номер}'", "top": 3},
+        ),
+        (
+            "query startswith(Значение, '{')",
+            "odata1c_query",
+            {"entity": ки, "filter": "startswith(Значение, '{')", "top": 3},
+        ),
+        (
+            "query НомерТелефона gt '8'",
+            "odata1c_query",
+            {"entity": ки, "filter": "НомерТелефона gt '8'", "top": 3},
+        ),
+        (
+            "query orderby Представление",
+            "odata1c_query",
+            {"entity": ки, "orderby": "Представление", "top": 3},
+        ),
+        (
+            "raw_get $filter substringof",
+            "odata1c_raw_get",
+            {"path": ки, "query": {"$filter": "substringof('495', Представление)"}},
+        ),
+        (
+            "raw_get $orderby Представление",
+            "odata1c_raw_get",
+            {"path": ки, "query": {"$orderby": "Представление"}},
+        ),
+        (
+            "recipe: открытый номер в параметре",
+            "odata1c_recipe",
+            {"name": "проба_ки_по_номеру", "params": {"номер": номер}},
+        ),
+    ]
+    if владелец:
+        отказы.append(
+            (
+                "raw_get путём владельца, $filter substringof",
+                "odata1c_raw_get",
+                {
+                    "path": f"Catalog_Контрагенты(guid'{владелец}')/КонтактнаяИнформация",
+                    "query": {"$filter": "substringof('495', Представление)"},
+                },
+            )
+        )
+    for метка, имя, аргументы in отказы:
+        await вызов(метка, имя, аргументы)
+    if токен:
+        await вызов(
+            "токен из ответа: query Представление eq токен",
+            "odata1c_query",
+            {
+                "entity": ки,
+                "filter": f"Тип eq 'Телефон' and Представление eq '{токен}'",
+                "select": ["Ref_Key", "Представление"],
+                "top": 3,
+            },
+        )
+        await вызов(
+            "токен из ответа: recipe",
+            "odata1c_recipe",
+            {"name": "проба_ки_по_номеру", "params": {"номер": токен}},
+        )
+    for метка, код, запросов, найдено in строки:
+        print(f"  {метка}: код {код}, запросов к 1С {запросов}, записей {найдено}")
+    итог["оракул"] = [
+        {"вызов": м, "код": к, "запросов_к_1С": з, "записей": н} for м, к, з, н in строки
+    ]
+
+
+async def люди(сеанс, итог: dict) -> None:
+    """Ruling 36 и правдивый `masked_fields`: ФИО контактных лиц партнёров и свойство списка —
+    каждое значение поля из `masked_fields` токен целиком (проверяется по всему ответу)."""
+    print("\n=== 7. Справочники людей (Ruling 36) и правдивый masked_fields ===")
+    факты = {}
+    for сущность, поля in (
+        ("Catalog_КонтактныеЛицаПартнеров", ["Ref_Key", "Description", "ДолжностьПоВизитке"]),
+        ("Catalog_ОтветственныеЛицаОрганизаций", ["Ref_Key", "Description"]),
+    ):
+        ответ = await тул(сеанс, "odata1c_query", {"entity": сущность, "select": поля, "top": 30})
+        if "error" in ответ:
+            print(f"  {сущность}: ошибка {ответ['error'].get('code')}")
+            continue
+        записи = ответ.get("items") or []
+        открытые_фио = Counter()
+        for запись in записи:
+            for поле in поля[1:]:
+                значение = без_токенов(str(запись.get(поле) or "")).strip()
+                if ФИО_ПОХОЖЕ.match(значение):
+                    открытые_фио[поле] += 1
+        полные = ответ.get("masked_fields") or []
+        частичные = ответ.get("partially_masked_fields") or []
+        нарушения = [
+            поле
+            for поле in полные
+            for запись in записи
+            if (з := str(запись.get(поле) or "")).strip()
+            and not ТОКЕН.fullmatch(з)
+            and not re.fullmatch(r"[0-9a-f\-]{36}\s*", з)
+        ]
+        факты[сущность] = {
+            "записей": len(записи),
+            "открыто_похожих_на_ФИО": dict(открытые_фио),
+            "masked_fields": полные,
+            "partially_masked_fields": частичные,
+            "нарушений_masked_fields": len(нарушения),
+        }
+        print(
+            f"  {сущность}: записей {len(записи)}, открыто похожих на ФИО {dict(открытые_фио)}, "
+            f"masked_fields {полные}, partially {частичные}, нарушений свойства {len(нарушения)}"
+        )
+    итог["люди"] = факты
 
 
 async def инвариант_6(сеанс, итог: dict, сырой: httpx.Client, адрес: str) -> None:
@@ -793,6 +1032,11 @@ async def main() -> int:
     )
     разбор.add_argument("--out", help="куда сохранить итог JSON (счётчики, без значений)")
     разбор.add_argument(
+        "--reindex-policy",
+        action="store_true",
+        help="пересобрать раздел auto политики во временном доме, как это сделает реиндекс",
+    )
+    разбор.add_argument(
         "--only",
         help="выполнить только перечисленные разделы через запятую (например, путь_владельца)",
     )
@@ -807,7 +1051,12 @@ async def main() -> int:
     адрес = настройки["url"].rstrip("/") + "/"
     сырой = httpx.Client(auth=(настройки["user"], настройки["password"]), timeout=120)
 
-    дом = собрать_дом(рабочий)
+    прокси = СчётчикЗапросов(адрес) if нужен("оракул") else None
+    дом = собрать_дом(
+        рабочий,
+        адрес=прокси.адрес if прокси else None,
+        перестроить_политику=аргументы.reindex_policy,
+    )
     итог: dict = {"label": аргументы.label}
     print(f"прогон {аргументы.label}: временный дом создан, порт демона {ПОРТ}")
     try:
@@ -822,12 +1071,18 @@ async def main() -> int:
                 await адреса(сеанс, итог)
             if нужен("путь_владельца"):
                 await путь_владельца(сеанс, итог)
+            if нужен("оракул") and прокси is not None:
+                await оракул(сеанс, итог, прокси)
+            if нужен("люди"):
+                await люди(сеанс, итог)
             if нужен("инвариант_6"):
                 await инвариант_6(сеанс, итог, сырой, адрес)
         if нужен("словарь"):
             словарь_телефонов(дом, итог)
     finally:
         остановить_демон(дом)
+        if прокси is not None:
+            прокси.закрыть()
         сырой.close()
         shutil.rmtree(дом, ignore_errors=True)
         print(f"\nвременный дом удалён: {not дом.exists()}")
