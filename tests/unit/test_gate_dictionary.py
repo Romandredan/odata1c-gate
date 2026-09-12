@@ -734,3 +734,14 @@ def test_токен_без_записи_нового_названия_не_вы�
     with pytest.raises(ValueError):
         словарь.token_for(класс, "АО Вектор", base="ut", entity="", field="e", persist=False)
     assert _строки(словарь) == до
+
+
+def test_детекторы_не_находят_названий():
+    """Опора `persist=False`: текст ошибки маскируется детекторами, а номер названия без записи не
+    выдать (`ValueError` выше). Детектор названий, добавленный позже, превратил бы каждый текст
+    отказа с названием в отказ без данных (`_safe_error` ловит исключение) — молча и на рабочем
+    пути. Тогда сначала решить, какой токен давать названию в эхе."""
+    from odata1c.gate.detectors import SCAN_ORDER
+    from odata1c.gate.dictionary import НУМЕРУЕМЫЕ
+
+    assert set(SCAN_ORDER).isdisjoint(НУМЕРУЕМЫЕ)
