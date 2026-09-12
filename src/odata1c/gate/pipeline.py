@@ -264,10 +264,10 @@ class BaseGate:
         if value == ПУСТАЯ_ДАТА_1С:
             return
         отказ = open_literal_refusal(
-            self.field_class(entity, field, shape=shape, strict=strict), field, value
+            self.field_class(entity, field, shape=shape, strict=strict), field
         )
         if отказ is not None:
-            raise token_fragment_refusal(value) or отказ
+            raise token_fragment_refusal(field, value) or отказ
 
     def mask(
         self,
