@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import datetime
+import json
 import pathlib
 import re
 import sqlite3
@@ -864,6 +865,7 @@ class Dictionary:
             "SELECT v.raw_value, t.type, t.normalized FROM variants v"
             " JOIN tokens t ON t.token = v.token"
             " WHERE v.base = ? AND v.entity = ? AND v.field = ?"
+            f" AND {_ИЗ_ДАННЫХ}"
             " AND substr(ltrim(v.raw_value, ' ' || char(9, 10, 13)), 1, 1) IN ('{', '<')",
             (base, entity, field),
         ):
@@ -1068,7 +1070,9 @@ class Dictionary:
         имён полей (их сотни, не тысячи), а не по всем написаниям."""
         поля = [
             строка["field"]
-            for строка in self._connection.execute("SELECT DISTINCT field FROM variants")
+            for строка in self._connection.execute(
+                f"SELECT DISTINCT field FROM variants WHERE {_ИЗ_ДАННЫХ}"
+            )
             if ПЕРЕЧИСЛЕНИЯ_ТИПА_ЛИЦА.fullmatch(строка["field"])
         ]
         if not поля:
@@ -1078,7 +1082,7 @@ class Dictionary:
             строка["token"]
             for строка in self._connection.execute(
                 f"SELECT DISTINCT v.token FROM variants v JOIN tokens t ON t.token = v.token"
-                f" WHERE v.field IN ({метки}) AND t.type IN ('org', 'person')",
+                f" WHERE v.field IN ({метки}) AND t.type IN ('org', 'person') AND {_ИЗ_ДАННЫХ}",
                 поля,
             )
         }
@@ -1123,7 +1127,7 @@ class Dictionary:
             строка["token"]: строка["type"]
             for строка in self._connection.execute(
                 "SELECT DISTINCT v.token, t.type FROM variants v JOIN tokens t ON t.token = v.token"
-                " WHERE v.raw_value LIKE '%[[%'"
+                f" WHERE v.raw_value LIKE '%[[%' AND {_ИЗ_ДАННЫХ}"
             ).fetchall()
         }
         мусор: set[str] = set()
@@ -1156,19 +1160,35 @@ class Dictionary:
         число в тексте неотличимо от числа. Словари прежних версий пересчитываются при открытии
         (`ВЕРСИЯ_СХЕМЫ`); проверка здесь — страховка на случай строки, дописанной прежней версией
         шлюза уже после пересчёта: число остаётся числом при любом содержимом таблицы.
+
+        Однозначность считается только среди токенов вне мусора (Р4-4 ревью раунда 4, сведение с
+        задачей 5): прежде мусорный токен выпадал уже ПОСЛЕ подсчёта, и токен эха (все написания —
+        путь ошибки до Ruling 48, Ruling 49 велит не учитывать их нигде) с тем же коротким ключом
+        делал ключ настоящей организации неоднозначным — название уходило открытым. То же для
+        остальных признаков мусора: такой токен не название ни одной организации, и ключ, общий с
+        ним, однозначен.
         """
-        мусор = self._мусорные_токены()
-        return {
-            строка["variant_norm"]: строка["token"]
-            for строка in self._connection.execute(
-                "SELECT variant_norm, token FROM name_variants"
-                " WHERE variant_norm IN ("
-                "   SELECT variant_norm FROM name_variants"
-                "   GROUP BY variant_norm HAVING COUNT(*) = 1"
-                " )"
-            ).fetchall()
-            if строка["token"] not in мусор and _годится_в_поиск(строка["variant_norm"])
-        }
+        return {ключ: токены[0] for ключ, токены in self._ключи_названий(однозначные=True).items()}
+
+    def _ключи_названий(self, *, однозначные: bool) -> dict[str, list[str]]:
+        """Ключи названий, годные для поиска (`_годится_в_поиск`), с токенами — однозначные (ровно
+        один токен) или неоднозначные (больше одного). Токены мусора (`_мусорные_токены`: эхо
+        ошибки по Ruling 49, след двойной маскировки, члены перечислений) исключаются ДО подсчёта
+        (Р4-4): множество передаётся в SQL одним параметром через `json_each`; группировка — там
+        же, одним проходом (токены ключа — `group_concat` через разделитель, которого в токене не
+        бывает)."""
+        мусор = json.dumps(sorted(self._мусорные_токены()))
+        условие = "COUNT(*) = 1" if однозначные else "COUNT(*) > 1"
+        результат: dict[str, list[str]] = {}
+        for строка in self._connection.execute(
+            "SELECT variant_norm, group_concat(token, char(31)) AS токены FROM name_variants"
+            " WHERE token NOT IN (SELECT value FROM json_each(?))"
+            f" GROUP BY variant_norm HAVING {условие}",
+            (мусор,),
+        ).fetchall():
+            if _годится_в_поиск(строка["variant_norm"]):
+                результат[строка["variant_norm"]] = sorted(строка["токены"].split("\x1f"))
+        return результат
 
     def ambiguous_name_variants(self) -> dict[str, list[str]]:
         """Варианты названий, закреплённые более чем за одним токеном (см. name_variants()).
@@ -1178,20 +1198,10 @@ class Dictionary:
         одним из токенов (поправка ревью, 2026-09-09).
 
         Голое безбуквенное ядро, дописанное прежней версией, сюда не попадает — та же страховка,
-        что в `name_variants`: это не ключ поиска, предупреждать о нём не о чем (Р3-2).
+        что в `name_variants`: это не ключ поиска, предупреждать о нём не о чем (Р3-2). Токены
+        мусора (эхо ошибки и прочие) неоднозначности не создают — считаются без них (Р4-4).
         """
-        результат: dict[str, list[str]] = {}
-        for строка in self._connection.execute(
-            "SELECT variant_norm, token FROM name_variants"
-            " WHERE variant_norm IN ("
-            "   SELECT variant_norm FROM name_variants GROUP BY variant_norm HAVING COUNT(*) > 1"
-            " )"
-            " ORDER BY variant_norm, token"
-        ).fetchall():
-            if not _годится_в_поиск(строка["variant_norm"]):
-                continue
-            результат.setdefault(строка["variant_norm"], []).append(строка["token"])
-        return результат
+        return self._ключи_названий(однозначные=False)
 
     def _создать(self, type_: str, нормализованное: str, base: str, entity: str, field: str) -> str:
         """Вставки без собственной транзакции — вызывающий (token_for) держит одну на всё."""

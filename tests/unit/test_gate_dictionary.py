@@ -1,5 +1,6 @@
 """Словарь токенов: детерминированность, номера названий, варианты, обратное чтение (SPEC §6.6)."""
 
+import json
 import sqlite3
 
 import pytest
@@ -13,6 +14,7 @@ from odata1c.gate.dictionary import (
     name_variants_of,
     normalize_text_with_map,
 )
+from odata1c.gate.guard import Guard
 
 СЕКРЕТ = "секрет ровно для тестов словаря!!".encode()
 
@@ -793,3 +795,106 @@ def test_токен_из_ошибки_и_данных_известен_по_да
     assert словарь.knows(токен)
     assert словарь.spellings(токен) == ["0000000716"]
     assert токен in словарь.number_tokens().values()
+
+
+# --- Р4-4 ревью раунда 4 (сведение с задачей 5): однозначность ключей названий — по данным -------
+# Однозначность ключа (`GROUP BY variant_norm HAVING COUNT(*) = 1`) считалась по всем токенам, и
+# токен эха (все написания — путь ошибки до Ruling 48) с тем же коротким ключом делал ключ
+# настоящей организации неоднозначным: название уходило открытым, хотя Ruling 49 велит такие
+# написания не учитывать нигде. Считается только по токенам вне мусора (`_мусорные_токены`).
+
+К = "Catalog_Контрагенты"
+
+
+def _текст_слоем_названий(словарь: Dictionary, текст: str) -> str:
+    проверено = Guard(словарь).check(
+        json.dumps({"К": текст}, ensure_ascii=False), mode="identifiers+names"
+    )
+    return json.loads(проверено.text)["К"]
+
+
+def test_токен_эха_не_делает_ключ_названия_неоднозначным(словарь):
+    """`scratchpad/r4_echo_collision.py` в обратной форме: с эхом `АО "Альфа Бета"` название
+    настоящей организации `ООО "Альфа Бета"` закрыто, как и без эха."""
+    настоящий = словарь.token_for(
+        "org", 'ООО "Альфа Бета"', base="ut", entity=К, field="Description"
+    )
+    _след_ошибки(словарь, "org", 'АО "Альфа Бета"')
+
+    assert словарь.name_variants()["альфа бета"] == настоящий
+    assert "альфа бета" not in словарь.ambiguous_name_variants()
+    assert _текст_слоем_названий(словарь, "оплата от Альфа Бета по счёту") == (
+        f"оплата от {настоящий} по счёту"
+    )
+
+
+def test_токен_эха_не_отнимает_ключ_в_кавычках(словарь):
+    настоящий = словарь.token_for("org", 'ООО "2020"', base="ut", entity=К, field="Description")
+    _след_ошибки(словарь, "org", 'АО "2020"')
+
+    assert словарь.name_variants()['"2020"'] == настоящий
+    assert _текст_слоем_названий(словарь, "от «2020» вх") == f"от {настоящий} вх"
+
+
+def test_эхо_пришедшее_данными_снова_участвует_в_однозначности(словарь):
+    """Токен, у которого появилось написание из данных, — обычный токен: общий короткий ключ двух
+    настоящих организаций неоднозначен, как прежде (§6.5, поправка ⁷)."""
+    настоящий = словарь.token_for(
+        "org", 'ООО "Альфа Бета"', base="ut", entity=К, field="Description"
+    )
+    эхо = _след_ошибки(словарь, "org", 'АО "Альфа Бета"')
+    assert (
+        словарь.token_for("org", 'АО "Альфа Бета"', base="ut", entity=К, field="Description") == эхо
+    )
+
+    assert "альфа бета" not in словарь.name_variants()
+    assert set(словарь.ambiguous_name_variants()["альфа бета"]) == {настоящий, эхо}
+
+
+def test_признак_структурного_поля_не_считает_написания_ошибки(словарь):
+    """Ruling 49 «нигде» — и в признаке 3 структурного поля: структура, записанная путём ошибки,
+    полем не является."""
+    структура = json.dumps(
+        {"value": "г. Тула, ул. Садовая, д. 9", "type": "Адрес"}, ensure_ascii=False
+    )
+    _след_ошибки(словарь, "addr", структура)
+
+    assert not словарь.structured_field(base="ut", entity="", field="error")
+
+
+def test_перестройка_словаря_не_заполняет_сущность_строк_ошибки(tmp_path):
+    """Словарь прежнего ключа `variants` со строками пути ошибки: перестройка копирует их как есть
+    (`entity=''`, `field='error'`), иначе они вышли бы из-под фильтра Ruling 49. Пересчёт названий
+    версии 3 не делает эхо участником однозначности."""
+    путь = tmp_path / "gate.sqlite"
+    с = Dictionary(путь, СЕКРЕТ)
+    настоящий = с.token_for("org", 'ООО "Альфа Бета"', base="ut", entity=К, field="Description")
+    эхо = с.token_for("org", 'АО "Альфа Бета"', base="ut", entity="", field="error")
+    инн = с.token_for("inn", "0000000716", base="ut", entity="", field="error")
+    с.close()
+    соединение = sqlite3.connect(путь, isolation_level=None)
+    соединение.executescript(
+        "BEGIN; CREATE TABLE v2 (token TEXT NOT NULL, base TEXT NOT NULL, entity TEXT NOT NULL,"
+        " field TEXT NOT NULL, raw_value TEXT NOT NULL, seen_at TEXT NOT NULL,"
+        " PRIMARY KEY (token, base, field, raw_value));"
+        " INSERT INTO v2 SELECT token, base, entity, field, raw_value, seen_at FROM variants;"
+        " DROP TABLE variants; ALTER TABLE v2 RENAME TO variants; PRAGMA user_version = 2; COMMIT;"
+    )
+    соединение.close()
+
+    с = Dictionary(путь, СЕКРЕТ)
+    try:
+        assert not с.knows(эхо)
+        assert not с.knows(инн)
+        assert с.name_variants()["альфа бета"] == настоящий
+        assert инн not in с.number_tokens().values()
+    finally:
+        с.close()
+    соединение = sqlite3.connect(путь)
+    try:
+        строки_ошибки = соединение.execute(
+            "SELECT DISTINCT entity, field FROM variants WHERE token IN (?, ?)", (эхо, инн)
+        ).fetchall()
+    finally:
+        соединение.close()
+    assert строки_ошибки == [("", "error")]
