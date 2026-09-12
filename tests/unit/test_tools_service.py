@@ -4459,3 +4459,182 @@ async def test_конверт_называет_частичные_поля_от�
     assert "Комментарий" not in ответ["masked_fields"]
     assert ответ["partially_masked_fields"] == ["Комментарий"]
     assert ИНН not in json.dumps(ответ, ensure_ascii=False)
+
+
+# Ruling 37: оракул через путь к табличной части контактной информации — на всех путях тулов
+
+ДОКУМЕНТ_С_КОНТРАГЕНТОМ = "Document_РеализацияТоваровУслуг"
+ОБОРОТЫ_С_КОНТРАГЕНТОМ = "AccumulationRegister_ДвиженияДенежныеСредстваКонтрагент_Turnovers"
+# (сущность, отбор) — коллекция от владельца, навигация от документа.
+ОРАКУЛЫ_ПУТЁМ = (
+    pytest.param(
+        "Catalog_Контрагенты", "substringof('495', КонтактнаяИнформация/Представление)", id="колл"
+    ),
+    pytest.param(
+        "Catalog_Контрагенты",
+        "КонтактнаяИнформация/Представление eq '84951234567'",
+        id="колл-eq",
+    ),
+    pytest.param(
+        ДОКУМЕНТ_С_КОНТРАГЕНТОМ,
+        "substringof('9', Контрагент/КонтактнаяИнформация/Представление)",
+        id="навигация",
+    ),
+    pytest.param(
+        "Catalog_Контрагенты",
+        "substringof('9', ГоловнойКонтрагент/КонтактнаяИнформация/Значение)",
+        id="три-звена",
+    ),
+)
+
+
+@pytest.mark.parametrize(("сущность", "отбор"), ОРАКУЛЫ_ПУТЁМ)
+async def test_r37_query_и_raw_get_отклоняют_оракул_путём_до_1С(сервис, respx_ut, сущность, отбор):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.query(SessionScope(), base="ut", entity=сущность, filter=отбор, top=5)
+    )
+    assert ответ["error"]["code"] == "filter_syntax", ответ
+    ответ = json.loads(
+        await сервис.raw_get(SessionScope(), base="ut", path=сущность, query={"$filter": отбор})
+    )
+    assert ответ["error"]["code"] == "filter_syntax", ответ
+    assert not маршрут.called
+
+
+@pytest.mark.parametrize("поле", ["Представление", "Значение", "Город"])
+async def test_r37_raw_get_вне_индекса_отклоняет_оракул_путём(сервис, respx_ut, поле):
+    """Путь `raw_get` не разрешён по индексу: прежде `$orderby` проверял один последний сегмент
+    на сущности вне индекса, и `КонтактнаяИнформация/Значение` проходил (`Представление` строгий
+    классификатор закрывал случайно — классом `org` по имени)."""
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    for запрос in (
+        {"$filter": f"substringof('495', КонтактнаяИнформация/{поле})"},
+        {"$orderby": f"КонтактнаяИнформация/{поле}"},
+    ):
+        ответ = json.loads(
+            await сервис.raw_get(
+                SessionScope(), base="ut", path="Catalog_НовыйСправочник", query=запрос
+            )
+        )
+        assert ответ["error"]["code"] in ("filter_syntax", "params_invalid"), (запрос, ответ)
+    assert not маршрут.called
+
+
+async def test_r37_условие_виртуальной_таблицы_отклонено(сервис, respx_ut):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.query(
+            SessionScope(),
+            base="ut",
+            entity=ОБОРОТЫ_С_КОНТРАГЕНТОМ,
+            params={"Condition": "substringof('9', Контрагент/КонтактнаяИнформация/Представление)"},
+        )
+    )
+    assert ответ["error"]["code"] == "filter_syntax", ответ
+    assert not маршрут.called
+
+
+@pytest.mark.parametrize(
+    ("сущность", "сортировка"),
+    [
+        ("Catalog_Контрагенты", "КонтактнаяИнформация/Представление"),
+        (ДОКУМЕНТ_С_КОНТРАГЕНТОМ, "Контрагент/КонтактнаяИнформация/Представление desc"),
+    ],
+)
+async def test_r37_сортировка_по_пути_к_контактной_информации_отклонена(
+    сервис, respx_ut, сущность, сортировка
+):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.query(SessionScope(), base="ut", entity=сущность, orderby=сортировка, top=5)
+    )
+    assert ответ["error"]["code"] == "params_invalid"
+    ответ = json.loads(
+        await сервис.raw_get(
+            SessionScope(), base="ut", path=сущность, query={"$orderby": сортировка}
+        )
+    )
+    assert ответ["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+РЕЦЕПТ_КИ_ПУТЁМ = """
+version: 1
+recipes:
+  контрагенты_по_номеру:
+    title: Контрагенты по номеру телефона
+    entity: Catalog_Контрагенты
+    params:
+      номер: { type: string, required: true, description: номер телефона }
+    filter: substringof({номер}, КонтактнаяИнформация/Представление)
+    select: [Ref_Key]
+"""
+
+
+async def test_r37_рецепт_отклоняет_оракул_путём(сервис, дом, respx_ut):
+    (дом / "bases" / "ut" / "recipes.yaml").write_text(РЕЦЕПТ_КИ_ПУТЁМ, encoding="utf-8")
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.recipe(
+            SessionScope(), base="ut", name="контрагенты_по_номеру", params={"номер": "495"}
+        )
+    )
+    assert ответ["error"]["code"] == "filter_syntax", ответ
+    assert not маршрут.called
+
+
+async def test_r37_токен_и_тип_через_путь_проходят(сервис, respx_ut):
+    """Обратная сторона: токен из ответа раскрывается и через путь, отбор по `Тип` через путь
+    уходит как есть."""
+    respx_ut.get(КИ).mock(return_value=httpx.Response(200, json={"value": [_строка_телефона_ки()]}))
+    маршрут = respx_ut.get("Catalog_Контрагенты").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    токен = json.loads(await сервис.query(SessionScope(), base="ut", entity=КИ, top=5))["items"][0][
+        "Представление"
+    ]
+    отбор = (
+        f"КонтактнаяИнформация/Тип eq 'Телефон' and КонтактнаяИнформация/Представление eq '{токен}'"
+    )
+    ответ = json.loads(
+        await сервис.query(
+            SessionScope(), base="ut", entity="Catalog_Контрагенты", filter=отбор, top=5
+        )
+    )
+    assert "error" not in ответ, ответ
+    assert маршрут.calls.last.request.url.params["$filter"] == (
+        "КонтактнаяИнформация/Тип eq 'Телефон' and "
+        f"КонтактнаяИнформация/Представление eq '{НОМЕР_КИ}'"
+    )
+
+
+async def test_r37_ручной_keep_действует_через_навигацию(сервис, дом, respx_ut):
+    """Ручное `keep` владельца на поле табличной части доходит и до пути через навигацию
+    документа: путь разрешается по навигациям индекса (`ToolService._строение`), а не только
+    по суффиксу имени — иначе `keep` на настоящей сущности `Catalog_Контрагенты_…` не нашёлся бы."""
+    путь = дом / "bases" / "ut" / "policy.yaml"
+    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    политика["fields"] = {f"{КИ}.Представление": "keep"}
+    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+    маршрут = respx_ut.get(ДОКУМЕНТ_С_КОНТРАГЕНТОМ).mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    отбор = "substringof('Рязань', Контрагент/КонтактнаяИнформация/Представление)"
+    ответ = json.loads(
+        await сервис.query(
+            SessionScope(), base="ut", entity=ДОКУМЕНТ_С_КОНТРАГЕНТОМ, filter=отбор, top=5
+        )
+    )
+    assert "error" not in ответ, ответ
+    assert маршрут.calls.last.request.url.params["$filter"] == отбор

@@ -107,14 +107,27 @@ class Unmasker:
     вердикт, каким бы тулом ни пришло.
 
     `field_class` — эффективный класс поля по политике базы; вызывается с ключевым `strict`
-    (Ruling 18: путь, не разрешённый по индексу, толкуется строго, см. `masking`)."""
+    (Ruling 18: путь, не разрешённый по индексу, толкуется строго, см. `masking`).
+
+    `path_class` — класс ПУТИ целиком (`Контрагент/КонтактнаяИнформация/Представление`), когда
+    его определяет не последний сегмент, а сущность, в которую путь приходит (Ruling 37,
+    `masking.inbound_path_class`). Отвечает `None`, если путь такому правилу не подлежит, — и
+    тогда класс ищется прежним порядком по последнему сегменту (`_класс_поля`). Гейт передаёт его
+    всегда (`BaseGate._обратная_подмена`); без него оракул через путь к табличной части
+    контактной информации открыт."""
 
     def __init__(
-        self, dictionary: Dictionary, *, base: str, field_class: Callable[..., str | None]
+        self,
+        dictionary: Dictionary,
+        *,
+        base: str,
+        field_class: Callable[..., str | None],
+        path_class: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._dictionary = dictionary
         self._base = base
         self._field_class = field_class
+        self._path_class = path_class
 
     def filter(
         self,
@@ -812,6 +825,14 @@ class Unmasker:
         сегменты = field.split("/") if field else []
         if not сегменты:
             return None
+        # Ruling 37: путь, пришедший в табличную часть контактной информации, получает класс по
+        # сущности, в которую пришёл, а не по последнему сегменту на корне — у корня поля
+        # `Представление` нет, и прежний поиск ниже его не находил (оракул C-1 ревью 8). `None` —
+        # путь правилу не подлежит, дальше прежний порядок без изменений.
+        if len(сегменты) > 1 and self._path_class is not None:
+            класс = self._path_class(entity, field)
+            if класс is not None:
+                return класс
         сегмент = сегменты[-1]
         класс = self._field_class(entity, сегмент, strict=strict)
         # Раунд 2 ревью (I2): запасной классификатор получает тип "Edm.String" вслепую и видит

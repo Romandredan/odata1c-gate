@@ -16,7 +16,13 @@ from odata1c.config.models import BaseConfig
 from odata1c.gate.contact_info import Shape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
-from odata1c.gate.masking import Masker, MaskResult, Resolve, inbound_field_class
+from odata1c.gate.masking import (
+    Masker,
+    MaskResult,
+    Resolve,
+    inbound_field_class,
+    inbound_path_class,
+)
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.unmasking import Unmasker
@@ -83,6 +89,7 @@ class BaseGate:
             field_class=lambda entity, field, *, strict=False: inbound_field_class(
                 policy, entity, field, mode=mode, shape=shape, strict=strict
             ),
+            path_class=lambda entity, path: inbound_path_class(policy, entity, path, shape=shape),
         )
 
     def is_hidden(self, entity: str) -> bool:
@@ -118,6 +125,13 @@ class BaseGate:
         return inbound_field_class(
             self._policy, entity, field, mode=self.mode, shape=shape, strict=strict
         )
+
+    def path_class(self, entity: str, path: str, *, shape: Shape) -> str | None:
+        """Класс пути по сущности, в которую путь приходит (Ruling 37,
+        `masking.inbound_path_class`): `contact` для поля значения табличной части контактной
+        информации, `keep` по ручному правилу владельца, `None` — путь правилу не подлежит.
+        Нужен слою тулов для `$orderby`: сортировка по такому пути — тот же оракул порядка."""
+        return inbound_path_class(self._policy, entity, path, shape=shape)
 
     def is_protected(self, entity: str, field: str, *, shape: Shape, strict: bool = False) -> bool:
         """Класс поля — что-то, кроме «не защищён» (`None`), «оставить как есть» (`keep`) или
