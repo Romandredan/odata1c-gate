@@ -18,7 +18,15 @@ from odata1c.gate.dictionary import Dictionary, normalize_text_with_map
 from odata1c.gate.field_rules import classify_field, is_naming_field
 from odata1c.gate.policy import Policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
-from odata1c.gate.tokens import CLASSES, GUID_RE, blank_tokens, parse_token
+from odata1c.gate.tokens import (
+    CLASSES,
+    GUID_RE,
+    TOKEN_RE,
+    КЛАСС_СТРОКИ_С_ТОКЕНОМ,
+    blank_tokens,
+    find_tokens,
+    parse_token,
+)
 
 # Вырезается из ответа всегда (SPEC §5.1).
 СЛУЖЕБНЫЕ_ПОЛЯ = ("odata.metadata", "odata.type", "DataVersion")
@@ -403,7 +411,18 @@ class Masker:
             класс=None,
             замаскированные=УчётПолей(),
             force_scan=True,
+            из_ответа=False,
         )
+
+    @staticmethod
+    def _вставки(
+        переписано: ScrubbedText | None, revealed: RevealedValues | None
+    ) -> tuple[tuple[int, int], ...]:
+        """Места токенов, которые поставил ранний проход в эту строку (Б-2). Обычная строка —
+        мест нет: ранний проход её не трогал, и все токены в ней пришли из 1С."""
+        if переписано is None or revealed is None:
+            return ()
+        return revealed.inserted_of(переписано)
 
     def _обойти(
         self,
@@ -808,8 +827,12 @@ class Masker:
         revealed: RevealedValues | None = None,
         извлечь: Callable[[str], str] | None = None,
         значение_поля: bool = True,
+        из_ответа: bool = True,
     ) -> str:
-        """`извлечь` — как получить из значения поля основу токена (`Dictionary.token_for`,
+        """`из_ответа=False` — строка не данные ответа 1С, а текст ошибки или подсказки
+        (`mask_text`): токены в ней пишет сам шлюз, и в `lit` они не превращаются (Б-2).
+
+        `извлечь` — как получить из значения поля основу токена (`Dictionary.token_for`,
         аргумент `source`), если поле замаскировано целиком по классу и основа — не всё
         содержимое: у значения контактной информации это его представление
         (`contact_info.representation`, Ruling 33).
@@ -833,9 +856,18 @@ class Masker:
         # Знаменатель `masked_fields` (см. `УчётПолей`): значение, которое маскировщик взвешивает.
         if значение_поля:
             замаскированные.увидено(field)
+        # Б-2: токен шлюза в строке ДАННЫХ 1С — не токен, а текст, и выдаётся токеном `lit`, в
+        # том числе в поле, открытом владельцем (`keep` открывает значение, а не право выдать
+        # строку из 1С за токен шлюза). Имена полей и тексты ошибок (`из_ответа=False`) не
+        # трогаются: в сообщениях токены пишет сам шлюз.
+        строка_данных = из_ответа and значение_поля
         if класс == "keep":
             if переписано is not None:
                 замаскированные.append(field, целиком=bool(parse_token(текст)))
+            if строка_данных:
+                return self._заменить_строки_с_токенами(
+                    текст, entity=entity, field=field, вставки=self._вставки(переписано, revealed)
+                )
             return текст
         if класс and класс not in ("scan",) and (класс in CLASSES or класс.startswith("custom:")):
             return self._заменить_по_классу(
@@ -849,7 +881,15 @@ class Masker:
                 извлечь=извлечь,
             )
 
-        обработанное = self._заменить_известные_названия(текст, entity=entity, field=field)
+        обработанное = текст
+        if строка_данных:
+            обработанное = self._заменить_строки_с_токенами(
+                обработанное,
+                entity=entity,
+                field=field,
+                вставки=self._вставки(переписано, revealed),
+            )
+        обработанное = self._заменить_известные_названия(обработанное, entity=entity, field=field)
         обработанное = self._заменить_найденные_реквизиты(
             обработанное, entity=entity, field=field, force=force_scan or strict
         )
@@ -902,11 +942,16 @@ class Masker:
            одни пробелы), поле остаётся тем, что сделал ранний проход, и его замены остаются
            засчитанными стражу.
 
-        2. Строка целиком — токен, выданный словарём, но не этим вызовом: уже замаскированное
-           значение не маскируется повторно, иначе от него остались бы цифры хвоста. «Выданный
-           словарём» (`Dictionary.knows`), а не «похожий на токен»: строка 1С вида
-           `[[inn:7707083893]]` — это значение поля, и в хвосте у неё могут стоять настоящие
-           цифры; такая строка маскируется как обычное значение.
+        2. Строка — обычная (ранний проход её не трогал), и в ней стоит токен шлюза: это данные
+           1С — вписанная человеком или подложенная строка `[[inn:…]]` (Б-2, находка M-1 ревью 6).
+           Прежде целый токен, выданный словарём, пропускался как «уже замаскированный», и модель
+           видела у записи R токен значения S — два значения под одним токеном. Уже
+           замаскированное шлюзом значение приходит сюда только строкой раннего прохода (случай
+           1), поэтому обычная строка с токеном — всегда данные: она получает токен класса `lit`
+           (`tokens.КЛАСС_СТРОКИ_С_ТОКЕНОМ`) по дословному содержимому. То же — исходное значение
+           места в случае 1, если в нём самом стоит токен. Токен настоящего значения такая
+           строка не получает никогда: ИНН рядом с вписанным токеном (`7707083893 [[inn:…]]`)
+           нормализация класса свела бы к цифрам — это была находка M-3.
 
         `masked_fields` заполняется ПО ФАКТУ (Ruling 20, пункт 4): поле в списке — значит
         реального значения в ответе нет. В обоих случаях выше его нет, и поле числится
@@ -919,33 +964,67 @@ class Masker:
             исходное = revealed.original_of(переписано) if revealed is not None else None
             if исходное is None:
                 return текст
-            замена = self._dictionary.token_for(
-                класс,
-                исходное,
-                base=self._base,
-                entity=entity,
-                field=field,
-                source=извлечь(исходное) if извлечь is not None else None,
-            )
+            замена = self._токен_поля(класс, исходное, entity=entity, field=field, извлечь=извлечь)
             if замена == исходное:
                 return текст
             if revealed is not None:
                 revealed.absorb(переписано.hits)
             return замена
-        if parse_token(текст) and self._dictionary.knows(текст):
-            замаскированные.append(field)
-            return текст
-        замена = self._dictionary.token_for(
-            класс,
-            текст,
-            base=self._base,
-            entity=entity,
-            field=field,
-            source=извлечь(текст) if извлечь is not None else None,
-        )
+        замена = self._токен_поля(класс, текст, entity=entity, field=field, извлечь=извлечь)
         if замена != текст:
             замаскированные.append(field)
         return замена
+
+    def _токен_поля(
+        self,
+        класс: str,
+        значение: str,
+        *,
+        entity: str,
+        field: str,
+        извлечь: Callable[[str], str] | None,
+    ) -> str:
+        """Токен значения поля с классом; строка с токеном шлюза внутри — токен `lit` (Б-2)."""
+        if TOKEN_RE.search(значение):
+            return self._dictionary.token_for(
+                КЛАСС_СТРОКИ_С_ТОКЕНОМ, значение, base=self._base, entity=entity, field=field
+            )
+        return self._dictionary.token_for(
+            класс,
+            значение,
+            base=self._base,
+            entity=entity,
+            field=field,
+            source=извлечь(значение) if извлечь is not None else None,
+        )
+
+    def _заменить_строки_с_токенами(
+        self, текст: str, *, entity: str, field: str, вставки: tuple[tuple[int, int], ...]
+    ) -> str:
+        """Токены шлюза внутри строки данных 1С — токенами `lit` (Б-2). Кроме тех, что поставил
+        сам ранний проход этого вызова: они стоят в `вставки` (`RevealedValues.inserted_of`), и
+        отличить их от вписанного в 1С того же токена можно только по месту — текст одинаков."""
+        найдено = find_tokens(текст)
+        if not найдено:
+            return текст
+        куски: list[str] = []
+        позиция = 0
+        for начало, конец, _, _ in найдено:
+            if any(слева <= начало and конец <= справа for слева, справа in вставки):
+                continue
+            куски.append(текст[позиция:начало])
+            куски.append(
+                self._dictionary.token_for(
+                    КЛАСС_СТРОКИ_С_ТОКЕНОМ,
+                    текст[начало:конец],
+                    base=self._base,
+                    entity=entity,
+                    field=field,
+                )
+            )
+            позиция = конец
+        куски.append(текст[позиция:])
+        return "".join(куски)
 
     def _заменить_найденные_реквизиты(
         self, текст: str, *, entity: str, field: str, force: bool = False

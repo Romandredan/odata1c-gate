@@ -111,8 +111,10 @@ class ScrubbedText(str):
 
 
 # Смещение открывающей кавычки строкового литерала в тексте ПОСЛЕ раннего прохода → (что стояло в
-# литерале до замены, сколько замен засчитано стражу). Заполняет `Guard.scrub_revealed_json`.
-МестаЗамен = dict[int, tuple[str, int]]
+# литерале до замены, сколько замен засчитано стражу, места вставленных токенов в значении
+# литерала после замены). Заполняет `Guard.scrub_revealed_json`.
+Вставки = tuple[tuple[int, int], ...]
+МестаЗамен = dict[int, tuple[str, int, Вставки]]
 
 
 class _РазборПоМестам(json.JSONDecoder):
@@ -131,8 +133,9 @@ class _РазборПоМестам(json.JSONDecoder):
             место = места.get(конец - 1)
             if место is None:
                 return значение, после
-            исходное, засчитано = место
-            return набор.scrubbed(значение, original=исходное, hits=засчитано), после
+            исходное, засчитано, вставки = место
+            строка = набор.scrubbed(значение, original=исходное, hits=засчитано, inserted=вставки)
+            return строка, после
 
         self.parse_string = разобрать_строку
         self.scan_once = json.scanner.py_make_scanner(self)
@@ -161,21 +164,36 @@ class RevealedValues:
         self._по_написанию: dict[str, str] = {}
         self._по_границам: set[str] = set()
         self._замен = 0
-        self._исходные: dict[object, str] = {}
+        self._исходные: dict[object, tuple[str, Вставки]] = {}
 
-    def scrubbed(self, text: str, *, original: str, hits: int) -> ScrubbedText:
+    def scrubbed(
+        self, text: str, *, original: str, hits: int, inserted: Вставки = ()
+    ) -> ScrubbedText:
         """Строка, переписанная ранним проходом: у неё — метка места и число засчитанных стражу
-        замен, исходное значение остаётся здесь (см. `ScrubbedText`)."""
+        замен, исходное значение и места вставленных токенов остаются здесь (см. `ScrubbedText`,
+        `inserted_of`)."""
         строка = ScrubbedText(text)
         метка = object()
         строка._метка = метка
         строка.hits = hits
-        self._исходные[метка] = original
+        self._исходные[метка] = (original, tuple(inserted))
         return строка
 
     def original_of(self, text: ScrubbedText) -> str | None:
         """Что стояло на месте этой строки до раннего прохода. `None` — строка переписана не в
         этом вызове (или вовсе не ранним проходом): чужое исходное подставлять нельзя."""
+        запись = self._запись(text)
+        return None if запись is None else запись[0]
+
+    def inserted_of(self, text: ScrubbedText) -> Вставки:
+        """Где в строке стоят токены, которые поставил ранний проход (Б-2): `(начало, конец)` в
+        координатах самой строки. Токен вне этих мест пришёл из 1С как текст — маскировщик выдаёт
+        его токеном `lit`. Строка чужого вызова — мест нет: все токены в ней считаются текстом,
+        отказ в сторону «не выдать строку из 1С за токен шлюза»."""
+        запись = self._запись(text)
+        return () if запись is None else запись[1]
+
+    def _запись(self, text) -> tuple[str, Вставки] | None:
         метка = getattr(text, "_метка", None)
         return None if метка is None else self._исходные.get(метка)
 
