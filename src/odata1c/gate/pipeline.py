@@ -13,6 +13,7 @@ import pathlib
 from collections.abc import Callable
 
 from odata1c.config.models import BaseConfig
+from odata1c.gate.contact_info import Shape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import Masker, MaskResult, Resolve, effective_field_class
@@ -163,6 +164,7 @@ class BaseGate:
         resolve: Resolve,
         hidden: Callable[[str], bool],
         revealed: RevealedValues | None,
+        shape: Shape,
         strict: bool = False,
     ) -> MaskResult:
         """`resolve` — резолвер «сущность и ключ ответа → сущность вложенного объекта» (итоговое
@@ -183,9 +185,20 @@ class BaseGate:
         сыром теле токенами, и без набора маскировщик выдаёт полю с классом токен по чужому
         токену — одна запись с отбором и без него приходит разными токенами. Аргумент обязателен
         по той же причине, что `resolve` и `hidden`: пропуск не падает, а тихо ломает инвариант 5.
-        `None` — только у вызова, который заведомо ничего не раскрывал."""
+        `None` — только у вызова, который заведомо ничего не раскрывал.
+
+        `shape` — строение сущностей по индексу (`contact_info.EntityShape`, Ruling 33): по нему
+        узнаётся строка контактной информации, в которой нет поля `Тип` (модель выбрала одно
+        `Представление`). Обязателен по той же причине, что `resolve`: без него такая строка
+        тихо уходит по пути свободного текста, где адрес не ловит ни один детектор."""
         return self._masker.mask(
-            data, entity=entity, resolve=resolve, hidden=hidden, strict=strict, revealed=revealed
+            data,
+            entity=entity,
+            resolve=resolve,
+            hidden=hidden,
+            strict=strict,
+            revealed=revealed,
+            shape=shape,
         )
 
     def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:

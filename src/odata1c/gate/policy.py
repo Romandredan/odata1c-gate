@@ -55,13 +55,35 @@ class Policy:
             return None
         return self._применить_умолчания(значение, entity)
 
+    def manual_sensitivity_of(self, entity: str, field: str) -> str | None:
+        """Класс поля из РУЧНЫХ разделов политики — `fields` и `custom`, с умолчаниями; раздел
+        `auto` не смотрится. Нужен правилам, которые решают класс поля сами, по строению ответа
+        (контактная информация, Ruling 33): такое правило главнее автоматики реиндекса, но не
+        главнее того, что владелец написал рукой (итоговое ревью M1d, C1: объявленный владельцем
+        `keep` не отменяется автоматическим правилом)."""
+        ключ = f"{entity}.{field}"
+        значение = self._fields.get(ключ)
+        if значение is None:
+            значение = self.custom_fields().get(field)
+        if значение is None:
+            return None
+        return self._применить_умолчания(значение, entity)
+
+    def addr_masked(self, entity: str) -> bool:
+        """Закрыт ли адрес в этой сущности по правилу `defaults.addr` (SPEC §6.9): без правила —
+        закрыт, с правилом — только у сущностей из `mask_for`. Единственное место, где правило
+        читается: им пользуются и класс поля (`_применить_умолчания`), и правило контактной
+        информации (строка с `Тип` = «Адрес», Ruling 33)."""
+        правило_адреса = self._defaults.get("addr")
+        if not isinstance(правило_адреса, dict):
+            return True
+        return entity in (правило_адреса.get("mask_for") or [])
+
     def _применить_умолчания(self, значение: str, entity: str) -> str:
         if значение in ОТКРЫТЫЕ_ПО_УМОЛЧАНИЮ and self._defaults.get(значение) == "keep":
             return "keep"
-        правило_адреса = self._defaults.get("addr")
-        if значение == "addr" and isinstance(правило_адреса, dict):
-            разрешено = правило_адреса.get("mask_for") or []
-            return "addr" if entity in разрешено else "keep"
+        if значение == "addr":
+            return "addr" if self.addr_masked(entity) else "keep"
         return значение
 
     def is_hidden(self, entity: str) -> bool:

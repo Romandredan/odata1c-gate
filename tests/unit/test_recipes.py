@@ -13,7 +13,13 @@ import urllib.parse
 import httpx
 import pytest
 import respx
-from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_навигаций, ничего_не_скрыто, эхо_отбора
+from conftest import (
+    ЗНАЧЕНИЯ_КЛАССОВ,
+    без_навигаций,
+    ничего_не_скрыто,
+    строение_неизвестно,
+    эхо_отбора,
+)
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -501,6 +507,7 @@ async def токен_инн(служба: ToolService, инн: str) -> str:
         resolve=без_навигаций,
         hidden=ничего_не_скрыто,
         revealed=None,
+        shape=строение_неизвестно,
     )
     return результат.data["ИНН"]
 

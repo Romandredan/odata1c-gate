@@ -12,7 +12,13 @@ import httpx
 import pytest
 import respx
 import yaml
-from conftest import ЗНАЧЕНИЯ_КЛАССОВ, без_навигаций, ничего_не_скрыто, эхо_отбора
+from conftest import (
+    ЗНАЧЕНИЯ_КЛАССОВ,
+    без_навигаций,
+    ничего_не_скрыто,
+    строение_неизвестно,
+    эхо_отбора,
+)
 
 from odata1c.cli import main
 from odata1c.gate.service import policy_path, refresh_policy
@@ -100,6 +106,7 @@ async def токен_инн(сервис: ToolService, инн: str, *, entity: s
         resolve=без_навигаций,
         hidden=ничего_не_скрыто,
         revealed=None,
+        shape=строение_неизвестно,
     )
     return результат.data["ИНН"]
 
@@ -694,6 +701,7 @@ def _токен_лица(сервис: ToolService, фио: str) -> str:
             resolve=без_навигаций,
             hidden=ничего_не_скрыто,
             revealed=None,
+            shape=строение_неизвестно,
         )
         .data["Description"]
     )
@@ -904,6 +912,7 @@ async def test_get_не_выносит_раскрытое_в_эхе_ключа(�
         resolve=без_навигаций,
         hidden=ничего_не_скрыто,
         revealed=None,
+        shape=строение_неизвестно,
     )
     токен = маска.data[поле]
     assert токен.startswith("[["), "значение не замаскировано — сторож ничего не докажет"
@@ -1602,6 +1611,7 @@ async def токен_названия(сервис: ToolService, названи�
         resolve=без_навигаций,
         hidden=ничего_не_скрыто,
         revealed=None,
+        shape=строение_неизвестно,
     )
     return результат.data["Description"]
 
@@ -4024,3 +4034,104 @@ async def test_bases_объявляет_умолчание_сессии(серв
 
     assert своё["default"] == "dev"
     assert общее["default"] == "ut"
+
+
+# ---------------------------------------------------------------------------------------------
+# Ruling 33: контактная информация — класс по типу строки, а не по форме значения (находка
+# владельца на живой базе: 13 телефонов из 87 открыты в JSON поля `Значение`)
+# ---------------------------------------------------------------------------------------------
+
+КИ = "Catalog_Контрагенты_КонтактнаяИнформация"
+НОМЕР_КИ = "+7 (4912) 12-34-56"
+
+
+def _строка_телефона_ки(**поля) -> dict:
+    return {
+        "Ref_Key": ССЫЛКА,
+        "LineNumber": "1",
+        "Тип": "Телефон",
+        "Представление": НОМЕР_КИ,
+        "Значение": json.dumps(
+            {
+                "version": 4,
+                "value": НОМЕР_КИ,
+                "type": "Телефон",
+                "countryCode": "7",
+                "areaCode": "4912",
+                "number": "12-34-56",
+                "extNumber": "12",
+            },
+            ensure_ascii=False,
+        ),
+        "НомерТелефона": "74912123456",
+        "ДействуетС": "2020-01-01T00:00:00",
+        **поля,
+    }
+
+
+def _цифры_вне_токенов(элемент: dict) -> list[str]:
+    """Поля значения строки (всё, кроме ключа, номера строки, типа и даты действия), в которых
+    модель увидит цифры после вырезания токенов."""
+    from odata1c.gate.tokens import TOKEN_RE
+
+    return [
+        поле
+        for поле, значение in элемент.items()
+        if поле not in ("Ref_Key", "LineNumber", "Тип", "ДействуетС")
+        and isinstance(значение, str)
+        and any(символ.isdigit() for символ in TOKEN_RE.sub("", значение))
+    ]
+
+
+async def test_ки_json_телефона_целиком_токеном_через_query(сервис, respx_ut):
+    """Сквозной путь `query`: JSON со всеми ключами номера (`value`, `countryCode`, `areaCode`,
+    `number`, `extNumber`) — ни одной цифры номера в ответе, кроме токена. Сторож именно на
+    сквозном пути: правило живёт в маскировщике, строение даёт индекс через `ToolService`."""
+    respx_ut.get(КИ).mock(return_value=httpx.Response(200, json={"value": [_строка_телефона_ки()]}))
+    текст = await сервис.query(SessionScope(), base="ut", entity=КИ, top=5)
+    элемент = json.loads(текст)["items"][0]
+
+    assert not _цифры_вне_токенов(элемент), _цифры_вне_токенов(элемент)
+    assert "4912" not in текст and "12-34-56" not in текст
+    assert элемент["Значение"] == элемент["Представление"] == элемент["НомерТелефона"]
+    assert элемент["LineNumber"] == "1" and элемент["ДействуетС"] == "2020-01-01T00:00:00"
+
+
+async def test_ки_без_тип_в_select_узнаётся_по_индексу(сервис, respx_ut):
+    """Живая база: `select=Представление` — строка без `Тип`, 1С отдаёт её. Табличную часть
+    узнаёт строение из индекса (`ToolService._строение`), а не ключи строки."""
+    respx_ut.get(КИ).mock(
+        return_value=httpx.Response(200, json={"value": [{"Представление": НОМЕР_КИ}]})
+    )
+    текст = await сервис.query(
+        SessionScope(), base="ut", entity=КИ, select=["Представление"], top=5
+    )
+    данные = json.loads(текст)
+
+    assert "4912" not in текст
+    assert данные["items"][0]["Представление"].startswith("[[phone:")
+    assert данные["masked_fields"] == ["Представление"]
+    assert any(п.startswith("contact_info_strict") for п in данные["warnings"])
+
+
+async def test_ки_внутри_карточки_через_get(сервис, respx_ut):
+    """Табличная часть приходит в карточке владельца без `$expand` (проба P4): её строки
+    маскируются по строению своей сущности, найденной резолвером навигаций."""
+    respx_ut.get(url__regex=r".*").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "Ref_Key": ССЫЛКА,
+                "ИНН": ИНН,
+                "ЮрФизЛицо": "ЮрЛицо",
+                "КонтактнаяИнформация": [_строка_телефона_ки()],
+            },
+        )
+    )
+    текст = await сервис.get(
+        SessionScope(), base="ut", entity="Catalog_Контрагенты", key=f"guid'{ССЫЛКА}'"
+    )
+    строка = json.loads(текст)["item"]["КонтактнаяИнформация"][0]
+
+    assert not _цифры_вне_токенов(строка), _цифры_вне_токенов(строка)
+    assert "4912" not in текст and ИНН not in текст

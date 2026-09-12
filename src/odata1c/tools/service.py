@@ -30,6 +30,7 @@ from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
 from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
+from odata1c.gate.contact_info import EntityShape, Shape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import (
@@ -766,6 +767,31 @@ class ToolService:
 
         return резолвер
 
+    def _строение(self, repo: IndexRepository) -> Shape:
+        """Строение сущностей для маскировки (Ruling 33): имена полей и родитель по индексу. По
+        нему гейт узнаёт табличную часть контактной информации, даже когда в ответе нет поля
+        `Тип` — модель выбрала только `Представление`, а 1С такие строки отдаёт.
+
+        Строение — факт индекса, как цель навигации у `_навигации`: какие поля образуют
+        контактную информацию, решает гейт (`gate/contact_info.py`), а слой тулов лишь отвечает,
+        какие поля у сущности есть. Кэш на вызов — по той же причине, что у `_навигации`."""
+        кэш: dict[str, EntityShape | None] = {}
+
+        def строение(имя: str) -> EntityShape | None:
+            if имя not in кэш:
+                описание = repo.describe(имя)
+                кэш[имя] = (
+                    None
+                    if описание is None
+                    else EntityShape(
+                        fields=frozenset(поле["name"] for поле in описание.fields),
+                        parent=описание.parent_entity,
+                    )
+                )
+            return кэш[имя]
+
+        return строение
+
     def _обрезать_expand(
         self,
         repo: IndexRepository,
@@ -1153,6 +1179,7 @@ class ToolService:
             записи,
             entity=описание.name,
             resolve=self._навигации(репозиторий),
+            shape=self._строение(репозиторий),
             hidden=self._скрытые(репозиторий, гейт).__contains__,
             revealed=раскрытое,
         )
@@ -1223,6 +1250,7 @@ class ToolService:
                 записи,
                 entity=описание.name,
                 resolve=self._навигации(репозиторий),
+                shape=self._строение(репозиторий),
                 hidden=self._скрытые(репозиторий, гейт).__contains__,
                 revealed=раскрытое,
             )
@@ -1783,6 +1811,7 @@ class ToolService:
                 записи,
                 entity=цель.entity,
                 resolve=self._навигации(репозиторий),
+                shape=self._строение(репозиторий),
                 hidden=self._скрытые(репозиторий, гейт).__contains__,
                 revealed=раскрытое,
                 strict=not цель.resolved,

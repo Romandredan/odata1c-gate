@@ -458,7 +458,16 @@ class Dictionary:
     def revision(self) -> int:
         return self._revision
 
-    def token_for(self, type_: str, raw_value: str, *, base: str, entity: str, field: str) -> str:
+    def token_for(
+        self,
+        type_: str,
+        raw_value: str,
+        *,
+        base: str,
+        entity: str,
+        field: str,
+        source: str | None = None,
+    ) -> str:
         """Токен значения поля объявленного класса (SPEC §6.3).
 
         Ruling 20, пункт 4 (C3 ревью 2026-09-11): пустое нормализованное значение — НЕ повод
@@ -476,8 +485,18 @@ class Dictionary:
         строка, — когда в ней нет ничего, кроме пробелов: защищать там нечего, и токен на пустоту
         только засорил бы словарь. Вызывающий (`masking._обработать_строку`) обязан считать поле
         замаскированным ПО ФАКТУ замены, а не до неё.
+
+        `source` — строка, по которой строится нормализованное значение (и значит, токен), если
+        она не совпадает с содержимым поля (Ruling 33): поле `Значение` контактной информации —
+        JSON, а токен ему положен тот же, что `Представление` той же строки, поэтому основой
+        служит представление значения из JSON (`contact_info.representation`). Написание при
+        этом запоминается ИСХОДНОЕ (`raw_value`): обратная подмена токена в этом поле обязана
+        вернуть то, что в поле лежит, — JSON целиком, а не текст из него.
         """
-        нормализованное = normalize_value(type_, raw_value)
+        основа = source if source is not None and source.strip() else raw_value
+        нормализованное = normalize_value(type_, основа)
+        if not нормализованное:
+            нормализованное = " ".join(основа.split())
         if not нормализованное:
             нормализованное = " ".join(raw_value.split())
         if not нормализованное:
