@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import unicodedata
 
+from odata1c.gate import contact_info
 from odata1c.gate.field_rules import ПЕРЕЧИСЛЕНИЯ_ТИПА_ЛИЦА
 from odata1c.gate.tokens import (
     TOKEN_RE,
@@ -620,7 +621,12 @@ class Dictionary:
 
         Строка с токеном шлюза внутри узнаётся только дословно: цифры вписанного токена не делают
         её написанием ИНН (свёртка цифрового класса оставила бы цифры хвоста — та же ошибка, что
-        у признака мусорного токена, Б-5)."""
+        у признака мусорного токена, Б-5).
+
+        Структура контактной информации (JSON или XML БСП) сравнивается по представлению — той же
+        основе, по которой `token_for(source=…)` строит её токен (Ruling 33 и Ruling 38, пункт 3):
+        JSON адреса в поле заказа — написание значения, даже если словарь видел этот адрес только
+        текстом или JSON другой записи с другим `comment`."""
         строка = self._connection.execute(
             "SELECT type, normalized FROM tokens WHERE token = ?", (token,)
         ).fetchone()
@@ -628,9 +634,10 @@ class Dictionary:
             return False
         if text in self.spellings(token):
             return True
-        if TOKEN_RE.search(text) and not TOKEN_RE.search(строка["normalized"]):
+        основа = contact_info.representation(text) if contact_info.is_contact_value(text) else text
+        if TOKEN_RE.search(основа) and not TOKEN_RE.search(строка["normalized"]):
             return False
-        нормализованное = normalize_value(строка["type"], text) or " ".join(text.split())
+        нормализованное = normalize_value(строка["type"], основа) or " ".join(основа.split())
         return нормализованное == строка["normalized"]
 
     def issued_for(self, token: str, *, base: str, field: str, entity: str | None = None) -> bool:
