@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS tokens (
     UNIQUE (type, normalized)
 );
 
+-- Сущность в ключе (Р3-1, раунд 4 блокеров M2): одно написание одного значения в одноимённом поле
+-- двух сущностей — две строки. Прежде вторая сущность терялась на INSERT OR IGNORE, и признак
+-- структурного поля по сущности (`structured_field`) её не видел. Словари прежних версий
+-- перестраиваются при открытии (`Dictionary._перестроить_ключ_написаний`).
 CREATE TABLE IF NOT EXISTS variants (
     token TEXT NOT NULL REFERENCES tokens(token) ON DELETE CASCADE,
     base TEXT NOT NULL,
@@ -45,7 +49,7 @@ CREATE TABLE IF NOT EXISTS variants (
     field TEXT NOT NULL,
     raw_value TEXT NOT NULL,
     seen_at TEXT NOT NULL,
-    PRIMARY KEY (token, base, field, raw_value)
+    PRIMARY KEY (token, base, entity, field, raw_value)
 );
 
 -- Ключ — пара (token, variant_norm), а не один variant_norm: короткий вариант вида "ромашка"
@@ -62,6 +66,7 @@ CREATE TABLE IF NOT EXISTS name_variants (
 );
 
 CREATE INDEX IF NOT EXISTS idx_variants_lookup ON variants(token, base, field);
+CREATE INDEX IF NOT EXISTS idx_variants_field ON variants(base, entity, field);
 """
 
 # Версия содержимого словаря (`PRAGMA user_version`; см. `Dictionary._пересчитать_названия`):
@@ -457,6 +462,7 @@ class Dictionary:
             self._connection.executescript(СХЕМА)
             # Внутри того же try: сбой пересчёта обязан закрыть соединение так же, как сбой
             # открытия (см. комментарий выше).
+            self._перестроить_ключ_написаний()
             self._пересчитать_названия()
         except sqlite3.DatabaseError as ошибка:
             self._connection.close()
@@ -465,6 +471,48 @@ class Dictionary:
         # Кэш `_мусорные_токены` на ревизию словаря (находки П2 и П1).
         self._мусор: set[str] = set()
         self._мусор_ревизия = -1
+
+    def _перестроить_ключ_написаний(self) -> None:
+        """Однократная перестройка таблицы `variants` словаря, заведённого до сущности в ключе
+        (Р3-1, раунд 4 блокеров M2). SQLite не меняет первичный ключ на месте — таблица
+        переписывается целиком в одной транзакции: новая таблица, копия строк, старая удаляется,
+        новая получает её имя, индексы строятся заново. Строки и их `seen_at` сохраняются как
+        есть; написания, которые прежний ключ потерял во второй сущности, лягут при следующей
+        встрече значения. Признак — сам ключ таблицы (`PRAGMA table_info`), а не версия: проверка
+        одна и та же при любом пути, которым словарь дошёл до этой версии."""
+        ключ = {
+            строка["name"]
+            for строка in self._connection.execute("PRAGMA table_info(variants)").fetchall()
+            if строка["pk"]
+        }
+        if "entity" in ключ:
+            return
+        try:
+            self._connection.executescript(
+                """
+                BEGIN;
+                CREATE TABLE variants_new (
+                    token TEXT NOT NULL REFERENCES tokens(token) ON DELETE CASCADE,
+                    base TEXT NOT NULL,
+                    entity TEXT NOT NULL,
+                    field TEXT NOT NULL,
+                    raw_value TEXT NOT NULL,
+                    seen_at TEXT NOT NULL,
+                    PRIMARY KEY (token, base, entity, field, raw_value)
+                );
+                INSERT INTO variants_new (token, base, entity, field, raw_value, seen_at)
+                    SELECT token, base, entity, field, raw_value, seen_at FROM variants;
+                DROP TABLE variants;
+                ALTER TABLE variants_new RENAME TO variants;
+                CREATE INDEX idx_variants_lookup ON variants(token, base, field);
+                CREATE INDEX idx_variants_field ON variants(base, entity, field);
+                COMMIT;
+                """
+            )
+        except sqlite3.DatabaseError:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise
 
     def _пересчитать_названия(self) -> None:
         """Однократный пересчёт названий словаря, записанного прежней версией: до свёртки кавычек
@@ -654,26 +702,32 @@ class Dictionary:
             return написания
         return [написание for написание in написания if not TOKEN_RE.search(написание)]
 
-    def structured_field(self, *, base: str, field: str) -> bool:
-        """Видел ли словарь в этой базе в поле с этим именем структуру (`contact_info.is_structure`)
-        ЛЮБОГО значения — признак 3 структурного поля (Ruling 43, `Unmasker._поле_структурное`).
-        Признак полевой, а не потокенный: адрес, который словарь видел только текстом, пишется в
-        то же поле, что и адрес, виденный структурой, — формат у поля один.
+    def structured_field(self, *, base: str, entity: str, field: str) -> bool:
+        """Видел ли словарь в этой базе, в этой сущности и в поле с этим именем структуру
+        (`contact_info.is_structure`) ЛЮБОГО значения — признак 3 структурного поля (Ruling 43,
+        `Unmasker._поле_структурное`). Признак полевой, а не потокенный: адрес, который словарь
+        видел только текстом, пишется в то же поле, что и адрес, виденный структурой, — формат у
+        поля один.
 
-        Ключ — база и имя поля, как у первой ступени лестницы написаний (`spellings`). Поле с тем
-        же именем в другой сущности той же базы тоже засчитывается: так поле скорее будет принято
-        за структурное лишний раз (отказ на записи), чем пропущено (текст в структуре). Кандидаты
-        отбираются в SQL по первому значащему символу (`{` или `<`), содержимое проверяется уже
-        здесь — у текстового поля с тысячами написаний разбирать нечего.
+        Ключ — база, сущность и имя поля (Р3-1 ревью раунда 3, раунд 4 блокеров M2). Прежде
+        сущности в ключе не было, и одноимённое поле другой сущности засчитывалось: структура,
+        прочитанная в `ЗаявкаНаВыпускКиЗГИСМ.АдресДоставки`, делала структурным текстовое
+        `ЗаказКлиента.АдресДоставки` по всей базе и навсегда — одно значение уходило в 1С JSON-ом
+        чужой строки, рабочий отбор и запись адреса в заказ отказывали. `entity` — сущность, в
+        которую приходит путь (у строки табличной части — сама табличная часть): так же её
+        записывает маскировщик (`variants.entity`). Кандидаты отбираются в SQL по первому
+        значащему символу (`{` или `<`), содержимое проверяется уже здесь — у текстового поля с
+        тысячами написаний разбирать нечего.
 
         Структурой засчитывается написание, которое структура и для своего токена
         (`structure_of`): JSON без `type` в поле с классом вне контактной информации маскировщик
         кладёт в токен целиком, и для этого токена он текст, а не структура."""
         for строка in self._connection.execute(
             "SELECT v.raw_value, t.type, t.normalized FROM variants v"
-            " JOIN tokens t ON t.token = v.token WHERE v.base = ? AND v.field = ?"
+            " JOIN tokens t ON t.token = v.token"
+            " WHERE v.base = ? AND v.entity = ? AND v.field = ?"
             " AND substr(ltrim(v.raw_value, ' ' || char(9, 10, 13)), 1, 1) IN ('{', '<')",
-            (base, field),
+            (base, entity, field),
         ):
             if _структура_для(строка["raw_value"], строка["type"], строка["normalized"]):
                 return True

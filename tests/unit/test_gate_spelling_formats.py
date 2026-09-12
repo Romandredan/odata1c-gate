@@ -517,8 +517,8 @@ def test_json_целиком_не_делает_поле_структурным(�
     _адрес_целиком(с)
     _телефон_без_типа(с)
 
-    assert not с.structured_field(base="ut", field="НастройкиАдреса")
-    assert с.structured_field(base="ut", field="Значение")
+    assert not с.structured_field(base="ut", entity=ЗАКАЗ, field="НастройкиАдреса")
+    assert с.structured_field(base="ut", entity=КИ, field="Значение")
 
 
 def test_поле_с_json_целиком_принимает_текст(связка):
@@ -541,4 +541,4 @@ def test_json_без_type_без_других_цифр_остаётся_стру
     тело = u.write({"ТелефонКонтакта": т}, entity=ЗАКАЗ, current=None, revealed=None)
 
     assert тело == {"ТелефонКонтакта": ТЕЛ_2}
-    assert с.structured_field(base="ut", field="Значение")
+    assert с.structured_field(base="ut", entity=КИ, field="Значение")

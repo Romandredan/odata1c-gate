@@ -8,7 +8,9 @@
 выполнено хотя бы одно:
 1. имя кончается на `…Значение` или `…ЗначенияПолей`;
 2. у сущности есть поле-брат `<Имя>Строкой` (ИС МП, СУЗ, ЗЕРНО: 24 поля в индексе УТ);
-3. в словаре для этой базы и этого имени поля есть структурное написание ЛЮБОГО токена;
+3. в словаре для этой базы, этой сущности (куда приходит путь) и этого имени поля есть
+   структурное написание ЛЮБОГО токена (сущность в ключе — Р3-1, раунд 4,
+   `test_gate_structure_entity.py`);
 4. в `current` поле содержит структуру.
 Поле, про которое ничего не известно, пишется текстом, как прежде (остаток — SPEC §6.8).
 
@@ -218,15 +220,15 @@ def test_структура_в_другой_базе_поле_не_делает_
 def test_словарь_знает_структурное_поле(связка):
     с, _ = связка
     с.token_for("addr", А2, base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="ОтправительАдрес")
-    assert not с.structured_field(base="ut", field="ОтправительАдрес")
+    assert not с.structured_field(base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="ОтправительАдрес")
 
     с.token_for(
         "addr", _структура(А1), base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="ОтправительАдрес", source=А1
     )
 
-    assert с.structured_field(base="ut", field="ОтправительАдрес")
-    assert not с.structured_field(base="bp", field="ОтправительАдрес")
-    assert not с.structured_field(base="ut", field="АдресДоставки")
+    assert с.structured_field(base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="ОтправительАдрес")
+    assert not с.structured_field(base="bp", entity=ПЕРЕМЕЩЕНИЕ, field="ОтправительАдрес")
+    assert not с.structured_field(base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="АдресДоставки")
 
 
 @pytest.mark.parametrize(
@@ -244,7 +246,7 @@ def test_словарь_узнаёт_структуру_поля_в_любой_�
     с, _ = связка
     с.token_for("addr", структура, base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="АдресПлощадки", source=А1)
 
-    assert с.structured_field(base="ut", field="АдресПлощадки")
+    assert с.structured_field(base="ut", entity=ПЕРЕМЕЩЕНИЕ, field="АдресПлощадки")
 
 
 def test_структурное_поле_с_тем_же_значением_в_current_пишет_current(связка):
