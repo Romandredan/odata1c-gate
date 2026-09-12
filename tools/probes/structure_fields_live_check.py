@@ -112,10 +112,11 @@ def записать(гейт, строение, entity: str, поле: str, т�
 async def проверить(дом: pathlib.Path) -> None:
     config = load_config(дом)
     сервис = ToolService(config)
+    индекс = IndexRepository(index_path(дом, БАЗА))
     try:
         база = config.bases[БАЗА]
         гейт = сервис._gate_for(база)
-        строение = сервис._строение(IndexRepository(index_path(дом, БАЗА)))
+        строение = сервис._строение(индекс)
         подмена = гейт._обратная_подмена(строение)
 
         кандидаты = поля_с_братом(index_path(дом, БАЗА))
@@ -171,6 +172,8 @@ async def проверить(дом: pathlib.Path) -> None:
             f"{записать(гейт, lambda _: None, ЭМИССИЯ, ПОЛЕ, токен)}"
         )
     finally:
+        # Открытый индекс на Windows не даёт удалить временный дом: rmtree молча оставлял копию.
+        индекс.close()
         await сервис.aclose()
 
 
