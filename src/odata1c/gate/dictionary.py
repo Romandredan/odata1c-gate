@@ -550,8 +550,26 @@ class Dictionary:
         текущий токен остаётся с прежним `normalized` и без вариантов (в подмене не участвует, но
         `variants` и сам токен не трогаются: раскрытие в старых чатах работает). Уцелевший токен
         получает варианты, пересчитанные от свёрнутого `normalized`. Для словаря, созданного этой
-        версией, пересчёт — пустой проход."""
+        версией, пересчёт — пустой проход.
+
+        Кроме версии — пересчёт по содержимому (Р4-2 ревью раунда 4): если прежняя версия шлюза
+        дописала название без букв уже ПОСЛЕ пересчёта (дом, где работали две версии кода), в
+        таблице лежит голое безбуквенное ядро, а ключей в кавычках и с формой у названия нет —
+        версия уже текущая, и без этой проверки они не появились бы никогда. Такие токены
+        (`_токены_с_устаревшими_ключами`) пересчитываются при каждом открытии, где они есть."""
         if self._connection.execute("PRAGMA user_version").fetchone()[0] >= ВЕРСИЯ_СХЕМЫ:
+            устаревшие = self._токены_с_устаревшими_ключами()
+            if устаревшие:
+                with self._connection:
+                    for токен, нормализованное in устаревшие:
+                        self._connection.execute(
+                            "DELETE FROM name_variants WHERE token = ?", (токен,)
+                        )
+                        self._connection.executemany(
+                            "INSERT OR IGNORE INTO name_variants (token, variant_norm)"
+                            " VALUES (?, ?)",
+                            [(токен, вариант) for вариант in name_variants_of(нормализованное)],
+                        )
             return
         with self._connection:
             строки = self._connection.execute(
@@ -578,6 +596,26 @@ class Dictionary:
                     [(токен, вариант) for вариант in name_variants_of(старое)],
                 )
             self._connection.execute(f"PRAGMA user_version = {ВЕРСИЯ_СХЕМЫ}")
+
+    def _токены_с_устаревшими_ключами(self) -> list[tuple[str, str]]:
+        """Токены названий, у которых в `name_variants` есть ключ, не годный для поиска
+        (`_годится_в_поиск`): голое безбуквенное ядро (так пишет версия до раунда 4) или ядро
+        короче минимума в кавычках (промежуточная версия раунда 4). Признак записи прежней версией
+        после пересчёта (Р4-2). Кандидаты отбираются в SQL — ключи без единой буквы кириллицы и
+        латиницы (дёшево на каждом открытии), точная проверка — здесь. Возвращает токен и его
+        `normalized`, от которого варианты строятся заново."""
+        кандидаты = self._connection.execute(
+            "SELECT DISTINCT nv.token, nv.variant_norm, t.normalized FROM name_variants nv"
+            " JOIN tokens t ON t.token = nv.token"
+            " WHERE nv.variant_norm NOT GLOB '*[a-zA-Zа-яА-ЯёЁ]*'"
+        ).fetchall()
+        return list(
+            dict.fromkeys(
+                (строка["token"], строка["normalized"])
+                for строка in кандидаты
+                if not _годится_в_поиск(строка["variant_norm"])
+            )
+        )
 
     def close(self) -> None:
         self._connection.close()
