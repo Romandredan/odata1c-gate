@@ -25,7 +25,8 @@ from odata1c.gate.masking import (
 )
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
-from odata1c.gate.unmasking import Unmasker
+from odata1c.gate.tokens import parse_token
+from odata1c.gate.unmasking import Unmasker, open_literal_refusal
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
 # по политике конкретной базы нет, поэтому страж проверяет по максимально строгому уровню —
@@ -234,6 +235,26 @@ class BaseGate:
         return self._обратная_подмена(shape).write(
             data, entity=entity, current=current, revealed=revealed, strict=strict
         )
+
+    def check_open_literal(
+        self, entity: str, field: str, value, *, shape: Shape, strict: bool = False
+    ) -> None:
+        """Отказывает `GateError`, если `value` — открытый литерал (не целый токен) для поля,
+        которое на входе принимает только токен (`unmasking.open_literal_refusal`: `dob`,
+        `contact`). Код и текст — те же, что у отбора на чтении.
+
+        Нужна пишущему тулу ДО обращения к 1С (Ruling 45, находка I-1 ревью задачи 5 M2):
+        `inbound_write` открытый литерал в тело пропускает — там пишется новое значение, — но
+        подготовка `update` сравнивает его с текущим и отвечает «изменений нет», то есть задаёт
+        тот же вопрос, что `ДатаРождения eq datetime'…'`, запрещённый на чтении. Класс — входной
+        (`field_class`), как у отбора. Не строка — не литерал: тип проверяет вызывающий."""
+        if self.mode == "off" or not isinstance(value, str) or parse_token(value) is not None:
+            return
+        отказ = open_literal_refusal(
+            self.field_class(entity, field, shape=shape, strict=strict), field, value
+        )
+        if отказ is not None:
+            raise отказ
 
     def mask(
         self,
