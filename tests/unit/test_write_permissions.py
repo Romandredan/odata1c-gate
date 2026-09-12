@@ -260,6 +260,67 @@ def test_порядок_скрытая_и_в_deny_entities_побеждает_en
     assert инфо.value.code == "entity_hidden"
 
 
+@pytest.mark.parametrize(
+    ("b", "e", "op", "fields", "action"),
+    [
+        pytest.param(база(write=False), сущность(), "update", (), None, id="шаг2-read_only"),
+        pytest.param(
+            база(permissions=Permissions(post_documents=False)),
+            сущность("Document_Заказ", "Document"),
+            "action",
+            (),
+            "Post",
+            id="шаг3-post_documents",
+        ),
+        pytest.param(
+            база(permissions=Permissions(mark_deletion=False)),
+            сущность(),
+            "mark_for_deletion",
+            (),
+            None,
+            id="шаг3-mark_deletion",
+        ),
+        pytest.param(
+            база(permissions=Permissions(register_direct_write=False)),
+            сущность("AccumulationRegister_Остатки", "AccumulationRegister", is_records=True),
+            "create",
+            (),
+            None,
+            id="шаг3-register_direct_write",
+        ),
+        pytest.param(
+            база(),
+            сущность(
+                "AccumulationRegister_Остатки_Balance", "AccumulationRegister", is_virtual=True
+            ),
+            "update",
+            (),
+            None,
+            id="шаг4-виртуальная",
+        ),
+        pytest.param(
+            база(permissions=Permissions(deny_fields=["Catalog_Контрагенты.ИНН"])),
+            сущность(),
+            "update",
+            ("ИНН",),
+            None,
+            id="шаг6-deny_fields",
+        ),
+    ],
+)
+def test_порядок_скрытая_сущность_побеждает_любой_следующий_отказ(b, e, op, fields, action):
+    """Скрытая сущность отвечает `entity_hidden` раньше всего: любой другой код для неё —
+    `base_read_only` на базе `prod`, имя флага, «виртуальная таблица» — подтвердил бы, что
+    сущность существует. Каждый случай сначала проверен без скрытия: отказ в нём настоящий,
+    иначе тест ловил бы не порядок, а пустой случай."""
+    with pytest.raises(WriteError) as без_скрытия:
+        проверить(b, e, op, fields, action=action)
+    assert без_скрытия.value.code != "entity_hidden"
+    with pytest.raises(WriteError) as инфо:
+        проверить(b, e, op, fields, action=action, hidden=_скрыта)
+    assert инфо.value.code == "entity_hidden"
+
+
 def test_порядок_read_only_и_deny_fields_побеждает_base_read_only():
     b = база(write=False, permissions=Permissions(deny_fields=["Catalog_Контрагенты.ИНН"]))
     with pytest.raises(WriteError) as инфо:
