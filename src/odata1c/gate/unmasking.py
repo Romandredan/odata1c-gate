@@ -255,6 +255,10 @@ class Unmasker:
             return text
         целиком = parse_token(text)
         if целиком:
+            if allow_mixed:
+                # Тело записи старым путём (`body`): шаг 2а правила записи (Ruling 38) — в
+                # структурное поле контактной информации JSON другой записи не подставляется.
+                self._не_в_структуру(целиком, entity=entity, field=field, strict=strict)
             return self._раскрыть(
                 целиком, entity=entity, field=field, strict=strict, revealed=revealed
             )
@@ -963,8 +967,10 @@ class Unmasker:
         revealed: RevealedValues | None,
         strict: bool = False,
     ) -> str:
+        """Токены внутри текста тела записи старым путём (`body`, единственный вызывающий)."""
         куски, позиция = [], 0
         for начало, конец, класс, хвост in find_tokens(текст):
+            self._не_в_структуру((класс, хвост), entity=entity, field=field, strict=strict)
             куски.append(текст[позиция:начало])
             куски.append(
                 self._раскрыть(
@@ -974,6 +980,19 @@ class Unmasker:
             позиция = конец
         куски.append(текст[позиция:])
         return "".join(куски)
+
+    def _не_в_структуру(
+        self, разобранный: tuple[str, str], *, entity: str, field: str, strict: bool
+    ) -> None:
+        """Шаг 2а правила записи для старого пути `body` (у него нет `current`, поэтому шаг 2 не
+        спасает): токен в структурное поле контактной информации — отказ. Право проверяется
+        первым, как везде: ответ «структурное / нет» не должен стать оракулом для токена чужого
+        класса."""
+        токен, сегмент = self._проверить_право(
+            разобранный, entity=entity, field=field, strict=strict
+        )
+        if self._структурное(токен, сегмент):
+            raise _структура_не_по_токену(токен, field)
 
     def _раскрыть(
         self,
