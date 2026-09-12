@@ -6,6 +6,7 @@ import os
 import time
 
 import pytest
+from conftest import строение_неизвестно
 
 from odata1c.config.models import BaseConfig, GateSettings
 from odata1c.gate.dictionary import Dictionary
@@ -127,17 +128,33 @@ def test_error_маскирует_сообщение_1С(врата_prod, сло
 
 def test_is_protected_учитывает_уровень(врата_prod, врата_identifiers):
     # политика: auto Catalog_Контрагенты.Description: org, Catalog_Контрагенты.ИНН: inn
-    assert врата_prod.is_protected("Catalog_Контрагенты", "Description") is True
-    assert врата_identifiers.is_protected("Catalog_Контрагенты", "Description") is False
-    assert врата_identifiers.is_protected("Catalog_Контрагенты", "ИНН") is True
-    assert врата_prod.is_protected("Catalog_Контрагенты", "Code") is False
+    assert (
+        врата_prod.is_protected("Catalog_Контрагенты", "Description", shape=строение_неизвестно)
+        is True
+    )
+    assert (
+        врата_identifiers.is_protected(
+            "Catalog_Контрагенты", "Description", shape=строение_неизвестно
+        )
+        is False
+    )
+    assert (
+        врата_identifiers.is_protected("Catalog_Контрагенты", "ИНН", shape=строение_неизвестно)
+        is True
+    )
+    assert (
+        врата_prod.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is False
+    )
 
 
 def test_inbound_filter_в_режиме_identifiers_пропускает_название(врата_identifiers):
     выражение = "Description eq 'ООО Ромашка'"
     assert (
         врата_identifiers.inbound_filter(
-            выражение, entity="Catalog_Контрагенты", revealed=RevealedValues()
+            выражение,
+            entity="Catalog_Контрагенты",
+            revealed=RevealedValues(),
+            shape=строение_неизвестно,
         )
         == выражение
     )
@@ -195,14 +212,16 @@ def test_вход_обратной_подмены_требует_набор(вр
 
 
 def test_refresh_подхватывает_новую_политику(врата_prod, путь_политики):
-    assert врата_prod.is_protected("Catalog_Контрагенты", "Code") is False
+    assert (
+        врата_prod.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is False
+    )
     путь_политики.write_text(
         путь_политики.read_text(encoding="utf-8") + "fields:\n  Catalog_Контрагенты.Code: inn\n",
         encoding="utf-8",
     )
     os.utime(путь_политики, (time.time() + 5, time.time() + 5))
     врата_prod.refresh()
-    assert врата_prod.is_protected("Catalog_Контрагенты", "Code") is True
+    assert врата_prod.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is True
 
 
 def test_finish_text_прогоняет_стража(врата_prod, словарь):

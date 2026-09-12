@@ -13,7 +13,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from odata1c.gate.masking import effective_field_class
+from odata1c.gate.contact_info import EntityShape
+from odata1c.gate.masking import inbound_field_class
 from odata1c.gate.policy import Policy
 from odata1c.index.repository import EntityDescription
 
@@ -57,6 +58,14 @@ def build(
 
     скрытые_дети = {имя for имя in desc.children if скрыта(имя)}
 
+    # Класс поля — входного пути (`inbound_field_class`, Ruling 35): поле значения контактной
+    # информации показывается классом `contact` — по нему модель узнаёт заранее, что отбор по
+    # полю принимает только токен. Строение этой сущности — из её же описания.
+    своё_строение = EntityShape(frozenset(поле["name"] for поле in desc.fields), desc.parent_entity)
+
+    def строение(имя: str) -> EntityShape | None:
+        return своё_строение if имя == desc.name else None
+
     def тип(edm_type: str) -> str:
         """Имя типа строки табличной части (`Collection(…Document_X_Товары_RowType)`) содержит имя
         самой табличной части, и по нему скрытое имя восстанавливается целиком. Функционального
@@ -85,7 +94,9 @@ def build(
             # Цель ссылки — то же имя сущности, что и цель навигации, и запрет на него тот же.
             "ref_targets": [цель(имя) for имя in поле["ref_targets"]],
             "is_composite": bool(поле["is_composite"]),
-            "gate_class": effective_field_class(policy, desc.name, поле["name"], mode=mode),
+            "gate_class": inbound_field_class(
+                policy, desc.name, поле["name"], mode=mode, shape=строение
+            ),
         }
         for поле in desc.fields
     ]

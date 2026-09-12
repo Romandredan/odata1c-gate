@@ -905,7 +905,9 @@ async def test_get_не_выносит_раскрытое_в_эхе_ключа(�
     путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
 
     гейт = сервис._gate_for(сервис._config.bases["ut"])
-    assert гейт.field_class(сущность, поле) == "doc", "поле не получило объявленный класс"
+    assert гейт.field_class(сущность, поле, shape=строение_неизвестно) == "doc", (
+        "поле не получило объявленный класс"
+    )
     маска = гейт.mask(
         {поле: значение},
         entity=сущность,
@@ -2032,14 +2034,14 @@ async def test_reindex_пересобирает_политику_и_гейт_е�
     policy_path(дом, "ut").unlink()
     гейт = сервис._gate_for(сервис._config.bases["ut"])
     гейт.refresh()
-    assert not гейт.is_protected("Catalog_Контрагенты", "Description")
+    assert not гейт.is_protected("Catalog_Контрагенты", "Description", shape=строение_неизвестно)
 
     respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
     данные = json.loads(await сервис.reindex(SessionScope(), base="ut", force=True))
 
     assert данные["changed"] is True
     assert policy_path(дом, "ut").exists()
-    assert гейт.is_protected("Catalog_Контрагенты", "Description")
+    assert гейт.is_protected("Catalog_Контрагенты", "Description", shape=строение_неизвестно)
 
 
 async def test_перечисление_тип_лица_приходит_открытым(сервис, respx_ut):
@@ -2112,7 +2114,9 @@ async def test_reindex_без_изменений_пересобирает_уст
     _записать_auto(дом, "Catalog_Контрагенты.ЮрФизЛицо", "person")
     гейт = сервис._gate_for(сервис._config.bases["ut"])
     гейт.refresh(force=True)
-    assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо") == "person"
+    assert (
+        гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо", shape=строение_неизвестно) == "person"
+    )
     respx_ut.get(f"{URL_UT}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
 
     данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
@@ -2120,7 +2124,7 @@ async def test_reindex_без_изменений_пересобирает_уст
     assert данные["changed"] is False
     политика = yaml.safe_load(policy_path(дом, "ut").read_text(encoding="utf-8"))
     assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
-    assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо") is None
+    assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо", shape=строение_неизвестно) is None
     # Смена классов без перемены `$metadata` меняет то, как приходят значения, посреди сессии;
     # модель узнаёт об этом из ответа, а не из «у того же контрагента вдруг другое значение».
     assert [с for с in данные["warnings"] if с.startswith(ПОЛИТИКА_ПЕРЕСОБРАНА)]
@@ -4278,3 +4282,155 @@ async def test_r34_адрес_доставки_документа_закрыт_�
     assert "Ленина" not in текст and "390000" not in текст
     assert элемент["АдресДоставки"] == элемент["АдресДоставкиЗначение"]
     assert элемент["Number"] == "00УТ-050437" and элемент["Date"] == "2026-08-26T19:30:11"
+
+
+# Ruling 35: оракул отбора по полям контактной информации — одна реализация на все пути
+
+ОРАКУЛЫ_КИ = (
+    "substringof('495', Представление)",
+    "Представление eq '84951234567'",
+    "startswith(Значение, '{')",
+    "НомерТелефона gt '8'",
+)
+
+
+@pytest.mark.parametrize("отбор", ОРАКУЛЫ_КИ)
+async def test_r35_query_отклоняет_оракул_до_1С(сервис, respx_ut, отбор):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.query(SessionScope(), base="ut", entity=КИ, filter=отбор, top=5)
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert "только токеном из ответа" in ответ["error"]["hint"]
+    assert not маршрут.called
+
+
+@pytest.mark.parametrize("отбор", ОРАКУЛЫ_КИ)
+async def test_r35_raw_get_отклоняет_оракул_до_1С(сервис, respx_ut, отбор):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    for путь in (КИ, f"Catalog_Контрагенты(guid'{ССЫЛКА}')/КонтактнаяИнформация"):
+        ответ = json.loads(
+            await сервис.raw_get(SessionScope(), base="ut", path=путь, query={"$filter": отбор})
+        )
+        assert ответ["error"]["code"] == "filter_syntax", путь
+    assert not маршрут.called
+
+
+async def test_r35_raw_get_вне_индекса_отклоняет_оракул(сервис, respx_ut):
+    """Табличная часть, которой нет в индексе (устаревший индекс): запасной признак по суффиксу."""
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.raw_get(
+            SessionScope(),
+            base="ut",
+            path="Catalog_НовыйСправочник_КонтактнаяИнформация",
+            query={"$filter": "substringof('495', Представление)"},
+        )
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert not маршрут.called
+
+
+async def test_r35_сортировка_по_контактной_информации_отклонена(сервис, respx_ut):
+    маршрут = respx_ut.route(method="GET").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    ответ = json.loads(
+        await сервис.query(SessionScope(), base="ut", entity=КИ, orderby="Представление", top=5)
+    )
+    assert ответ["error"]["code"] == "params_invalid"
+    ответ = json.loads(
+        await сервис.raw_get(
+            SessionScope(), base="ut", path=КИ, query={"$orderby": "Представление desc"}
+        )
+    )
+    assert ответ["error"]["code"] == "params_invalid"
+    assert not маршрут.called
+
+
+async def test_r35_токен_и_отбор_по_типу_проходят(сервис, respx_ut):
+    """Токен из ответа раскрывается реальным значением; отбор по `Тип` уходит как есть."""
+    маршрут = respx_ut.get(КИ).mock(
+        return_value=httpx.Response(200, json={"value": [_строка_телефона_ки()]})
+    )
+    строка = json.loads(await сервис.query(SessionScope(), base="ut", entity=КИ, top=5))["items"][0]
+    токен = строка["Представление"]
+
+    ответ = json.loads(
+        await сервис.query(
+            SessionScope(),
+            base="ut",
+            entity=КИ,
+            filter=f"Тип eq 'Телефон' and Представление eq '{токен}'",
+            top=5,
+        )
+    )
+    assert "error" not in ответ
+    отбор = маршрут.calls.last.request.url.params["$filter"]
+    assert отбор == f"Тип eq 'Телефон' and Представление eq '{НОМЕР_КИ}'"
+    assert НОМЕР_КИ not in json.dumps(ответ, ensure_ascii=False)
+
+
+async def test_r35_ключ_get_с_открытым_значением_отклонён(сервис, respx_ut):
+    маршрут = respx_ut.route(method="GET").mock(return_value=httpx.Response(200, json={}))
+    ответ = json.loads(
+        await сервис.get(
+            SessionScope(),
+            base="ut",
+            entity=КИ,
+            key={"Ref_Key": ССЫЛКА, "Представление": "84951234567"},
+        )
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert not маршрут.called
+
+
+РЕЦЕПТ_КИ = f"""
+version: 1
+recipes:
+  по_номеру:
+    title: Строки контактной информации по номеру
+    entity: {КИ}
+    params:
+      номер: {{ type: string, required: true, description: номер телефона }}
+    filter: Представление eq {{номер}}
+    select: [Ref_Key, Тип, Представление]
+"""
+
+
+async def test_r35_рецепт_отклоняет_открытый_номер_и_принимает_токен(сервис, дом, respx_ut):
+    (дом / "bases" / "ut" / "recipes.yaml").write_text(РЕЦЕПТ_КИ, encoding="utf-8")
+    маршрут = respx_ut.get(КИ).mock(
+        return_value=httpx.Response(200, json={"value": [_строка_телефона_ки()]})
+    )
+    ответ = json.loads(
+        await сервис.recipe(
+            SessionScope(), base="ut", name="по_номеру", params={"номер": "84951234567"}
+        )
+    )
+    assert ответ["error"]["code"] == "filter_syntax"
+    assert not маршрут.called
+
+    строка = json.loads(await сервис.query(SessionScope(), base="ut", entity=КИ, top=5))["items"][0]
+    ответ = json.loads(
+        await сервис.recipe(
+            SessionScope(), base="ut", name="по_номеру", params={"номер": строка["Представление"]}
+        )
+    )
+    assert "error" not in ответ
+    assert маршрут.calls.last.request.url.params["$filter"] == f"Представление eq '{НОМЕР_КИ}'"
+
+
+async def test_r35_describe_показывает_класс_contact(сервис):
+    описание = json.loads(
+        await сервис.describe_entity(SessionScope(), base="ut", entity=КИ, response_format="json")
+    )
+    классы = {поле["name"]: поле["gate_class"] for поле in описание["fields"]}
+    assert классы["Представление"] == классы["НомерТелефона"] == "contact"
+    assert классы["Тип"] is None and классы["LineNumber"] is None

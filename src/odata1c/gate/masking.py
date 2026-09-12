@@ -162,6 +162,42 @@ def effective_field_class(
     return _понизить_класс_названия_по_уровню(класс, mode=mode)
 
 
+def inbound_field_class(
+    policy: Policy,
+    entity: str,
+    field: str,
+    *,
+    mode: str,
+    shape: Shape | None,
+    strict: bool = False,
+) -> str | None:
+    """Класс поля на ВХОДНОМ пути — для обратной подмены и анти-оракульных правил отбора, для
+    вопроса «поле защищено?» (`$orderby`) и для класса в `describe_entity` (Ruling 35).
+
+    Отличие от `effective_field_class` одно: поле значения табличной части контактной информации
+    (`contact_info.is_contact_info_entity` + `is_value_field`) получает класс
+    `contact_info.КЛАСС_НА_ВХОДЕ` независимо от политики. На выходе такое поле закрывает правило
+    строки по её `Тип` (Ruling 33), но на входе строки нет: отбор `Представление eq '…'` не знает,
+    телефон это или адрес, и у поля `Представление` в политике класса нет вовсе. Без этого правила
+    открытый литерал в сравнении и `substringof('495', Представление)` уходили в 1С, и по ответам
+    «есть / нет» номер подбирался перебором, ни разу не показанный модели.
+
+    Порядок источников — как у правила строки на выходе (раунд 1): ручное `keep` владельца —
+    единственное «не защищать» и главнее всего; раздел `auto` (`НомерТелефона: phone`) уступает —
+    иначе у колонок поиска остался бы класс, разрешающий равенство с открытым литералом, то есть
+    тот же оракул; ручной `scan` уступает, как на выходе. Ручной класс, отличный от `keep`,
+    правило тоже не отменяет: поле остаётся полем контактной информации, и отбор по нему — только
+    токеном (токен ручного класса раскрывается по записи о выдаче, Ruling 19).
+
+    `shape` — строение по индексу; нет строения — запасной признак по суффиксу имени (см.
+    `is_contact_info_entity`). Слой тулов передаёт его обязательно (`BaseGate.inbound_*`)."""
+    if contact_info.is_value_field(field) and contact_info.is_contact_info_entity(entity, shape):
+        if policy.manual_sensitivity_of(entity, field) == "keep":
+            return "keep"
+        return contact_info.КЛАСС_НА_ВХОДЕ
+    return effective_field_class(policy, entity, field, mode=mode, strict=strict)
+
+
 @dataclasses.dataclass(slots=True)
 class MaskResult:
     data: object

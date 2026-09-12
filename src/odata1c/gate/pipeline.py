@@ -16,7 +16,7 @@ from odata1c.config.models import BaseConfig
 from odata1c.gate.contact_info import Shape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
-from odata1c.gate.masking import Masker, MaskResult, Resolve, effective_field_class
+from odata1c.gate.masking import Masker, MaskResult, Resolve, inbound_field_class
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.unmasking import Unmasker
@@ -48,7 +48,6 @@ class BaseGate:
         self.mode = base.gate.mode
         self._mtime: float | None = None
         self._masker: Masker | None = None
-        self._unmasker: Unmasker | None = None
         self.refresh()
 
     def refresh(self, *, force: bool = False) -> None:
@@ -70,11 +69,19 @@ class BaseGate:
         policy = load_policy(self._policy_path)
         self._policy, self._mtime = policy, mtime
         self._masker = Masker(self._dictionary, policy, mode=self.mode, base=self._base.name)
-        self._unmasker = Unmasker(
+
+    def _обратная_подмена(self, shape: Shape) -> Unmasker:
+        """`Unmasker` на один вызов: класс поля на входе зависит от строения сущностей по индексу
+        (Ruling 35 — поле значения контактной информации), а строение знает только слой тулов и
+        передаёт его в каждый вызов, как в `mask`. Сборка дешёвая — словарь и политика общие, — а
+        держать `Unmasker` со строением прошлого вызова нельзя: индекс перестраивается реиндексом
+        посреди жизни демона."""
+        policy, mode = self._policy, self.mode
+        return Unmasker(
             self._dictionary,
             base=self._base.name,
-            field_class=lambda entity, field, *, strict=False: effective_field_class(
-                policy, entity, field, mode=self.mode, strict=strict
+            field_class=lambda entity, field, *, strict=False: inbound_field_class(
+                policy, entity, field, mode=mode, shape=shape, strict=strict
             ),
         )
 
@@ -92,7 +99,9 @@ class BaseGate:
         """Есть ли у базы хоть одно правило `entities.hide` — см. `policy.Policy.has_hidden`."""
         return self._policy.has_hidden()
 
-    def field_class(self, entity: str, field: str, *, strict: bool = False) -> str | None:
+    def field_class(
+        self, entity: str, field: str, *, shape: Shape, strict: bool = False
+    ) -> str | None:
         """Эффективный класс поля по текущей политике и уровню гейта. Публичный доступ к тому,
         что до сих пор брали через приватную `_policy` (долг, отмеченный в `tools/service.py`
         при задаче 4): слою тулов класс нужен не только ответом «защищено или нет» — от самого
@@ -100,20 +109,37 @@ class BaseGate:
         сравнивается с открытым литералом).
 
         `strict` — сущность не подтверждена индексом (см. `masking.effective_field_class`): тот
-        же строгий взгляд, что и у маскировки (Ruling 18)."""
-        return effective_field_class(self._policy, entity, field, mode=self.mode, strict=strict)
+        же строгий взгляд, что и у маскировки (Ruling 18).
 
-    def is_protected(self, entity: str, field: str, *, strict: bool = False) -> bool:
+        Это класс ВХОДНОГО пути (`masking.inbound_field_class`): поле значения контактной
+        информации получает `contact` (Ruling 35). `shape` — строение сущностей по индексу,
+        обязателен по той же причине, что у `mask`: без него поле контактной информации тихо
+        получило бы класс из политики, где его нет, и оракул отбора открылся бы снова."""
+        return inbound_field_class(
+            self._policy, entity, field, mode=self.mode, shape=shape, strict=strict
+        )
+
+    def is_protected(self, entity: str, field: str, *, shape: Shape, strict: bool = False) -> bool:
         """Класс поля — что-то, кроме «не защищён» (`None`), «оставить как есть» (`keep`) или
         «только сканировать значение» (`scan`, значение целиком не заменяется по классу поля).
 
         `strict` пробрасывается в `field_class`: иначе запрет на оракул порядка (`$orderby` по
         защищаемому полю) снимался бы ровно там, где снимается маска, — на сущности вне индекса
         (форма (г) ревью 2026-09-11)."""
-        return self.field_class(entity, field, strict=strict) not in (None, "keep", "scan")
+        return self.field_class(entity, field, shape=shape, strict=strict) not in (
+            None,
+            "keep",
+            "scan",
+        )
 
     def inbound_filter(
-        self, expression: str, *, entity: str, revealed: RevealedValues, strict: bool = False
+        self,
+        expression: str,
+        *,
+        entity: str,
+        revealed: RevealedValues,
+        shape: Shape,
+        strict: bool = False,
     ) -> str:
         """Выражение отбора от модели: обратная подмена токенов и анти-оракульные правила (SPEC
         §6.7). Единственная точка, где эти правила реализованы, — рецепты прогоняют через неё
@@ -127,10 +153,14 @@ class BaseGate:
         `strict` — путь не разрешён по индексу целиком (Ruling 18, пункт 7 дополнения): «любые
         другие параметры, которые на разрешённом пути отклоняются как оракул, на неразрешённом
         отклоняются тем более». Без проброса `Description ge 'М'` на сущности вне индекса уходил
-        в 1С — двоичный поиск по названию, — хотя на известной сущности отклонялся."""
+        в 1С — двоичный поиск по названию, — хотя на известной сущности отклонялся.
+
+        `shape` — строение сущностей по индексу (Ruling 35), см. `field_class`."""
         if self.mode == "off":
             return expression
-        return self._unmasker.filter(expression, entity=entity, strict=strict, revealed=revealed)
+        return self._обратная_подмена(shape).filter(
+            expression, entity=entity, strict=strict, revealed=revealed
+        )
 
     def inbound_value(
         self,
@@ -139,22 +169,34 @@ class BaseGate:
         entity: str,
         field: str,
         revealed: RevealedValues,
+        shape: Shape,
         strict: bool = False,
     ) -> str:
         """Одно значение от модели (параметр рецепта, элемент ключа). Раскрытие токена здесь
         возможно только при известном поле и совпадении класса — см. `unmasking._раскрыть`.
-        `revealed` — набор вызова, см. `inbound_filter`."""
+        `revealed` — набор вызова, `shape` — строение по индексу; см. `inbound_filter`."""
         if self.mode == "off":
             return text
-        return self._unmasker.value(
+        return self._обратная_подмена(shape).value(
             text, entity=entity, field=field, strict=strict, revealed=revealed
         )
 
-    def inbound_key(self, key, *, entity: str, revealed: RevealedValues, strict: bool = False):
-        """Ключ записи от модели. `revealed` — набор вызова, см. `inbound_filter`."""
+    def inbound_key(
+        self,
+        key,
+        *,
+        entity: str,
+        revealed: RevealedValues,
+        shape: Shape,
+        strict: bool = False,
+    ):
+        """Ключ записи от модели. `revealed` — набор вызова, `shape` — строение по индексу; см.
+        `inbound_filter`."""
         if self.mode == "off":
             return key
-        return self._unmasker.key(key, entity=entity, strict=strict, revealed=revealed)
+        return self._обратная_подмена(shape).key(
+            key, entity=entity, strict=strict, revealed=revealed
+        )
 
     def mask(
         self,

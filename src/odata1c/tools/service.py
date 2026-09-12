@@ -870,7 +870,7 @@ class ToolService:
             if следующая is None:
                 return True
             текущая = следующая
-        return gate.is_protected(текущая.name, поле)
+        return gate.is_protected(текущая.name, поле, shape=self._строение(repo))
 
     def _видимые_кандидаты(
         self,
@@ -1062,7 +1062,12 @@ class ToolService:
             self._проверить_сортировку(репозиторий, гейт, описание, orderby)
 
             реальный_filter = (
-                гейт.inbound_filter(filter, entity=описание.name, revealed=раскрытое)
+                гейт.inbound_filter(
+                    filter,
+                    entity=описание.name,
+                    revealed=раскрытое,
+                    shape=self._строение(репозиторий),
+                )
                 if filter
                 else filter
             )
@@ -1070,7 +1075,10 @@ class ToolService:
             if описание.is_virtual and params and "Condition" in params:
                 реальные_params = dict(params)
                 реальные_params["Condition"] = гейт.inbound_filter(
-                    params["Condition"], entity=описание.name, revealed=раскрытое
+                    params["Condition"],
+                    entity=описание.name,
+                    revealed=раскрытое,
+                    shape=self._строение(репозиторий),
                 )
 
             return await self._выборка(
@@ -1210,7 +1218,12 @@ class ToolService:
     ) -> str:
         async def тело(base_config, гейт, репозиторий, раскрытое):
             описание = self._resolve_entity(репозиторий, гейт, entity)
-            реальный_ключ = гейт.inbound_key(key, entity=описание.name, revealed=раскрытое)
+            реальный_ключ = гейт.inbound_key(
+                key,
+                entity=описание.name,
+                revealed=раскрытое,
+                shape=self._строение(репозиторий),
+            )
 
             раскрытия, обрезка = self._обрезать_expand(
                 репозиторий, гейт, описание, _как_список(expand)
@@ -1308,8 +1321,11 @@ class ToolService:
 
             описание = self._resolve_entity(репозиторий, гейт, рецепт.entity)
             self._проверить_сортировку(репозиторий, гейт, описание, рецепт.orderby)
-            self._проверить_условия(гейт, рецепт, описание.name, params, раскрытое)
-            значения = self._значения_рецепта(гейт, рецепт, описание.name, params, раскрытое)
+            строение = self._строение(репозиторий)
+            self._проверить_условия(гейт, рецепт, описание.name, params, раскрытое, shape=строение)
+            значения = self._значения_рецепта(
+                гейт, рецепт, описание.name, params, раскрытое, shape=строение
+            )
             аргументы = render_recipe(рецепт, значения)
 
             return await self._выборка(
@@ -1350,6 +1366,8 @@ class ToolService:
         entity: str,
         params: dict | None,
         revealed: RevealedValues,
+        *,
+        shape: Shape,
     ) -> None:
         """Условия рецепта с подставленными значениями — через тот же разбор `$filter`, что и
         отбор обычного `query` (Ruling 20, пункт 3, ревью 2026-09-11).
@@ -1375,7 +1393,7 @@ class ToolService:
         результат, таблица = probe_recipe(recipe, сырые)
         for выражение in (результат, таблица):
             if выражение:
-                gate.inbound_filter(выражение, entity=entity, revealed=revealed)
+                gate.inbound_filter(выражение, entity=entity, revealed=revealed, shape=shape)
 
     def _значения_рецепта(
         self,
@@ -1384,6 +1402,8 @@ class ToolService:
         entity: str,
         params: dict | None,
         revealed: RevealedValues,
+        *,
+        shape: Shape,
     ) -> dict:
         """Значения параметров рецепта после обратной подмены (токен → реальное значение).
 
@@ -1414,6 +1434,7 @@ class ToolService:
                     entity=entity,
                     field=recipe.param_field(имя),
                     revealed=revealed,
+                    shape=shape,
                 )
             готовые[имя] = значение
         return готовые
@@ -2103,7 +2124,11 @@ class ToolService:
                 )
             if имя == "$filter":
                 текст = gate.inbound_filter(
-                    текст, entity=цель.entity, strict=not цель.resolved, revealed=revealed
+                    текст,
+                    entity=цель.entity,
+                    strict=not цель.resolved,
+                    revealed=revealed,
+                    shape=self._строение(repo),
                 )
             elif "[[" in текст:
                 raise _ServiceError(
@@ -2125,7 +2150,10 @@ class ToolService:
                     self._поле_защищено_по_пути(repo, gate, описание, поле)
                     if описание is not None
                     else gate.is_protected(
-                        цель.entity, поле.split("/")[-1], strict=not цель.resolved
+                        цель.entity,
+                        поле.split("/")[-1],
+                        shape=self._строение(repo),
+                        strict=not цель.resolved,
                     )
                 )
                 if защищено:
