@@ -90,6 +90,7 @@ class BaseGate:
                 policy, entity, field, mode=mode, shape=shape, strict=strict
             ),
             path_class=lambda entity, path: inbound_path_class(policy, entity, path, shape=shape),
+            shape=shape,
         )
 
     def is_hidden(self, entity: str) -> bool:
