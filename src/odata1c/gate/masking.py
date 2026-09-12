@@ -14,8 +14,9 @@ from ahocorasick_rs import AhoCorasick, MatchKind
 from odata1c.gate import contact_info
 from odata1c.gate.contact_info import Shape
 from odata1c.gate.detectors import scan_value
-from odata1c.gate.dictionary import Dictionary, normalize_text_with_map
+from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.field_rules import classify_field, is_naming_field
+from odata1c.gate.overlaps import заменить_названия
 from odata1c.gate.policy import Policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
 from odata1c.gate.tokens import (
@@ -23,7 +24,6 @@ from odata1c.gate.tokens import (
     GUID_RE,
     TOKEN_RE,
     КЛАСС_СТРОКИ_С_ТОКЕНОМ,
-    blank_tokens,
     find_tokens,
     parse_token,
 )
@@ -1065,9 +1065,9 @@ class Masker:
             return
         self._названия_варианты = self._dictionary.name_variants()
         ключи = list(self._названия_варианты)
-        self._названия_автомат = (
-            AhoCorasick(ключи, matchkind=MatchKind.LeftmostLongest) if ключи else None
-        )
+        # `Standard`, а не `LeftmostLongest`: нужны ВСЕ совпадения, в том числе пересекающиеся
+        # (Б-4, `gate/overlaps.py`) — только этот вид автомата умеет `overlapping=True`.
+        self._названия_автомат = AhoCorasick(ключи, matchkind=MatchKind.Standard) if ключи else None
         self._названия_ревизия = self._dictionary.revision()
 
     def _заменить_известные_названия(self, текст: str, *, entity: str, field: str) -> str:
@@ -1093,30 +1093,16 @@ class Masker:
         приведённое к нижнему регистру латинское название, и вариант мог бы разрезать токен
         (ревью 2026-09-09, дыра 8), а вариант, зацепивший скобку токена, подавлял более короткий
         вариант названия рядом (Ruling 21 M1c, хвост 2) — с заглушкой совпасть с токеном нечему.
+
+        Пересекающиеся названия (Б-4, находка I-2 ревью 7): ищутся все совпадения, и сцепленные
+        пересечениями заменяются одной группой — накрывающим названием или токенами всех
+        участников подряд (`gate/overlaps.py`). Прежний поиск без пересечений брал первое и
+        оставлял хвост второго открытым: «Юг Альфа Север» → `[[org:1]] Север`.
         """
         if self._mode != "identifiers+names":
             return текст
         self._обновить_автомат_названий()
         if self._названия_автомат is None:
             return текст
-        нормализованный, карта = normalize_text_with_map(blank_tokens(текст))
-        совпадения = self._названия_автомат.find_matches_as_indexes(нормализованный)
-        if not совпадения:
-            return текст
-        куски: list[str] = []
-        норм_позиция = 0
-        текст_позиция = 0
-        for _, начало, конец in совпадения:
-            if начало < норм_позиция:
-                continue
-            токен = self._названия_варианты.get(нормализованный[начало:конец])
-            if токен is None:
-                continue
-            текст_начало = карта[начало][0]
-            текст_конец = карта[конец - 1][1]
-            куски.append(текст[текст_позиция:текст_начало])
-            куски.append(токен)
-            норм_позиция = конец
-            текст_позиция = текст_конец
-        куски.append(текст[текст_позиция:])
-        return "".join(куски)
+        заменено, _ = заменить_названия(текст, self._названия_автомат, self._названия_варианты)
+        return заменено
