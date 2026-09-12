@@ -745,3 +745,51 @@ def test_детекторы_не_находят_названий():
     from odata1c.gate.dictionary import НУМЕРУЕМЫЕ
 
     assert set(SCAN_ORDER).isdisjoint(НУМЕРУЕМЫЕ)
+
+
+# --- Ruling 49: написания пути ошибки (до Ruling 48) шлюз не учитывает нигде -------------------
+# «Старый» словарь моделируется тем же вызовом, которым писал путь ошибки до Ruling 48:
+# `token_for(entity="", field="error")` с записью.
+
+
+def _след_ошибки(словарь, класс: str, значение: str) -> str:
+    return словарь.token_for(класс, значение, base="ut", entity="", field="error")
+
+
+def test_написание_из_ошибки_не_написание(словарь):
+    токен = словарь.token_for("phone", "+7 495 700-00-00", base="ut", entity="E", field="Т")
+    assert _след_ошибки(словарь, "phone", "+7 (495) 700-00-00") == токен
+
+    assert словарь.spellings(токен) == ["+7 495 700-00-00"]
+    assert словарь.spellings(токен, base="ut", field="error") == []
+    assert словарь.reveal(токен, base="ut", field="error") == словарь.reveal(токен)
+    assert not словарь.issued_for(токен, base="ut", field="error")
+    assert not словарь.issued_for(токен, base="ut", entity="", field="error")
+    assert словарь.knows(токен)
+    assert словарь.any_variant(токен) == "+7 495 700-00-00"
+    assert токен in словарь.number_tokens().values()
+
+
+def test_токен_только_из_ошибок_неизвестен(словарь):
+    """Все написания — из пути ошибки: токен ведёт себя как неизвестный, как токен эха по
+    Ruling 48, и в множество стража не входит (иначе номер документа в чужом ответе оставался бы
+    токеном `inn` — B2 на старом словаре)."""
+    токен = _след_ошибки(словарь, "inn", "0000000716")
+
+    assert not словарь.knows(токен)
+    assert словарь.reveal(токен) is None
+    assert словарь.any_variant(токен) is None
+    assert словарь.spellings(токен) == []
+    assert not словарь.matches(токен, "0000000716")
+    assert токен not in словарь.number_tokens().values()
+
+
+def test_токен_из_ошибки_и_данных_известен_по_данным(словарь):
+    """Значение, пришедшее потом данными 1С, — обычный токен; написание из ошибки по-прежнему не
+    считается."""
+    токен = _след_ошибки(словарь, "inn", "0000000716")
+    assert словарь.token_for("inn", "0000000716", base="ut", entity="E", field="ИНН") == токен
+
+    assert словарь.knows(токен)
+    assert словарь.spellings(токен) == ["0000000716"]
+    assert токен in словарь.number_tokens().values()

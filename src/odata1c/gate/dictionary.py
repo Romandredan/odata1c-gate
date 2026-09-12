@@ -411,6 +411,23 @@ def _след_токена(тип: str, написание: str) -> bool:
     return True
 
 
+# Ruling 49: написания, которые путь не-данных записал до Ruling 48, — `(entity, field)` его
+# записей. Путь был один за всю историю: `BaseGate.error` → `Masker.mask_text(entity="",
+# field="error")` → `token_for` (сообщение и подсказка отказа, эхо значения модели или 1С). Строки
+# в файле остаются — файл владельца не трогаем, миграции нет; шлюз их не учитывает НИГДЕ, как
+# будто их нет, и отсекает при чтении `variants` одним условием (`_ИЗ_ДАННЫХ`). Иначе второе
+# написание из эха делало запись токеном `token_ambiguous` (B4), попадало в `or` отбора, а токен,
+# известный только из эха, раскрывался и держал номер документа в множестве стража (B2).
+_ПУТЬ_НЕ_ДАННЫХ: tuple[tuple[str, str], ...] = (("", "error"),)
+
+
+# SQL-условие «строка `variants` — написание из данных 1С». Значения — константы модуля, не ввод:
+# подстановка в текст запроса безопасна.
+_ИЗ_ДАННЫХ = " AND ".join(
+    f"NOT (entity = '{сущность}' AND field = '{поле}')" for сущность, поле in _ПУТЬ_НЕ_ДАННЫХ
+)
+
+
 class DictionaryCorruptError(Exception):
     """Файл словаря — не SQLite-база или повреждён (тот же набор атрибутов, что у OdataError,
     ConfigError и IndexCorruptError: SPEC §5.2 — code, message, hint; см.
@@ -758,17 +775,28 @@ class Dictionary:
         строка = self._connection.execute(
             "SELECT normalized FROM tokens WHERE token = ?", (token,)
         ).fetchone()
-        if строка is None:
+        if строка is None or self._только_не_данные(token):
             return None
         if base and field:
             вариант = self._connection.execute(
                 "SELECT raw_value FROM variants WHERE token = ? AND base = ? AND field = ?"
-                " ORDER BY seen_at DESC LIMIT 1",
+                f" AND {_ИЗ_ДАННЫХ} ORDER BY seen_at DESC LIMIT 1",
                 (token, base, field),
             ).fetchone()
             if вариант:
                 return вариант["raw_value"]
         return строка["normalized"]
+
+    def _только_не_данные(self, token: str) -> bool:
+        """Все написания токена — с пути не-данных (Ruling 49): токен ведёт себя как неизвестный,
+        как токен эха по Ruling 48, которого словарь не записал. Токен без единого написания
+        сюда не относится — у него прежнее поведение."""
+        строка = self._connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM variants WHERE token = ?) AS есть,"
+            f" EXISTS(SELECT 1 FROM variants WHERE token = ? AND {_ИЗ_ДАННЫХ}) AS из_данных",
+            (token, token),
+        ).fetchone()
+        return bool(строка["есть"]) and not строка["из_данных"]
 
     def spellings(
         self, token: str, *, base: str | None = None, field: str | None = None
@@ -793,7 +821,7 @@ class Dictionary:
         ).fetchone()
         if строка is None:
             return []
-        условия, параметры = ["token = ?"], [token]
+        условия, параметры = ["token = ?", _ИЗ_ДАННЫХ], [token]
         if base is not None:
             условия.append("base = ?")
             параметры.append(base)
@@ -880,7 +908,7 @@ class Dictionary:
         строка = self._connection.execute(
             "SELECT type, normalized FROM tokens WHERE token = ?", (token,)
         ).fetchone()
-        if строка is None:
+        if строка is None or self._только_не_данные(token):
             return False
         if text in self.spellings(token):
             return True
@@ -917,13 +945,14 @@ class Dictionary:
         """
         if entity is None:
             строка = self._connection.execute(
-                "SELECT 1 FROM variants WHERE token = ? AND base = ? AND field = ? LIMIT 1",
+                "SELECT 1 FROM variants WHERE token = ? AND base = ? AND field = ?"
+                f" AND {_ИЗ_ДАННЫХ} LIMIT 1",
                 (token, base, field),
             ).fetchone()
         else:
             строка = self._connection.execute(
                 "SELECT 1 FROM variants WHERE token = ? AND base = ? AND entity = ? AND field = ?"
-                " LIMIT 1",
+                f" AND {_ИЗ_ДАННЫХ} LIMIT 1",
                 (token, base, entity, field),
             ).fetchone()
         return строка is not None
@@ -932,11 +961,13 @@ class Dictionary:
         """Выдан ли этот токен словарём (находка П2 приёмки, 2026-09-12). Маскировщик по нему
         отличает уже замаскированное значение от строки 1С, которая лишь похожа на токен: первое
         не маскируется повторно, второе — обычное значение поля (в хвосте такой строки вполне
-        могут стоять настоящие цифры, и пропускать её как «уже токен» нельзя)."""
-        return (
-            self._connection.execute("SELECT 1 FROM tokens WHERE token = ?", (token,)).fetchone()
-            is not None
-        )
+        могут стоять настоящие цифры, и пропускать её как «уже токен» нельзя).
+
+        Токен, все написания которого — с пути не-данных (Ruling 49), словарю не известен: на
+        нём обратная подмена отвечает `token_unknown`."""
+        return self._connection.execute(
+            "SELECT 1 FROM tokens WHERE token = ?", (token,)
+        ).fetchone() is not None and not self._только_не_данные(token)
 
     def any_variant(self, token: str) -> str | None:
         """Любое сохранённое исходное написание токена, без выбора конкретной базы/поля.
@@ -950,7 +981,8 @@ class Dictionary:
         `variants` (сам токен при этом мог существовать в `tokens` — тогда вызывающий код
         показывает нормализованное значение как запасной вариант)."""
         строка = self._connection.execute(
-            "SELECT raw_value FROM variants WHERE token = ? ORDER BY seen_at DESC LIMIT 1",
+            f"SELECT raw_value FROM variants WHERE token = ? AND {_ИЗ_ДАННЫХ}"
+            " ORDER BY seen_at DESC LIMIT 1",
             (token,),
         ).fetchone()
         return строка["raw_value"] if строка else None
@@ -987,7 +1019,8 @@ class Dictionary:
 
     def _мусорные_токены(self) -> set[str]:
         """Токены, которые словарь выдал по ошибке прежних версий, — в множества поиска стража и
-        слоя названий они не попадают. Два признака, оба «по ВСЕМ написаниям токена»:
+        слоя названий они не попадают. Три признака, все «по ВСЕМ написаниям токена» (третий —
+        написания только с пути не-данных, Ruling 49, `_порождённые_не_данными`):
 
         1. Написание содержит целый токен — след двойной маскировки (находка П2, подробно ниже).
         2. Токен названия (`org`/`person`), выданный значению поля-перечисления
@@ -1006,9 +1039,27 @@ class Dictionary:
         смене, и держать признак свежее своих потребителей незачем."""
         if self._мусор_ревизия == self._revision:
             return self._мусор
-        мусор = self._порождённые_токенами() | self._порождённые_перечислениями()
+        мусор = (
+            self._порождённые_токенами()
+            | self._порождённые_перечислениями()
+            | self._порождённые_не_данными()
+        )
         self._мусор, self._мусор_ревизия = мусор, self._revision
         return мусор
+
+    def _порождённые_не_данными(self) -> set[str]:
+        """Признак 3 `_мусорных_токенов` (Ruling 49): ВСЕ написания токена — с пути не-данных
+        (эхо в тексте ошибки, записанное до Ruling 48). Такой токен словарю не известен (`knows`),
+        и в множествах поиска ему не место: цифры эха держали бы номер документа токеном `inn` в
+        чужих ответах (B2 повторного ревью задачи 5 M2). Написания из ошибок признаки 1 и 2 тоже
+        не считают — «все написания» там только написания из данных."""
+        return {
+            строка["token"]
+            for строка in self._connection.execute(
+                "SELECT token FROM variants GROUP BY token"
+                f" HAVING SUM(CASE WHEN {_ИЗ_ДАННЫХ} THEN 1 ELSE 0 END) = 0"
+            )
+        }
 
     def _порождённые_перечислениями(self) -> set[str]:
         """Признак 2 `_мусорных_токенов`. Поля-перечисления берутся из того же закрытого списка,
@@ -1037,7 +1088,7 @@ class Dictionary:
             if all(
                 ПЕРЕЧИСЛЕНИЯ_ТИПА_ЛИЦА.fullmatch(строка["field"])
                 for строка in self._connection.execute(
-                    "SELECT field FROM variants WHERE token = ?", (токен,)
+                    f"SELECT field FROM variants WHERE token = ? AND {_ИЗ_ДАННЫХ}", (токен,)
                 )
             )
         }
@@ -1080,7 +1131,7 @@ class Dictionary:
             написания = [
                 строка["raw_value"]
                 for строка in self._connection.execute(
-                    "SELECT raw_value FROM variants WHERE token = ?", (токен,)
+                    f"SELECT raw_value FROM variants WHERE token = ? AND {_ИЗ_ДАННЫХ}", (токен,)
                 ).fetchall()
             ]
             if написания and all(_след_токена(тип, написание) for написание in написания):

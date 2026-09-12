@@ -1742,3 +1742,90 @@ async def test_null_в_поле_dob_отклоняет_проверка_типа
     assert отказ["code"] == "params_invalid"
     assert "0001-01-01T00:00:00" in отказ["hint"]
     assert not одинс.обращались
+
+
+# Ruling 49: написания, которые путь ошибки успел записать до Ruling 48 (`field='error'`), шлюз не
+# учитывает нигде. «Старый» словарь — тот же вызов, которым писал прежний `gate.error`.
+
+
+def _след_ошибки(tools: ToolService, класс: str, значение: str) -> str:
+    return tools._dictionary.token_for(класс, значение, base="ut", entity="", field="error")
+
+
+async def test_B4_на_старом_словаре_написание_из_ошибки_не_делает_токен_неоднозначным(среда, одинс):
+    запись, стор, tools, _ = среда
+    т = токен(tools, "+7 495 700-00-00", entity=БАНК, поле="ТелефоныБанка")
+    assert _след_ошибки(tools, "phone", "+7 (495) 700-00-00") == т
+    одинс.объект({"Ref_Key": ССЫЛКА, "DataVersion": ВЕРСИЯ, "ТелефоныБанкаДляРасчетов": ""})
+
+    ответ = json.loads(
+        await запись.update(
+            SessionScope(),
+            "s",
+            base="ut",
+            entity=БАНК,
+            key=ССЫЛКА,
+            data={"ТелефоныБанкаДляРасчетов": т},
+        )
+    )
+
+    assert "pending_id" in ответ, ответ
+    [операция] = стор._ops.values()
+    assert операция.request["json"] == {"ТелефоныБанкаДляРасчетов": "+7 495 700-00-00"}
+
+
+async def test_отбор_по_токену_не_берёт_написание_из_ошибки(среда, одинс):
+    """Группа написаний отбора (поле без своих написаний — все написания словаря) — без
+    написания пути ошибки: в `or` 1С не уходит написание, которого в 1С нет."""
+    _, _, tools, _ = среда
+    т = токен(tools, "+7 495 700-00-00", entity=БАНК, поле="ТелефоныБанка")
+    _след_ошибки(tools, "phone", "+7 (495) 700-00-00")
+    одинс.объект({"value": []})
+
+    ответ = json.loads(
+        await tools.query(
+            SessionScope(), base="ut", entity=БАНК, filter=f"ТелефоныБанкаДляРасчетов eq '{т}'"
+        )
+    )
+
+    assert "error" not in ответ, ответ
+    отбор = одинс.get.calls.last.request.url.params["$filter"]
+    assert "+7 495 700-00-00" in отбор and "(495)" not in отбор
+
+
+async def test_токен_только_из_ошибок_token_unknown_на_чтении_и_записи(среда, одинс):
+    запись, стор, tools, _ = среда
+    т = _след_ошибки(tools, "inn", ЦИФРЫ_ИНН)
+
+    по_отбору = ошибка(
+        await tools.query(SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, filter=f"ИНН eq '{т}'")
+    )
+    assert по_отбору["code"] == "token_unknown"
+    assert not одинс.обращались
+    одинс.объект(контрагент())
+    по_телу = ошибка(
+        await запись.update(
+            SessionScope(), "s", base="ut", entity=КОНТРАГЕНТЫ, key=ССЫЛКА, data={"ИНН": т}
+        )
+    )
+
+    assert по_телу["code"] == "token_unknown"
+    assert not одинс.писали
+    assert стор._ops == {}
+
+
+async def test_B2_на_старом_словаре_номер_документа_цел(среда, одинс):
+    """Токен только из ошибок не входит и в множество стража: номер документа с теми же цифрами
+    в ответе остаётся номером (инвариант 6)."""
+    _, _, tools, _ = среда
+    _след_ошибки(tools, "inn", ЦИФРЫ_ИНН)
+    одинс.объект(документ(Number=ЦИФРЫ_ИНН))
+
+    ответ = json.loads(
+        await tools.get(
+            SessionScope(), base="ut", entity=РЕАЛИЗАЦИЯ, key=ССЫЛКА_ДОК, select=["Number"]
+        )
+    )
+
+    assert ответ["item"]["Number"] == ЦИФРЫ_ИНН
+    assert not any("guard_replaced" in п for п in ответ.get("warnings", []))
