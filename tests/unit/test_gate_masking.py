@@ -9,7 +9,7 @@ from odata1c.gate.masking import (
     Masker,
 )
 from odata1c.gate.policy import load_policy
-from odata1c.gate.revealed import RevealedValues
+from odata1c.gate.revealed import RevealedValues, ScrubbedText
 
 СЕКРЕТ = "секрет ровно для тестов подмены!!".encode()
 
@@ -1170,15 +1170,89 @@ def test_раскрытое_внутри_поля_с_классом_возвра
     ).data["Description"]
     набор = RevealedValues()
     набор.add("ООО Ромашка", token=токен_части)
-    # Так набор заполняет ранний проход (`Guard.scrub_revealed`): число замен и дословный кусок.
+    # Так ответ приходит после раннего прохода (`Guard.scrub_revealed_json`): замена засчитана
+    # стражу, а строка несёт то, что стояло на ЭТОМ месте до замены (Ruling 32).
     набор.note(1)
-    набор.remember(токен_части, "ООО Ромашка")
+    переписанное = ScrubbedText.of(
+        f"{токен_части} (Москва)", original="ООО Ромашка (Москва)", hits=1
+    )
 
     результат = маскировщик.mask(
-        {"Description": f"{токен_части} (Москва)"},
-        entity="Catalog_Контрагенты",
-        revealed=набор,
+        {"Description": переписанное}, entity="Catalog_Контрагенты", revealed=набор
     )
 
     assert результат.data["Description"] == ожидаемый
+    assert type(результат.data["Description"]) is str
     assert набор.replacements == 0
+
+
+def test_исходное_без_токена_не_уходит_из_маскировщика(гейт):
+    """Исходное значение места — реальное (Ruling 32), и маскировщик не отдаёт его никогда. Если
+    словарь не дал ему токена (строка из одних пробелов — единственный такой случай у
+    `token_for`), наружу уходит строка после раннего прохода, а замена раннего прохода остаётся
+    засчитанной стражу. Правило структурное: оно держится и там, где реальные данные до этой
+    ветки не доходят."""
+    набор = RevealedValues()
+    набор.note(1)
+    переписанное = ScrubbedText.of("[[org:1]]", original="  ", hits=1)
+
+    результат = гейт().mask({"ИНН": переписанное}, entity="Catalog_Контрагенты", revealed=набор)
+
+    assert результат.data["ИНН"] == "[[org:1]]"
+    assert type(результат.data["ИНН"]) is str
+    assert результат.masked_fields == ["ИНН"]
+    assert набор.replacements == 1
+
+
+def test_открытое_поле_закрытое_ранним_проходом_названо_в_masked_fields(tmp_path):
+    """Поле, открытое владельцем (`keep`), маскировщик не трогает. Но если в нём раскрытое
+    значение заменил ранний проход, реального значения в поле нет — и `masked_fields` говорит об
+    этом правду (находка M-2 ревью 6)."""
+    (tmp_path / "policy.yaml").write_text(
+        "version: 2\nfields:\n  Catalog_Контрагенты.Комментарий: keep\n", encoding="utf-8"
+    )
+    словарь = Dictionary(tmp_path / "gate.sqlite", СЕКРЕТ)
+    try:
+        маскировщик = Masker(
+            словарь, load_policy(tmp_path / "policy.yaml"), mode="identifiers+names", base="ut"
+        )
+        переписанное = ScrubbedText.of("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
+
+        результат = маскировщик.mask(
+            {"Комментарий": переписанное, "Прочее": "без замен"},
+            entity="Catalog_Контрагенты",
+            revealed=RevealedValues(),
+        )
+
+        assert результат.data["Комментарий"] == "см. [[org:1]]"
+        assert type(результат.data["Комментарий"]) is str
+        assert результат.masked_fields == ["Комментарий"]
+    finally:
+        словарь.close()
+
+
+def test_исходное_значение_не_едет_дальше_маскировщика(гейт):
+    """Строка с исходным значением (`ScrubbedText`) не выходит из маскировщика ни в одном поле:
+    ни в поле с классом, ни в поле без класса, ни в открытом по политике, ни во вложенном."""
+    переписанное = ScrubbedText.of("см. [[org:1]]", original="см. ООО Ромашка", hits=1)
+    данные = {
+        "Description": ScrubbedText.of("[[org:1]]", original="ООО Ромашка", hits=1),
+        "Комментарий": переписанное,
+        "Строки": [{"Содержание": переписанное}, переписанное],
+    }
+
+    результат = гейт().mask(данные, entity="Catalog_Контрагенты", revealed=RevealedValues())
+
+    def строки(значение):
+        if isinstance(значение, dict):
+            for ключ, вложенное in значение.items():
+                yield ключ
+                yield from строки(вложенное)
+        elif isinstance(значение, list):
+            for элемент in значение:
+                yield from строки(элемент)
+        elif isinstance(значение, str):
+            yield значение
+
+    assert all(type(строка) is str for строка in строки(результат.data))
+    assert "Комментарий" in результат.masked_fields

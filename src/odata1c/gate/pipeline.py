@@ -203,12 +203,21 @@ class BaseGate:
         не собирается, текст возвращается тем же объектом."""
         if self.mode == "off" or not revealed:
             return text
-        return self._guard.scrub_revealed(text, revealed)
+        return self._guard.scrub_revealed(text, revealed, mode=self.mode)
 
-    def scrubber(self, revealed: RevealedValues | None):
-        """Функция обратной замены раскрытого для клиента 1С (`Client1C.get(scrub=…)`):
-        единственное, что смотрит на сырой ответ базы до разбора, маскировки и усечения."""
-        return lambda текст: self.scrub_revealed(текст, revealed)
+    def scrub_revealed_json(self, text: str, revealed: RevealedValues | None):
+        """Тот же ранний проход по сырому телу УСПЕШНОГО ответа — и его разбор JSON (Ruling 32):
+        строки, которые проход переписал, приходят `revealed.ScrubbedText` с исходным значением
+        своего места, и маскировщик токенизирует поле с классом по нему. Без раскрытого —
+        обычный `json.loads`."""
+        if self.mode == "off" or not revealed:
+            return json.loads(text)
+        return self._guard.scrub_revealed_json(text, revealed, mode=self.mode)
+
+    def scrubber(self, revealed: RevealedValues | None) -> Scrubber:
+        """Ранний проход для клиента 1С (`Client1C.get(scrub=…)`): единственное, что смотрит на
+        сырой ответ базы до разбора, маскировки и усечения."""
+        return Scrubber(self, revealed)
 
     def finish(self, envelope: dict, revealed: RevealedValues | None = None) -> str:
         """Сериализация ответа тула (`ensure_ascii=False` — страж должен видеть кириллицу как
@@ -287,3 +296,22 @@ def guard_only(guard: Guard, envelope: dict) -> str:
     некому и нечем (задача N1 M1d)."""
     текст = json.dumps(envelope, ensure_ascii=False)
     return guard.check(текст, mode=СТРОЖАЙШИЙ_УРОВЕНЬ).text
+
+
+class Scrubber:
+    """Ранний проход раскрытого (Ruling 25) в двух формах, которые нужны клиенту 1С: вызов — по
+    тексту ошибки (`map_error` дальше режет его), `load` — по телу успешного ответа вместе с
+    разбором JSON (Ruling 32: разбор помечает переписанные строки их исходным значением). Клиент о
+    гейте ничего не знает — только вызывает эти два метода (`client1c.client.Scrub`)."""
+
+    __slots__ = ("_gate", "_revealed")
+
+    def __init__(self, gate: BaseGate, revealed: RevealedValues | None) -> None:
+        self._gate = gate
+        self._revealed = revealed
+
+    def __call__(self, text: str) -> str:
+        return self._gate.scrub_revealed(text, self._revealed)
+
+    def load(self, text: str):
+        return self._gate.scrub_revealed_json(text, self._revealed)

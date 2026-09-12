@@ -15,7 +15,7 @@ from odata1c.gate.detectors import scan_value
 from odata1c.gate.dictionary import Dictionary, normalize_text_with_map
 from odata1c.gate.field_rules import classify_field, is_naming_field
 from odata1c.gate.policy import Policy
-from odata1c.gate.revealed import RevealedValues
+from odata1c.gate.revealed import RevealedValues, ScrubbedText
 from odata1c.gate.tokens import CLASSES, GUID_RE, blank_tokens, parse_token
 
 # Вырезается из ответа всегда (SPEC §5.1).
@@ -434,6 +434,12 @@ class Masker:
         strict: bool = False,
         revealed: RevealedValues | None = None,
     ) -> str:
+        # Строка, которую переписал ранний проход (Ruling 32), несёт исходное значение своего места
+        # — реальное. Дальше маскировщика оно не едет: всё, что отсюда уходит, — обычная строка, а
+        # исходное читает только ветка поля с классом.
+        переписано: ScrubbedText | None = None
+        if isinstance(текст, ScrubbedText):
+            переписано, текст = текст, str(текст)
         if not текст:
             return текст
         # SPEC §6.4, сноска ⁴; инвариант 6: GUID не защищается. `.strip()` — GUID фиксированной
@@ -442,6 +448,8 @@ class Masker:
         if GUID_RE.fullmatch(текст.strip()):
             return текст
         if класс == "keep":
+            if переписано is not None:
+                замаскированные.append(field)
             return текст
         if класс and класс not in ("scan",) and (класс in CLASSES or класс.startswith("custom:")):
             return self._заменить_по_классу(
@@ -451,13 +459,17 @@ class Masker:
                 field=field,
                 замаскированные=замаскированные,
                 revealed=revealed,
+                переписано=переписано,
             )
 
         обработанное = self._заменить_известные_названия(текст, entity=entity, field=field)
         обработанное = self._заменить_найденные_реквизиты(
             обработанное, entity=entity, field=field, force=force_scan or strict
         )
-        if обработанное != текст:
+        # Поле, где значение заменил только ранний проход, — тоже без реального значения в ответе
+        # (находка M-2 ревью 6; Ruling 20, пункт 4: список говорит правду ПО ФАКТУ). Исходное здесь
+        # не подставляется и не перемаскируется: для поля без класса это путь дефекта N1-B.
+        if обработанное != текст or переписано is not None:
             замаскированные.append(field)
         return обработанное
 
@@ -470,6 +482,7 @@ class Masker:
         field: str,
         замаскированные: list[str],
         revealed: RevealedValues | None,
+        переписано: ScrubbedText | None = None,
     ) -> str:
         """Поле с объявленным классом — целиком одним токеном (SPEC §6.4). Два случая, когда в
         строке УЖЕ стоит токен (находка П2 приёмки через настоящие инструменты, 2026-09-12):
@@ -481,15 +494,21 @@ class Masker:
            приходила разными токенами (инвариант 5), повторный отбор по новому токену искал в 1С
            число, которого там нет, а в словарь ложился мусорный реквизит. То же — с токеном
            ВНУТРИ строки: `Description` контрагента входит в его `НаименованиеПолное` (одна
-           запись из сорока на живой базе). Значение возвращается на место из набора вызова
-           (`RevealedValues.restore`), и токен выдаётся настоящему содержимому поля — ровно тот
-           же, что в ответе без отбора. Наружу при этом не уходит ничего нового: результат —
-           по-прежнему один токен на всё поле.
+           запись из сорока на живой базе). Токен выдаётся тому, что стояло в ЭТОМ поле до
+           раннего прохода (`ScrubbedText.original`, Ruling 32: по месту, а не по токену и не по
+           порядку обхода), — ровно тот же, что в ответе без отбора, и словарь не получает чужого
+           написания. Наружу при этом не уходит ничего нового: результат — по-прежнему один
+           токен на всё поле.
 
            Замены раннего прохода, пришедшиеся на поле с классом, снимаются со счётчика
            `guard_replaced` (`RevealedValues.absorb`): это поле маскировщик закрыл бы и сам, а
            «страж поймал то, что пропустил маскировщик» на каждом отборе по токену было бы
            неправдой.
+
+           Исходное значение наружу не отдаётся НИКОГДА — правило структурное, а не по случаю:
+           если словарь не дал ему токена (`token_for` возвращает строку как есть, когда в ней
+           одни пробелы), поле остаётся тем, что сделал ранний проход, и его замены остаются
+           засчитанными стражу.
 
         2. Строка целиком — токен, выданный словарём, но не этим вызовом: уже замаскированное
            значение не маскируется повторно, иначе от него остались бы цифры хвоста. «Выданный
@@ -500,17 +519,24 @@ class Masker:
         `masked_fields` заполняется ПО ФАКТУ (Ruling 20, пункт 4): поле в списке — значит
         реального значения в ответе нет. В обоих случаях выше его нет, и поле числится
         замаскированным так же, как в ответе без отбора."""
-        значение = текст
-        if revealed is not None:
-            значение, возвращено = revealed.restore(текст)
-            revealed.absorb(возвращено)
-        if значение == текст and parse_token(текст) and self._dictionary.knows(текст):
+        if переписано is not None:
+            замаскированные.append(field)
+            исходное = переписано.original
+            замена = self._dictionary.token_for(
+                класс, исходное, base=self._base, entity=entity, field=field
+            )
+            if замена == исходное:
+                return текст
+            if revealed is not None:
+                revealed.absorb(переписано.hits)
+            return замена
+        if parse_token(текст) and self._dictionary.knows(текст):
             замаскированные.append(field)
             return текст
         замена = self._dictionary.token_for(
-            класс, значение, base=self._base, entity=entity, field=field
+            класс, текст, base=self._base, entity=entity, field=field
         )
-        if замена != значение:
+        if замена != текст:
             замаскированные.append(field)
         return замена
 

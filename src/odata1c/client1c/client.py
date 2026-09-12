@@ -11,11 +11,23 @@ import contextlib
 import json as json_mod
 import urllib.parse
 from collections.abc import Callable
+from typing import Any, Protocol
 
 import httpx
 
 from odata1c.client1c.errors import OdataError, map_error
 from odata1c.config.models import BaseConfig
+
+
+class Scrub(Protocol):
+    """Ранний проход гейта по сырому ответу (Ruling 25): вызов — по тексту ошибки, `load` — по
+    телу успешного ответа вместе с разбором JSON (Ruling 32). Реализация — `gate.pipeline.Scrubber`;
+    клиент о гейте ничего не знает."""
+
+    def __call__(self, text: str) -> str: ...
+
+    def load(self, text: str) -> Any: ...
+
 
 ПОВТОРЫ = 2
 ПАУЗА_ПЕРЕД_ПОВТОРОМ_С = 0.5
@@ -111,24 +123,25 @@ class Client1C:
         params: dict | None = None,
         *,
         timeout: float | None = None,
-        scrub: Callable[[str], str] | None = None,
+        scrub: Scrub | None = None,
     ) -> dict:
         """Таймаут одного запроса (SPEC §10): по умолчанию — таймаут базы (`timeout_s`,
         конструктор `httpx.AsyncClient`), явный `timeout=` (план M1d: виртуальные таблицы —
         `virtual_timeout_s`) переопределяет его только для этого запроса.
 
-        `scrub` — функция гейта, возвращающая на место раскрытых значений их токены (Ruling 25,
-        задача N1 M1d). Она применяется к СЫРОМУ телу ответа — и успешного, и ошибочного — до
-        разбора JSON и до `map_error`: инвариант 1 требует, чтобы раскрытое гейтом значение не
-        вышло наружу, а точное вхождение, на котором держится обратная замена, рвут все
+        `scrub` — ранний проход гейта, возвращающий на место раскрытых значений их токены
+        (Ruling 25, задача N1 M1d). Он применяется к СЫРОМУ телу ответа — и успешного, и
+        ошибочного — до разбора JSON и до `map_error`: инвариант 1 требует, чтобы раскрытое гейтом
+        значение не вышло наружу, а точное вхождение, на котором держится обратная замена, рвут все
         преобразования ниже по конвейеру (маскировка, усечение строк, обрезка неразобранного
-        тела до 500 знаков в `map_error`). Клиент о гейте ничего не знает — только вызывает
-        переданную функцию; без неё поведение прежнее."""
+        тела до 500 знаков в `map_error`). Тело успешного ответа проход сам и разбирает
+        (`scrub.load`, Ruling 32): разбор помечает переписанные строки их исходным значением. Клиент
+        о гейте ничего не знает — только вызывает переданное; без него поведение прежнее."""
         response = await self._request(
             "GET", path, params=params, retry=True, timeout=timeout, scrub=scrub
         )
         тело = _тело_текстом(response)
-        return json_mod.loads(scrub(тело) if scrub is not None else тело)
+        return scrub.load(тело) if scrub is not None else json_mod.loads(тело)
 
     async def get_raw(
         self,
