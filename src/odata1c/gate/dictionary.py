@@ -639,7 +639,7 @@ class Dictionary:
             return False
         if text in self.spellings(token):
             return True
-        основа = contact_info.representation(text) if contact_info.is_contact_value(text) else text
+        основа = contact_info.representation(text) if contact_info.is_structure(text) else text
         if TOKEN_RE.search(основа) and not TOKEN_RE.search(строка["normalized"]):
             return False
         нормализованное = normalize_value(строка["type"], основа) or " ".join(основа.split())

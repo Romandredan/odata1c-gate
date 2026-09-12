@@ -535,10 +535,10 @@ class Unmasker:
         текст вместо структуры."""
         if contact_info.is_structure_field(сегмент):
             return True
-        if текущее is not None and contact_info.is_contact_value(текущее):
+        if текущее is not None and contact_info.is_structure(текущее):
             return True
         return сегмент != "" and any(
-            contact_info.is_contact_value(написание)
+            contact_info.is_structure(написание)
             for написание in self._dictionary.spellings(токен, base=self._base, field=сегмент)
         )
 
@@ -1124,7 +1124,7 @@ class Unmasker:
                 return свои
         все = self._dictionary.spellings(токен)
         if contact_info.is_structure_field(сегмент):
-            кандидаты = [написание for написание in все if contact_info.is_contact_value(написание)]
+            кандидаты = [написание for написание in все if contact_info.is_structure(написание)]
         else:
             кандидаты = _текстом(все)
         нормализованное = self._dictionary.reveal(токен)
@@ -1420,13 +1420,14 @@ def _развернуть(текущее, revealed: RevealedValues | None) -> st
 
 def _текстом(написания: list[str]) -> list[str]:
     """Написания для текстового поля (Ruling 38, пункт 2): текст — как есть, структура
-    контактной информации БСП — её представлением (`contact_info.representation`, та же основа,
-    по которой построен токен). Без повторов и по порядку: текст «+7 (495) …» из `Представление`
-    и JSON с тем же `value` из `Значение` — одно написание, а не два. Структура без представления
-    (JSON без `value`) в текстовое поле не идёт вовсе: подставить из неё нечего."""
+    (`contact_info.is_structure`: из неё извлекается представление, с `type` из перечисления или
+    без, Р2-2) — её представлением, той же основой, по которой построен токен. Без повторов и по
+    порядку: текст «+7 (495) …» из `Представление` и JSON с тем же `value` из `Значение` — одно
+    написание, а не два. Структура без представления (JSON БСП без `value`) в текстовое поле не
+    идёт вовсе: подставить из неё нечего."""
     результат: set[str] = set()
     for написание in написания:
-        if not contact_info.is_contact_value(написание):
+        if not contact_info.is_structure(написание):
             результат.add(написание)
             continue
         представление = contact_info.representation(написание)
