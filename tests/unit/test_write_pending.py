@@ -145,6 +145,34 @@ async def test_выполненная_операция_после_ttl_pending_un
     assert отказ.value.code == "pending_unknown"
 
 
+async def test_ruling_40_finish_продлевает_окно_на_полный_ttl_а_не_остаток():
+    # Ruling 40: подтверждение может прийти под самый конец исходного TTL (здесь — t=ttl-1).
+    # Без продления окно идемпотентности после finish длилось бы секунду, а не 10 минут — и
+    # повторный commit после обрыва связи почти сразу получил бы pending_unknown вместо прежнего
+    # result. finish продлевает expires_at до clock() + ttl_s (полный TTL от момента finish).
+    ttl = 600
+    часы = ЧасыЗаглушка(0.0)
+    store = PendingStore(ttl_s=ttl, clock=часы)
+    await store.put(операция(created_at=0.0, expires_at=часы.t + ttl))
+
+    часы.t = ttl - 1  # 599 — почти весь TTL подготовки истёк, операция ещё pending
+    await store.take("p1", "sess-1")
+    await store.finish("p1", status="committed", result="[[ok:done]]")
+
+    часы.t = ttl + ttl // 2  # 900: по старому правилу (expires_at не продлён) — уже за 600
+    снова = await store.take("p1", "sess-1")
+    assert снова.status == "committed"
+    assert снова.result == "[[ok:done]]"
+
+    часы.t = 2 * ttl  # 1200: новое окно (599 + 600 = 1199) тоже истекло
+    with pytest.raises(WriteError) as отказ:
+        await store.take("p1", "sess-1")
+    assert отказ.value.code == "pending_unknown"
+
+    удалено = await store.purge()
+    assert удалено == 1
+
+
 async def test_deadline_считает_от_часов_стора_а_не_от_настоящего_времени():
     # Ловушка, которая уже один раз подвела этот файл (см. отчёт задачи 3): если вызывающий код
     # проставляет `expires_at` от СВОИХ часов, а стор проверяет TTL от СВОИХ — при подмене часов
