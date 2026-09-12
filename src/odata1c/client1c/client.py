@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json as json_mod
 import urllib.parse
-from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
@@ -215,7 +214,7 @@ class Client1C:
         headers: dict | None = None,
         add_format: bool = True,
         timeout: float | None = None,
-        scrub: Callable[[str], str] | None = None,
+        scrub: Scrub | None = None,
     ) -> httpx.Response:
         путь = _экранировать_путь(path)
         params = dict(params or {})
