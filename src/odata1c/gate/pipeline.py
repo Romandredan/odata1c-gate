@@ -26,7 +26,7 @@ from odata1c.gate.masking import (
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
 from odata1c.gate.tokens import parse_token
-from odata1c.gate.unmasking import Unmasker, open_literal_refusal
+from odata1c.gate.unmasking import Unmasker, open_literal_refusal, token_fragment_refusal
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
 # по политике конкретной базы нет, поэтому страж проверяет по максимально строгому уровню —
@@ -247,14 +247,16 @@ class BaseGate:
         `inbound_write` открытый литерал в тело пропускает — там пишется новое значение, — но
         подготовка `update` сравнивает его с текущим и отвечает «изменений нет», то есть задаёт
         тот же вопрос, что `ДатаРождения eq datetime'…'`, запрещённый на чтении. Класс — входной
-        (`field_class`), как у отбора. Не строка — не литерал: тип проверяет вызывающий."""
+        (`field_class`), как у отбора. Не строка — не литерал: тип проверяет вызывающий. Строка с
+        токеном внутри или его обрезком получает `token_partial`, как на чтении, где этот код
+        стоит раньше общего отказа (`unmasking.token_fragment_refusal`)."""
         if self.mode == "off" or not isinstance(value, str) or parse_token(value) is not None:
             return
         отказ = open_literal_refusal(
             self.field_class(entity, field, shape=shape, strict=strict), field, value
         )
         if отказ is not None:
-            raise отказ
+            raise token_fragment_refusal(value) or отказ
 
     def mask(
         self,
