@@ -212,6 +212,28 @@ class BaseGate:
             key, entity=entity, strict=strict, revealed=revealed
         )
 
+    def inbound_write(
+        self,
+        data: dict,
+        *,
+        entity: str,
+        shape: Shape,
+        current: dict | None,
+        revealed: RevealedValues,
+        strict: bool = False,
+    ) -> dict:
+        """Тело PATCH/POST пишущего тула M2: токены → реальные значения (Б-1). `current` —
+        текущее состояние объекта так, как его вернул `client.get(..., scrub=self.scrubber(
+        revealed))` (update), `None` — для create. Правило — `Unmasker.write`: написание берётся
+        из текущего значения поля, иначе единственное известное словарю, иначе отказ
+        `token_ambiguous`; молчаливого выбора нет. Анти-оракульные и классовые правила — те же,
+        что у `inbound_value`. `revealed`, `shape`, `strict` — как у `inbound_filter`."""
+        if self.mode == "off":
+            return data
+        return self._обратная_подмена(shape).write(
+            data, entity=entity, current=current, revealed=revealed, strict=strict
+        )
+
     def mask(
         self,
         data,
