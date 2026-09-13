@@ -26,6 +26,8 @@ import respx
 import test_write_commit as к
 from conftest import без_навигаций, ничего_не_скрыто, строение_неизвестно
 
+from odata1c.gate.pipeline import BaseGate
+from odata1c.gate.service import policy_path
 from odata1c.registry.registry import SessionScope
 from odata1c.write.journal import Journal
 from odata1c.write.pending import PendingOp
@@ -644,6 +646,11 @@ async def test_журнал_только_видимые_базы(среда, о�
 
     assert [з["commit_id"] for з in все["entries"]] == [на_idn["commit_id"], на_ut["commit_id"]]
     assert [з["commit_id"] for з in видимые["entries"]] == [на_ut["commit_id"]]
+    # Строки невидимой базы не читаются вовсе — ни предупреждения о них, ни съеденного `limit`
+    # (последняя по времени запись — на невидимой базе).
+    assert видимые["warnings"] == [] and видимые["bases"] == ["ut"]
+    последняя = json.loads(await журнал(среда, scope=только_ut, limit=1))
+    assert [з["commit_id"] for з in последняя["entries"]] == [на_ut["commit_id"]]
     assert к.ошибка(чужая)["code"] == "base_unknown"
     assert на_idn["commit_id"] not in чужая
 
@@ -726,3 +733,164 @@ async def test_ключ_записи_регистра_в_откате_и_жур�
     await выполнено(среда, откат["pending_id"])
     assert к._путь(одинс.patch.calls.last.request) == путь
     assert json.loads(одинс.тела_записи[-1]) == {"Комментарий": "проверен"}
+
+
+# ---------------------------------------------------------------------------------------------
+# Журнал: скрытые сущности и неисправные базы, страж смешанного ответа
+# ---------------------------------------------------------------------------------------------
+
+СКРЫТАЯ = "Catalog_Валюты"
+# Потомок скрытой сущности, которого нет в индексе (реиндекс его убрал): имя содержит имя
+# родителя целиком — Ruling 30.
+ПОТОМОК_СКРЫТОЙ = f"{СКРЫТАЯ}_Представления"
+
+
+def скрыть(дом, база: str, сущность: str) -> None:
+    путь = policy_path(дом, база)
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + f"entities:\n  {сущность}: {{hide: true}}\n",
+        encoding="utf-8",
+    )
+
+
+def строки_скрытых_и_видимой(путь_журнала, *, base="ut") -> None:
+    for номер, сущность in enumerate((СКРЫТАЯ, ПОТОМОК_СКРЫТОЙ, КОНТРАГЕНТЫ)):
+        записать_в_журнал(
+            путь_журнала,
+            commit_id=f"c-{base}-{номер}",
+            base=base,
+            entity=сущность,
+            op="update",
+            key={"Ref_Key": ССЫЛКА},
+            request={"method": "PATCH", "path": "x", "json": {"Description": НАЗВАНИЕ}},
+            before={"Description": НАЗВАНИЕ},
+        )
+
+
+async def test_журнал_скрытая_сущность_не_видна_с_индексом_и_без(дом, tmp_path, одинс):
+    """Строка скрытой сущности не показывается ни с индексом, ни без него: без индекса родство
+    неизвестно, и отбор идёт по вхождению имени корня запрета (отказ закрытый, как у разницы
+    `reindex`)."""
+    скрыть(дом, "ut", СКРЫТАЯ)
+    путь = tmp_path / "journal.sqlite"
+    строки_скрытых_и_видимой(путь)
+
+    for без_индекса in (False, True):
+        if без_индекса:
+            к.index_path(дом, "ut").unlink()
+        среда = к.Среда(дом, путь)
+        try:
+            текст = await журнал(среда, base="ut")
+        finally:
+            await среда.tools.aclose()
+        assert СКРЫТАЯ not in текст, без_индекса
+        ответ = json.loads(текст)
+        [видимая] = ответ["entries"]
+        assert видимая["entity"] == КОНТРАГЕНТЫ
+        assert any("не показана" in п for п in ответ["warnings"])
+        к.нет_реальных_значений(текст)
+        if без_индекса:
+            assert видимая["before"] is None and видимая["request"] is None
+
+
+async def test_журнал_база_с_битой_политикой_строки_не_показаны(дом, tmp_path, одинс):
+    """Гейта нет — неизвестно, что скрыто: строки такой базы не показываются вовсе, остальные
+    базы — как обычно."""
+    путь = tmp_path / "journal.sqlite"
+    строки_скрытых_и_видимой(путь, base="idn")
+    записать_в_журнал(
+        путь,
+        commit_id="c-ut",
+        entity=КОНТРАГЕНТЫ,
+        op="update",
+        key={"Ref_Key": ССЫЛКА},
+        request={"method": "PATCH", "path": "x", "json": {"ИНН": ИНН}},
+        before={"ИНН": НОВЫЙ_ИНН},
+    )
+    policy_path(дом, "idn").write_text("entities: [сломано\n", encoding="utf-8")
+    среда = к.Среда(дом, путь)
+    try:
+        текст = await журнал(среда)
+    finally:
+        await среда.tools.aclose()
+
+    ответ = json.loads(текст)
+    assert [з["commit_id"] for з in ответ["entries"]] == ["c-ut"]
+    assert СКРЫТАЯ not in текст and "c-idn" not in текст
+    assert any("гейт их базы недоступен" in п for п in ответ["warnings"])
+    к.нет_реальных_значений(текст)
+
+
+# База с гейтом `off` первой в `bases.yaml` — как `trade_dev` у владельца.
+BASES_YAML_DEV_ПЕРВОЙ = f"""
+default: dev
+bases:
+  dev:
+    label: разработка
+    url: {к.URL_IDN}
+    user: u
+    password: p
+    role: dev
+""" + к.BASES_YAML.split("bases:\n", 1)[1]
+
+
+def дом_с(tmp_path, edmx: bytes, bases_yaml: str):
+    home = tmp_path / "home"
+    к.main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(bases_yaml, encoding="utf-8")
+    config = к.load_config(home)
+    for имя in config.bases:
+        хранилище = к.IndexRepository(к.index_path(home, имя))
+        хранилище.write(к.parse_edmx(edmx))
+        хранилище.close()
+        к.refresh_policy(home, config.bases[имя])
+    return home
+
+
+@pytest.mark.parametrize("путь_ответа", ["успех", "ошибка"])
+async def test_журнал_всех_баз_через_гейт_строжайшей(
+    tmp_path, edmx_ut_real, одинс, monkeypatch, путь_ответа
+):
+    """Первой среди видимых баз (реестр отдаёт их по алфавиту) стоит база с гейтом `off`: ответ
+    журнала и его ошибка всё равно проходят стража уровня названий — у `_run` путь ошибки идёт
+    через гейт первой базы, поэтому строжайшая база ставится первой."""
+    дом = дом_с(tmp_path, edmx_ut_real, BASES_YAML_DEV_ПЕРВОЙ)
+    настоящий_finish = BaseGate.finish
+    прошли: list[tuple[str, str]] = []
+
+    def finish(self, конверт, revealed=None):
+        текст = настоящий_finish(self, конверт, revealed)
+        прошли.append((self.mode, текст))
+        return текст
+
+    monkeypatch.setattr(BaseGate, "finish", finish)
+    путь = tmp_path / "journal.sqlite"
+    записать_в_журнал(
+        путь,
+        commit_id="c-ut",
+        entity=КОНТРАГЕНТЫ,
+        op="update",
+        key={"Ref_Key": ССЫЛКА},
+        request={"method": "PATCH", "path": "x", "json": {"ИНН": НОВЫЙ_ИНН}},
+        before={"ИНН": ИНН},
+    )
+    среда = к.Среда(дом, путь)
+    try:
+        assert среда.tools._config.bases["dev"].gate.mode == "off"
+        if путь_ответа == "ошибка":
+
+            def сбой(self, base, limit):
+                raise RuntimeError("сбой чтения журнала")
+
+            monkeypatch.setattr(Journal, "recent", сбой)
+        текст = await журнал(среда)
+    finally:
+        await среда.tools.aclose()
+
+    assert ("identifiers+names", текст) in прошли
+    к.нет_реальных_значений(текст)
+    if путь_ответа == "успех":
+        [запись] = json.loads(текст)["entries"]
+        assert запись["before"]["ИНН"].startswith("[[inn:")
+    else:
+        assert к.ошибка(текст)["code"] == "internal"
