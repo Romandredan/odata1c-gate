@@ -1258,6 +1258,62 @@ async def test_Н6r2_3_шаги_владельца_раньше_шагов_та�
     assert not одинс.обращались and стор._ops == {}
 
 
+# --- И-7: база с выключенным гейтом ------------------------------------------------------------
+
+BASES_С_DEV = (
+    BASES_YAML
+    + f"""  dev:
+    label: копия для разработки, гейт выключен
+    url: {URL_UT}
+    user: u
+    password: p
+    role: dev
+"""
+)
+
+
+@pytest.fixture
+async def среда_dev(tmp_path, edmx_ut_real):
+    запись, стор, tools, журнал = await _среда_на(tmp_path, edmx_ut_real, BASES_С_DEV)
+    assert tools._gate_for(tools._config.bases["dev"]).mode == "off"
+    yield запись, стор, tools
+    журнал.close()
+    await tools.aclose()
+
+
+async def test_И7_create_с_токеном_на_базе_без_гейта_отказ(среда_dev, одинс):
+    """И-7 итогового ревью M2: роль `dev` по умолчанию — гейт `off` и запись включена. Токен из
+    ответа базы с гейтом (словарь общий) раньше уходил в 1С текстом `[[inn:…]]`, и превью
+    показывало то же. Теперь — отказ до 1С; без токена `create` готовится."""
+    запись, стор, tools = среда_dev
+    ток = токен(tools, ИНН)
+
+    отказ = ошибка(await создать(запись, {"Description": "ООО Проба", "ИНН": ток}, base="dev"))
+    годное = json.loads(await создать(запись, {"Description": "ООО Проба", "ИНН": ИНН}, base="dev"))
+
+    assert отказ["code"] == "params_invalid" and "гейт этой базы выключен" in отказ["message"]
+    assert "pending_id" in годное
+    [операция] = стор._ops.values()
+    assert операция.request["json"]["ИНН"] == ИНН
+    assert not одинс.обращались
+
+
+async def test_И7_отбор_с_токеном_на_базе_без_гейта_отказ_без_1С(среда_dev, одинс):
+    """Чтение на уровне `off`: токен в отборе уходил в 1С текстом, и ответ был пустым вместо
+    записи. Та же правка гейта отклоняет его до 1С."""
+    _, _, tools = среда_dev
+    ток = токен(tools, ИНН)
+
+    отказ = ошибка(
+        await tools.query(
+            SessionScope(), base="dev", entity=КОНТРАГЕНТЫ, filter=f"ИНН eq '{ток}'", top=1
+        )
+    )
+
+    assert отказ["code"] == "params_invalid" and "гейт этой базы выключен" in отказ["message"]
+    assert not одинс.обращались
+
+
 BASES_DENY_КИ = BASES_YAML.replace(
     "deny_fields: [", f"deny_entities: [{КИ}]\n      deny_fields: [", 1
 )

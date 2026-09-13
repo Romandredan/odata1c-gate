@@ -25,8 +25,13 @@ from odata1c.gate.masking import (
 )
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
-from odata1c.gate.tokens import parse_token
-from odata1c.gate.unmasking import Unmasker, open_literal_refusal, token_fragment_refusal
+from odata1c.gate.tokens import find_tokens, is_partial_token, parse_token
+from odata1c.gate.unmasking import (
+    GateError,
+    Unmasker,
+    open_literal_refusal,
+    token_fragment_refusal,
+)
 
 # Уровень для ответов, у которых база не определена (неизвестная база в запросе): классов полей
 # по политике конкретной базы нет, поэтому страж проверяет по максимально строгому уровню —
@@ -37,6 +42,33 @@ from odata1c.gate.unmasking import Unmasker, open_literal_refusal, token_fragmen
 ПУСТАЯ_ДАТА_1С = "0001-01-01T00:00:00"
 
 _log = logging.getLogger(__name__)
+
+
+def _несёт_токен(значение) -> bool:
+    """Строка входа (на любой глубине словаря или списка) с токеном шлюза — целым, внутри текста
+    или обрезком (`is_partial_token`: оборванный, испорченный, неверный регистр класса)."""
+    if isinstance(значение, str):
+        return bool(find_tokens(значение)) or is_partial_token(значение)
+    if isinstance(значение, dict):
+        return any(_несёт_токен(ключ) or _несёт_токен(поле) for ключ, поле in значение.items())
+    if isinstance(значение, list | tuple):
+        return any(_несёт_токен(элемент) for элемент in значение)
+    return False
+
+
+def _отказ_токена_без_гейта(значение) -> None:
+    """И-7 итогового ревью M2: на уровне `off` гейт ничего не раскрывает, и токен уходил в 1С
+    текстом `[[inn:…]]` — в тело записи (порча данных: роль `dev` по умолчанию с гейтом `off` и
+    включённой записью), в отбор (пустой ответ вместо записи), в ключ и параметр. Модель берёт
+    токен из ответа базы с гейтом (словарь общий) и по инструкции подставляет «как есть». Отказ
+    одинаков на всех входах; ввод модели в текст не идёт (Ruling 51, 54)."""
+    if _несёт_токен(значение):
+        raise GateError(
+            "params_invalid",
+            "гейт этой базы выключен — токены не раскрываются, передайте значение",
+            "на базе с уровнем гейта off токен из ответа другой базы ушёл бы в 1С текстом "
+            "[[…]]; передайте значение, продиктованное пользователем",
+        )
 
 
 class BaseGate:
@@ -176,6 +208,7 @@ class BaseGate:
 
         `shape` — строение сущностей по индексу (Ruling 35), см. `field_class`."""
         if self.mode == "off":
+            _отказ_токена_без_гейта(expression)
             return expression
         return self._обратная_подмена(shape).filter(
             expression, entity=entity, strict=strict, revealed=revealed
@@ -195,6 +228,7 @@ class BaseGate:
         возможно только при известном поле и совпадении класса — см. `unmasking._раскрыть`.
         `revealed` — набор вызова, `shape` — строение по индексу; см. `inbound_filter`."""
         if self.mode == "off":
+            _отказ_токена_без_гейта(text)
             return text
         return self._обратная_подмена(shape).value(
             text, entity=entity, field=field, strict=strict, revealed=revealed
@@ -212,6 +246,7 @@ class BaseGate:
         """Ключ записи от модели. `revealed` — набор вызова, `shape` — строение по индексу; см.
         `inbound_filter`."""
         if self.mode == "off":
+            _отказ_токена_без_гейта(key)
             return key
         return self._обратная_подмена(shape).key(
             key, entity=entity, strict=strict, revealed=revealed
@@ -241,6 +276,7 @@ class BaseGate:
         (`unmasking.number_tokens`) и номер строки; место для текста отказа гейт строит сам по
         индексу, строки от вызывающего там нет; см. `Unmasker.write`."""
         if self.mode == "off":
+            _отказ_токена_без_гейта(data)
             return data
         return self._обратная_подмена(shape).write(
             data,

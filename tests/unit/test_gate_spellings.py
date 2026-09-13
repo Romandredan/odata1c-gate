@@ -558,10 +558,10 @@ def test_inbound_write_разрешает_токен_по_правилу_зап�
     assert ошибка.value.code == "token_ambiguous"
 
 
-def test_inbound_write_на_уровне_off_тело_как_есть(tmp_path, связка):
+def test_inbound_write_на_уровне_off_тело_без_токенов_как_есть(tmp_path, связка):
     словарь, _ = связка
     гейт = _гейт(tmp_path, словарь, "off")
-    тело = {"ИНН": "[[inn:ZZZZZZZZZZ]]"}
+    тело = {"ИНН": ИНН, "Комментарий": "[текущий] без токена"}
 
     assert (
         гейт.inbound_write(
@@ -569,6 +569,78 @@ def test_inbound_write_на_уровне_off_тело_как_есть(tmp_path, 
         )
         == тело
     )
+
+
+ТОКЕНЫ_НА_OFF = [
+    pytest.param("[[inn:ZZZZZZZZZZ]]", id="целый-токен"),
+    pytest.param("ИНН [[inn:ZZZZZZZZZZ]] проверен", id="токен-в-тексте"),
+    pytest.param("[[inn:ZZZZ", id="обрезок"),
+]
+
+
+@pytest.mark.parametrize("значение", ТОКЕНЫ_НА_OFF)
+def test_И7_на_уровне_off_токен_на_входе_отказ(tmp_path, связка, значение):
+    """И-7 итогового ревью M2: на базе с выключенным гейтом (умолчание роли `dev`) токен не
+    раскрывается — прежде он уходил в 1С текстом `[[inn:…]]`: в тело записи (порча данных копии),
+    в отбор (пустой ответ вместо записи), в ключ и параметр. Теперь — `params_invalid` на любом
+    входе: теле, отборе, ключе и значении; целый токен, токен в тексте и обрезок."""
+    словарь, _ = связка
+    гейт = _гейт(tmp_path, словарь, "off")
+    нет_строения = lambda _: None  # noqa: E731
+    вызовы = [
+        lambda: гейт.inbound_write(
+            {"Комментарий": значение},
+            entity=КОНТРАГЕНТЫ,
+            shape=нет_строения,
+            current=None,
+            revealed=RevealedValues(),
+        ),
+        lambda: гейт.inbound_write(
+            {"КонтактнаяИнформация": [{"Представление": значение}]},
+            entity=КОНТРАГЕНТЫ,
+            shape=нет_строения,
+            current=None,
+            revealed=RevealedValues(),
+        ),
+        lambda: гейт.inbound_filter(
+            f"ИНН eq '{значение}'",
+            entity=КОНТРАГЕНТЫ,
+            revealed=RevealedValues(),
+            shape=нет_строения,
+        ),
+        lambda: гейт.inbound_key(
+            {"ИНН": значение}, entity=КОНТРАГЕНТЫ, revealed=RevealedValues(), shape=нет_строения
+        ),
+        lambda: гейт.inbound_value(
+            значение,
+            entity=КОНТРАГЕНТЫ,
+            field="ИНН",
+            revealed=RevealedValues(),
+            shape=нет_строения,
+        ),
+    ]
+    for вызов in вызовы:
+        with pytest.raises(GateError) as отказ:
+            вызов()
+        assert отказ.value.code == "params_invalid"
+        assert "гейт этой базы выключен" in str(отказ.value)
+        assert "ZZZZ" not in str(отказ.value) + отказ.value.hint
+
+
+def test_И7_на_уровне_off_отбор_и_ключ_без_токенов_как_есть(tmp_path, связка):
+    словарь, _ = связка
+    гейт = _гейт(tmp_path, словарь, "off")
+    выражение = f"ИНН eq '{ИНН}' and Description eq 'Скобки [x]'"
+
+    assert (
+        гейт.inbound_filter(
+            выражение, entity=КОНТРАГЕНТЫ, revealed=RevealedValues(), shape=lambda _: None
+        )
+        == выражение
+    )
+    assert гейт.inbound_key(
+        {"ИНН": ИНН}, entity=КОНТРАГЕНТЫ, revealed=RevealedValues(), shape=lambda _: None
+    ) == {"ИНН": ИНН}
 
 
 def test_ошибка_неоднозначности_без_значений_в_ответе_тула(tmp_path, связка):
