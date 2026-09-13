@@ -9,8 +9,10 @@
 """
 
 import contextlib
+import dataclasses
 import json
 import re
+import urllib.parse
 
 import httpx
 import pytest
@@ -2268,3 +2270,253 @@ async def test_token_ambiguous_не_повторяет_токен(среда, о
     assert отказ["code"] == "token_ambiguous"
     assert ток not in отказ["message"] and "[[" not in отказ["message"]
     assert "первый токен в теле записи" in отказ["message"] and "«ИНН»" in отказ["message"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Н-5, Н-6: путь `raw_get` — те же правила отбора, что у `query`, и ни байта пути в ответе
+# ---------------------------------------------------------------------------------------------
+
+ДОКУМЕНТЫ_ЛИЦ = "InformationRegister_ДокументыФизическихЛиц"
+СРЕЗ_ДОКУМЕНТОВ = f"{ДОКУМЕНТЫ_ЛИЦ}_SliceLast"
+ПОДСТРОКА_СЕРИИ = "substringof('45', Серия)"
+
+# Три формы ревью: каждую `query` с `params` отклоняет правилами отбора (SPEC §6.7), и ровно их
+# путь `raw_get` отправлял в 1С как есть.
+УСЛОВИЯ_ОРАКУЛА = [
+    pytest.param(ПОДСТРОКА_СЕРИИ, id="подстрока-серии"),
+    pytest.param(
+        "Физлицо/ДатаРождения eq datetime'1990-01-01T00:00:00'", id="открытая-дата-рождения"
+    ),
+    pytest.param("length(Серия) eq 4", id="функция-над-серией"),
+]
+
+
+def _в_путь(выражение: str) -> str:
+    """Строковый литерал OData в пути: апостроф внутри удваивается."""
+    return выражение.replace("'", "''")
+
+
+def _отказ_пути_raw_get(отказ: dict) -> None:
+    assert отказ["code"] == "params_invalid", отказ
+    assert "odata1c_query" in отказ["hint"] and "params" in отказ["hint"], отказ
+
+
+async def _отказ_raw_get(tools, path: str, query: dict | None = None) -> dict:
+    return ошибка(await tools.raw_get(SessionScope(), base="ut", path=path, query=query))
+
+
+@pytest.mark.parametrize("условие", УСЛОВИЯ_ОРАКУЛА)
+async def test_Н6_условие_оракула_отклоняется_и_в_query_и_в_пути_raw_get(среда, одинс, условие):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    через_query = await _отказ_чтения(tools, СРЕЗ_ДОКУМЕНТОВ, params={"Condition": условие})
+    через_путь = await _отказ_raw_get(
+        tools, f"{ДОКУМЕНТЫ_ЛИЦ}/SliceLast(Condition='{_в_путь(условие)}')"
+    )
+
+    assert через_query["code"] == "filter_syntax"
+    _отказ_пути_raw_get(через_путь)
+    assert not одинс.get.called
+
+
+# Написания той же виртуальной таблицы с аргументами в пути. Шлюз их не разбирает и не угадывает,
+# какое из них 1С примет: любой аргумент в скобках после первого сегмента — отказ.
+ПУТИ_С_АРГУМЕНТАМИ = [
+    pytest.param("{т}/slicelast(Condition='{у}')", id="регистр-имени"),
+    pytest.param("{т}/SliceLast (Condition='{у}')", id="пробел-перед-скобкой"),
+    pytest.param("{т}/SliceLast( Condition = '{у}' )", id="пробелы-внутри"),
+    pytest.param("{т}/SliceFirst(Condition='{у}')", id="другая-таблица"),
+    pytest.param("{т}/SliceLast(Period=datetime'2026-01-01T00:00:00',Condition='{у}')", id="два"),
+    pytest.param("{т}/SliceLast(Condition='{у} or Номер eq ''a/b''')", id="косая-в-кавычках"),
+    pytest.param("{т}/SliceLast(condition='{у}')", id="регистр-параметра"),
+    pytest.param("{т}/НеизвестноеДействие(Условие='{у}')", id="неизвестное-действие"),
+    pytest.param("{т}_SliceLast(Condition='{у}')", id="имя-из-индекса-первым-сегментом"),
+]
+
+
+@pytest.mark.parametrize("шаблон", ПУТИ_С_АРГУМЕНТАМИ)
+async def test_Н6_аргументы_в_пути_raw_get_отклоняются_до_1С(среда, одинс, шаблон):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+    путь = шаблон.format(т=ДОКУМЕНТЫ_ЛИЦ, у=_в_путь(ПОДСТРОКА_СЕРИИ))
+
+    отказ = await _отказ_raw_get(tools, путь)
+
+    assert отказ["code"] == "params_invalid", отказ
+    assert "45" not in json.dumps(отказ, ensure_ascii=False)
+    assert not одинс.get.called
+
+
+async def test_Н6_процентная_запись_пути_отклоняется_до_1С(среда, одинс):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+    условие = urllib.parse.quote(f"Condition='{_в_путь(ПОДСТРОКА_СЕРИИ)}'", safe="")
+
+    for путь in (
+        f"{ДОКУМЕНТЫ_ЛИЦ}/SliceLast({условие})",
+        f"{ДОКУМЕНТЫ_ЛИЦ}/SliceLast%28{условие}%29",
+    ):
+        отказ = await _отказ_raw_get(tools, путь)
+        assert отказ["code"] == "params_invalid", отказ
+
+    assert not одинс.get.called
+
+
+async def test_Н6_токен_в_условии_раскрывается_в_query_а_путь_raw_get_отклоняется(среда, одинс):
+    """Правила одинаковы для обоих путей: токен в `Condition` через `query` раскрывается гейтом, а
+    тот же `Condition` в пути `raw_get` не уходит в 1С вовсе — ни токеном, ни значением."""
+    _, _, tools, _ = среда
+    серия = токен(tools, "4512", entity=ДОКУМЕНТЫ_ЛИЦ, поле="Серия")
+    assert серия.startswith("[[doc:"), серия
+    условие = f"Серия eq '{серия}'"
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    ответ = json.loads(
+        await tools.query(
+            SessionScope(), base="ut", entity=СРЕЗ_ДОКУМЕНТОВ, params={"Condition": условие}
+        )
+    )
+    assert "error" not in ответ, ответ
+    отправлено = urllib.parse.unquote(str(одинс.get.calls[-1].request.url))
+    assert "4512" in отправлено and серия not in отправлено
+    вызовов = одинс.get.call_count
+
+    отказ = await _отказ_raw_get(tools, f"{ДОКУМЕНТЫ_ЛИЦ}/SliceLast(Condition='{условие}')")
+
+    _отказ_пути_raw_get(отказ)
+    assert серия not in json.dumps(отказ, ensure_ascii=False)
+    assert одинс.get.call_count == вызовов
+
+
+@pytest.mark.parametrize(
+    "имя", ["Condition", "condition", " Condition ", "AccountCondition", "BalancedAccountCondition"]
+)
+async def test_Н6_условие_в_query_raw_get_отклоняется_до_1С(среда, одинс, имя):
+    """Параметр действия OData v3 может прийти и строкой запроса — `SliceLast?Condition=…`."""
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    отказ = await _отказ_raw_get(tools, f"{ДОКУМЕНТЫ_ЛИЦ}/SliceLast", {имя: ПОДСТРОКА_СЕРИИ})
+
+    _отказ_пути_raw_get(отказ)
+    assert not одинс.get.called
+
+
+@pytest.mark.parametrize("имя", ["$Filter", "$FILTER", " $filter", "$filter ", "filter"])
+async def test_Н6_написание_имени_filter_не_обходит_гейт(среда, одинс, имя):
+    """Имена параметров `raw_get` сравнивались дословно: `$Filter` уходил в 1С мимо разбора."""
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    отказ = await _отказ_raw_get(tools, ДОКУМЕНТЫ_ЛИЦ, {имя: ПОДСТРОКА_СЕРИИ})
+
+    assert отказ["code"] == "filter_syntax", отказ
+    assert not одинс.get.called
+
+
+async def test_Н6_написание_имени_filter_приводится_к_каноническому(среда, одинс):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    ответ = json.loads(
+        await tools.raw_get(
+            SessionScope(), base="ut", path=ДОКУМЕНТЫ_ЛИЦ, query={"$Filter": "Номер eq '1'"}
+        )
+    )
+
+    assert "error" not in ответ, ответ
+    параметры = одинс.get.calls[-1].request.url.params
+    assert параметры.get("$filter") == "Номер eq '1'" and "$Filter" not in параметры
+
+
+@pytest.mark.parametrize(
+    "запрос",
+    [
+        pytest.param({"$OrderBy": "Серия"}, id="сортировка"),
+        pytest.param({"$Format": "xml"}, id="формат"),
+        pytest.param({"$filter": "Номер eq '1'", "$Filter": "Номер eq '2'"}, id="дубль"),
+    ],
+)
+async def test_Н6_написание_остальных_параметров_не_обходит_проверки(среда, одинс, запрос):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    отказ = await _отказ_raw_get(tools, ДОКУМЕНТЫ_ЛИЦ, запрос)
+
+    assert отказ["code"] == "params_invalid", отказ
+    assert not одинс.get.called
+
+
+async def test_Н6_составной_ключ_в_пути_raw_get_отклоняется_до_1С(среда, одинс):
+    """Значение ключа в пути гейт не видит: токен не раскрыт, открытый литерал не проверен. У
+    `get` с `key` те же значения проходят правила гейта — туда и подсказка."""
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    отказ = await _отказ_raw_get(
+        tools, f"{КУРСЫ}(Period=datetime'2026-01-01T00:00:00',Валюта_Key=guid'{ССЫЛКА}')"
+    )
+
+    assert отказ["code"] == "params_invalid", отказ
+    assert "odata1c_get" in отказ["hint"], отказ
+    assert not одинс.get.called
+
+
+async def test_Н6_параметр_условия_виртуальной_таблицы_с_любым_именем_проходит_гейт(
+    среда, одинс, monkeypatch
+):
+    """У регистров бухгалтерии БП выражение отбора стоит и в `AccountCondition`,
+    `BalancedAccountCondition`: `query` прогонял через гейт только `Condition`."""
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+    исходный = IndexRepository.describe
+
+    def describe(self, name):
+        описание = исходный(self, name)
+        if описание is not None and описание.name == СРЕЗ_ДОКУМЕНТОВ:
+            действие = dict(описание.actions[0])
+            действие["params"] = {**действие["params"], "AccountCondition": "Edm.String"}
+            описание = dataclasses.replace(описание, actions=[действие])
+        return описание
+
+    monkeypatch.setattr(IndexRepository, "describe", describe)
+
+    отказ = await _отказ_чтения(
+        tools, СРЕЗ_ДОКУМЕНТОВ, params={"AccountCondition": ПОДСТРОКА_СЕРИИ}
+    )
+
+    assert отказ["code"] == "filter_syntax", отказ
+    assert not одинс.get.called
+
+
+async def test_Н5_успешный_raw_get_не_повторяет_путь(среда, одинс):
+    """Путь в ответе — эхо ввода модели: цифры, известные словарю, страж превращал в токен."""
+    _, _, tools, _ = среда
+    т = _метка_в_словаре(tools)
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    for путь in (
+        f"Catalog_Новый{ЦИФРЫ_ТЕЛЕФОНА}",
+        f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/{ИМЯ_С_МЕТКОЙ}",
+    ):
+        текст = await tools.raw_get(SessionScope(), base="ut", path=путь)
+        ответ = json.loads(текст)
+        assert "error" not in ответ, ответ
+        assert "path" not in ответ and "entity" not in ответ, ответ
+        _без_метки(ответ, т)
+        assert "guard_replaced" not in текст
+
+
+async def test_Н5_entity_остаётся_на_пути_из_индекса(среда, одинс):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+
+    ответ = json.loads(
+        await tools.raw_get(
+            SessionScope(), base="ut", path=f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/КонтактнаяИнформация"
+        )
+    )
+
+    assert ответ["entity"] == f"{КОНТРАГЕНТЫ}_КонтактнаяИнформация"
+    assert "path" not in ответ

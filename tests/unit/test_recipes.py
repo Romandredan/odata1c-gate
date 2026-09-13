@@ -1069,3 +1069,31 @@ def test_шаблон_ут_сверен_с_полным_дампом(индек�
         if описание.is_virtual:
             схема = описание.actions[0]["params"]
             assert set(р.virtual) <= set(схема), f"{имя}: у {р.virtual_kind} нет таких параметров"
+
+
+@pytest.mark.parametrize(
+    "параметр",
+    [
+        'AccountCondition: "{условие}"',
+        "BalancedAccountCondition: \"Code eq '60.01'\"",
+        'condition: "{условие}"',
+    ],
+    ids=["подстановка", "постоянное", "регистр-имени"],
+)
+def test_выражение_отбора_виртуальной_таблицы_только_в_Condition(tmp_path, параметр):
+    """Н-6 ревью Ruling 54: параметр виртуальной таблицы — одно значение, и шаблон `{условие}`
+    отдал бы значение модели в `AccountCondition` (регистры бухгалтерии БП) целым выражением
+    отбора, мимо разбора гейта, которым проверяется `Condition`. Такой рецепт отклоняется при
+    чтении файла."""
+    with pytest.raises(RecipeError) as отказ:
+        рецепт(
+            tmp_path,
+            f"""    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      условие: {{ type: string }}
+    virtual:
+      {параметр}
+""",
+        )
+    assert отказ.value.code == "config_invalid"
+    assert "Condition" in отказ.value.message
