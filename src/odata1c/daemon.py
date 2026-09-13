@@ -398,18 +398,39 @@ class _GateServer(MCPServer):
     `pydantic.ValidationError` целиком — с `input_value=<то, что прислала модель>` (проверено
     исполнением: `pending_id={"ИНН": …}` возвращался в отказе как есть). Этот текст идёт мимо
     гейта и стража. Здесь он заменяется отказом `params_invalid` в формате SPEC §5.2: имя тула,
-    имена аргументов и что с ними не так — через стража сервиса, как любой отказ без базы."""
+    имена аргументов и что с ними не так — через стража сервиса, как любой отказ без базы.
 
-    def __init__(self, *args, refuse: Callable[[str, str, str], str], **kwargs) -> None:
+    Второй канал того же рода — сбой обёртки тула вне сервиса (ключ сессии, клиент, механизм,
+    разбор области видимости): методы сервисов исключений не бросают, а обёртка до них — может.
+    SDK превращает такой сбой в `UnexpectedToolError` и отдаёт клиенту голую строку «Error
+    executing tool …» — не формат §5.2 и мимо стража, — а в журнал демона пишет
+    `logger.exception` с текстом исходного исключения. Здесь он становится отказом `internal`
+    через стража сервиса, а трассировка идёт через ту же защиту журнала, что у `ToolService`
+    (`trace`)."""
+
+    def __init__(
+        self,
+        *args,
+        refuse: Callable[[str, str, str], str],
+        trace: Callable[[str], None],
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._отказ = refuse
+        self._трассировка = trace
 
     async def call_tool(self, name, arguments, context=None):
         try:
             return await super().call_tool(name, arguments, context)
+        except UnexpectedToolError:
+            # Имя тула здесь — зарегистрированного: на незнакомое SDK отвечает `ToolError`.
+            self._трассировка(f"тул {name} упал вне сервиса — отдан отказ internal")
+            raise ToolError(
+                self._отказ("internal", "внутренняя ошибка шлюза, подробности в журнале демона", "")
+            ) from None
         except ToolError as ошибка:
             причина = ошибка.__cause__
-            if isinstance(ошибка, UnexpectedToolError) or not isinstance(причина, ValidationError):
+            if not isinstance(причина, ValidationError):
                 raise
             raise ToolError(self._отказ_аргументов(name, причина)) from None
 
@@ -453,7 +474,12 @@ def build_server(
     `serve()` передаёт свой, чтобы убирать его хранилище по расписанию.
     """
     слой = write if write is not None else build_write_layer(service)
-    server = _GateServer("odata1c", instructions=INSTRUCTIONS, refuse=service._guard_error)
+    server = _GateServer(
+        "odata1c",
+        instructions=INSTRUCTIONS,
+        refuse=service._guard_error,
+        trace=service._записать_трассировку,
+    )
     аннотации = ToolAnnotations(read_only_hint=True)
     мета = {"anthropic/maxResultSizeChars": limits.result_chars}
 

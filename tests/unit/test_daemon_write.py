@@ -540,6 +540,31 @@ async def test_отказ_SDK_по_аргументу_не_повторяет_в
     assert ИНН not in текст and "input_value" not in текст
 
 
+async def test_сбой_обёртки_демона_вне_сервиса_отказ_internal_через_стража(
+    демон, одинс, monkeypatch, caplog
+):
+    """Обёртка тула делает работу до вызова сервиса (ключ сессии, клиент, механизм) — вне
+    `ToolService._run`. Упав там, она без перехвата ушла бы в SDK: клиенту — голая строка
+    «Error executing tool …» не в формате §5.2 и мимо стража, в журнал демона — трассировка с
+    текстом исключения (SDK сам делает `logger.exception`). Здесь — отказ `internal` через стража
+    сервиса, трассировка — через ту же защиту журнала, что у `ToolService`: значение, известное
+    словарю, в журнал не попадает, класс исключения — попадает."""
+    к.токен(демон.tools, ИНН)  # значение известно словарю — как после любого чтения карточки
+
+    def падает(ctx):
+        raise RuntimeError(f"сломалось на {ИНН}")
+
+    monkeypatch.setattr(демон.слой.keys, "key", падает)
+    async with клиент(демон, ответ=ДА) as кл:
+        результат = await кл.сессия.call_tool("odata1c_commit", {"pending_id": "p"})
+    текст = результат.content[0].text
+    отказ = ошибка(текст)
+    assert отказ["code"] == "internal"
+    assert ИНН not in текст and "RuntimeError" not in текст
+    assert "RuntimeError" in caplog.text
+    assert ИНН not in caplog.text
+
+
 async def test_отказы_commit_и_undo_не_повторяют_идентификатор(демон, одинс):
     выдуманный = "7707083893-не-операция"
     async with клиент(демон, ответ=ДА) as кл:
