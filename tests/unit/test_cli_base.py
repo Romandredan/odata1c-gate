@@ -10,6 +10,7 @@ import yaml
 import odata1c.cli as cli
 from odata1c.cli import main
 from odata1c.config.loader import ConfigError, load_config
+from odata1c.config.writer import ensure_policy_template
 
 URL = "http://localhost/ut/odata/standard.odata/"
 BASES = f"""
@@ -275,6 +276,29 @@ def test_base_add_пароль_не_попадает_в_вывод(tmp_path, mon
     assert "секретный_пароль_только_для_теста" not in вывод
     config = load_config(home)
     assert config.bases["ut"].password == "секретный_пароль_только_для_теста"
+
+
+def test_base_add_создаёт_файл_политики_владельца_из_шаблона(tmp_path, monkeypatch, capsys):
+    """ADR-0015, задача 3: `base add` создаёт `bases/<имя>/policy.yaml` из шаблона, шапка
+    которого называет настоящую базу, а не образец `{{base}}`. Повторное обеспечение (например,
+    следующим реиндексом той же базы) файл не трогает."""
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    путь_политики = home / "bases" / "ut" / "policy.yaml"
+    assert путь_политики.exists()
+    текст = путь_политики.read_text(encoding="utf-8")
+    assert "ut" in текст
+    assert "{{base}}" not in текст
+    assert "создан файл политики владельца" in вывод
+    assert str(путь_политики) in вывод
+
+    assert ensure_policy_template(home, "ut") is False
+    assert путь_политики.read_text(encoding="utf-8") == текст
 
 
 def test_base_import_базу_ut_переносит_несмотря_на_шаблон(tmp_path, capsys):

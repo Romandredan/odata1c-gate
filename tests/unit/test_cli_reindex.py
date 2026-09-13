@@ -49,6 +49,11 @@ def test_reindex_строит_индекс_на_базе_без_индекса(t
     assert код == 0
     assert "индекс обновлён" in вывод
     assert (home / "bases" / "ut" / "metadata.sqlite").exists()
+    # ADR-0015, задача 3: bases.yaml дописан вручную, минуя `base add`, — файла владельца ещё
+    # нет, и reindex создаёт его сам из шаблона, а не требует ручного шага перед первым запуском.
+    путь_политики = home / "bases" / "ut" / "policy.yaml"
+    assert путь_политики.exists()
+    assert f"создан файл политики владельца: {путь_политики}" in вывод
 
 
 @respx.mock

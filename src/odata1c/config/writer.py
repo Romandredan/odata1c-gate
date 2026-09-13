@@ -20,6 +20,7 @@ import time
 
 import yaml
 
+from odata1c.config.home import base_dir
 from odata1c.config.loader import ConfigError
 
 _log = logging.getLogger(__name__)
@@ -40,6 +41,27 @@ def ensure_templates(home: pathlib.Path) -> None:
             continue
         шаблон = importlib.resources.files("odata1c.templates").joinpath(имя_шаблона)
         назначение.write_text(шаблон.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
+    """Файл владельца `bases/<база>/policy.yaml` из шаблона (ADR-0015, план 2026-09-13, задача 3);
+    существующий не трогает никогда — ни при повторном вызове, ни при реиндексе. `True` — файл
+    создан этим вызовом, `False` — уже был.
+
+    Отдельная функция, а не запись в `ШАБЛОНЫ` (`ensure_templates`): та копирует шаблоны домашнего
+    каталога по фиксированному имени, а здесь путь зависит от имени базы (`base_dir`) и каталога
+    базы может ещё не быть — создаём его сами. Плейсхолдер `{{base}}` шаблона заменяется именем
+    базы, чтобы шапка файла (`odata1c policy show <база>` и т. п.) называла настоящую команду, а
+    не образец."""
+    назначение = base_dir(home, base_name) / "policy.yaml"
+    if назначение.exists():
+        return False
+    назначение.parent.mkdir(parents=True, exist_ok=True)
+    шаблон = importlib.resources.files("odata1c.templates").joinpath("policy.example.yaml")
+    назначение.write_text(
+        шаблон.read_text(encoding="utf-8").replace("{{base}}", base_name), encoding="utf-8"
+    )
+    return True
 
 
 ШАБЛОН_ЗАПИСИ = """\

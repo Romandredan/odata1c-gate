@@ -28,6 +28,7 @@ from odata1c.config.writer import (
     append_base,
     ensure_gate_secret,
     ensure_launcher_key,
+    ensure_policy_template,
     ensure_templates,
 )
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
@@ -299,6 +300,11 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
         await client.close()
 
     print(результат.message)
+    # Файл владельца создаёт `base add`; здесь — запасной путь для баз, заведённых до задачи 3
+    # (ADR-0015) или добавленных в обход CLI (`bases.yaml` вручную) — реиндекс не должен требовать
+    # от владельца ручного создания `policy.yaml` перед первым запуском.
+    if ensure_policy_template(home, base.name):
+        print(f"создан файл политики владельца: {policy_path(home, base.name)}")
     # Политика — на каждом реиндексе, а не только перестроившем индекс (находка П1, тот же довод,
     # что у `ToolService.reindex`): раздел `auto` зависит и от классификатора, а тот меняется с
     # версией шлюза. Сообщение печатается, только если файл авторазметки действительно переписан
@@ -545,6 +551,8 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
         ) from ошибка
     append_base(home / "bases.yaml", name, values)
     print(f"база «{name}» дописана в {home / 'bases.yaml'}")
+    if ensure_policy_template(home, name):
+        print(f"создан файл политики владельца: {policy_path(home, name)}")
     if recipes:
         _скопировать_рецепты(home, name, recipes)
     print(f"проверить соединение: odata1c base test {name}")

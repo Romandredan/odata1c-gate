@@ -2284,6 +2284,14 @@ async def test_reindex_на_непроиндексированной_базе(tm
 
     assert данные["changed"] is True
     assert index_path(home, "ut").exists()
+    # ADR-0015, задача 3: база заведена в обход `base add` (bases.yaml дописан вручную) —
+    # реиндекс через тул сам создаёт файл владельца из шаблона и говорит об этом в warnings.
+    путь_политики = home / "bases" / "ut" / "policy.yaml"
+    assert путь_политики.exists()
+    assert any(
+        "создан файл политики владельца" in предупреждение and str(путь_политики) in предупреждение
+        for предупреждение in данные["warnings"]
+    )
 
 
 @pytest.mark.skipif(

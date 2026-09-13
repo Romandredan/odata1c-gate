@@ -31,6 +31,7 @@ from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
 from odata1c.config.loader import ConfigError
 from odata1c.config.models import AppConfig, BaseConfig
+from odata1c.config.writer import ensure_policy_template
 from odata1c.gate.contact_info import КЛАСС_НА_ВХОДЕ, EntityShape, Shape, select_with_type
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.guard import Guard
@@ -1831,6 +1832,10 @@ class ToolService:
             # `auto` жил до первой перемены в конфигурации 1С или до `force`. Файл при этом
             # переписывается, только если меняется содержимое (`refresh_policy`), а гейт
             # перечитывает его принудительно — по той же причине, что и раньше (mtime на Windows).
+            # Файл владельца создаёт `base add`; здесь — запасной путь для баз, заведённых до
+            # задачи 3 (ADR-0015) или добавленных в обход CLI, — реиндекс через MCP не должен
+            # требовать от владельца ручного создания `policy.yaml` перед первым вызовом.
+            создан_файл_политики = ensure_policy_template(self._config.home, base_config.name)
             путь_авторазметки = auto_policy_path(self._config.home, base_config.name)
             прежняя_авторазметка = (
                 путь_авторазметки.read_bytes() if путь_авторазметки.exists() else None
@@ -1880,6 +1885,11 @@ class ToolService:
             предупреждения = self._предупреждения_разбора(
                 результат.warnings, скрытые if скрытые is not None else self._скрытые(None, гейт)
             )
+            if создан_файл_политики:
+                предупреждения.append(
+                    f"создан файл политики владельца: "
+                    f"{policy_path(self._config.home, base_config.name)}"
+                )
             if отказ_отбора:
                 предупреждения.append(ПРЕДУПРЕЖДЕНИЕ_РАЗНИЦА_НЕ_ПОКАЗАНА)
             if видимые_списки["new_sensitive_fields"] or (
