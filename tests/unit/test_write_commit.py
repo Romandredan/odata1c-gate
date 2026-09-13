@@ -26,7 +26,7 @@ from conftest import без_навигаций, ничего_не_скрыто, 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
 from odata1c.gate.revealed import RevealedValues
-from odata1c.gate.service import refresh_policy
+from odata1c.gate.service import policy_path, refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import EntityDescription, IndexRepository
@@ -1045,6 +1045,31 @@ async def test_эхо_раскрытого_адреса_в_ошибке_1С_за
     assert ошибка(текст)["code"] == "odata_error"
     assert ЧУЖОЙ_АДРЕС not in текст and "Баумана" not in текст
     assert json.loads(одинс.тела_записи[0]) == {"АдресДоставки": ЧУЖОЙ_АДРЕС}
+
+
+async def test_И9_сущность_скрыта_после_подготовки_commit_отказ_без_записи(дом, среда, одинс):
+    """И-9 итогового ревью M2: `_выполнить` проверяет скрытость повторно (`_resolve_entity`):
+    политика, скрывшая сущность после подготовки, отказывает `entity_hidden` до диалога, чтения
+    и записи. Мутант ревьюера (`_resolve_entity` → `describe`) выполнял PATCH и отдавал в ответе
+    `commit` данные скрытой сущности; у отката аналог — Н8-2."""
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    чтений = одинс.get.call_count
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + f"entities:\n  {КОНТРАГЕНТЫ}: {{hide: true}}\n",
+        encoding="utf-8",
+    )
+    нет = Подтверждение(False)
+
+    текст = await выполнить(среда, подготовка["pending_id"], mechanism="elicitation", confirm=нет)
+
+    отказ = ошибка(текст)
+    assert отказ["code"] == "entity_hidden", отказ
+    assert одинс.записей == 0 and одинс.get.call_count == чтений
+    assert not нет.тексты
+    assert ИНН not in текст and НОВЫЙ_ИНН not in текст
+    assert (await среда.стор.take(подготовка["pending_id"], "s1")).status == "pending"
 
 
 async def test_таймаут_записи_исход_неизвестен_повтор_не_пишет(среда, одинс):
