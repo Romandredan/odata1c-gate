@@ -13,8 +13,8 @@
 Приёмка чтения на реальной базе УТ пройдена ([docs/probes/M1d-live-check.md](docs/probes/M1d-live-check.md)).
 Запись двухфазная: тул готовит операцию и показывает превью в токенах, выполняет её только
 `odata1c_commit` после подтверждения пользователя в клиенте, каждая запись откатывается
-`odata1c_undo`; приёмка записи скриптом на живой базе пройдена, проверка диалога Claude Code — за
-владельцем ([docs/probes/M2-live-check.md](docs/probes/M2-live-check.md)). Впереди: M3 package → M4
+`odata1c_undo`; приёмка записи на живой базе пройдена скриптом и вручную в Claude Code, этап M2
+закрыт ([docs/probes/M2-live-check.md](docs/probes/M2-live-check.md)). Впереди: M3 package → M4
 сетевая публикация (SPEC §13).
 
 ## Как подключить
