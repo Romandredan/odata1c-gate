@@ -143,6 +143,8 @@ async def test_ttl_истёк_до_выполнения_pending_expired():
     with pytest.raises(WriteError) as отказ:
         await store.take("p1", "sess-1")
     assert отказ.value.code == "pending_expired"
+    # Задача 9: отказ не повторяет аргумент тула (Ruling 51/53/54).
+    assert "p1" not in str(отказ.value) and "p1" not in отказ.value.hint
 
 
 async def test_выполненная_операция_до_ttl_отдаёт_прежний_result():

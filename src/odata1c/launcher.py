@@ -14,6 +14,11 @@ Elicitation (запрос демона к пользователю — прот�
 каждым из семи обработчиков при входе (`ctx.session`) — какой из них отработает первым, не важно:
 за один stdio-процесс лаунчера downstream-сессия всегда одна и та же.
 
+Клиент лаунчера (`clientInfo` и elicitation) демону нужен для выбора механизма подтверждения
+записи (ADR-0012, план M2 задача 9), а `initialize` демону шлёт сам лаунчер — раньше, чем
+подключится клиент, и со своим именем. Поэтому первый же обработчик передаёт клиента демону
+заголовками HTTP (`ProxyHolder.запомнить`, `daemon.client_headers`), как область видимости.
+
 Обрыв связи с демоном посреди сессии (раунд правок 1, находка 1) не должен ронять весь процесс
 голым traceback и не должен вешать вызов клиента навсегда: каждый из семи обработчиков перехватывает
 исключения апстрим-вызова и отдаёт клиенту штатный отказ — `CallToolResult(is_error=True, ...)` для
@@ -52,6 +57,7 @@ from odata1c.config.writer import ensure_gate_secret, ensure_templates
 from odata1c.daemon import (
     SCOPE_BASES_HEADER,
     SCOPE_DEFAULT_HEADER,
+    client_headers,
     daemon_url,
     is_listening,
     spawn_detached,
@@ -227,8 +233,17 @@ class ProxyHolder:
     входе и читается колбэком `forward_elicit`, когда демон (апстрим) просит подтверждение
     у пользователя."""
 
-    def __init__(self) -> None:
+    def __init__(self, http: httpx2.AsyncClient | None = None) -> None:
         self.session: object | None = None
+        # HTTP-клиент апстрима и признак, что клиент лаунчера уже передан ему заголовками (план
+        # M2, задача 9). `initialize` демону лаунчер шлёт сам, раньше, чем подключится его клиент,
+        # — и демон видел бы клиентом лаунчер (имя `mcp` SDK, elicitation всегда; проверено
+        # исполнением). Настоящего клиента лаунчер узнаёт из первого же запроса своей
+        # downstream-сессии и один раз ставит его заголовками на все следующие запросы к демону
+        # (`daemon.client_headers`) — тем же путём, что область видимости. Клиент у процесса
+        # лаунчера один, и значения не меняются; `None` — тесты в памяти без HTTP.
+        self.http = http
+        self.клиент_передан = False
         # Раунд правок 1, находка 1 (третья правка — «замок» на сессию): выставляется первым же
         # обработчиком, поймавшим `ОШИБКИ_АПСТРИМА`. Эмпирически (`probe_death2.py` на второй
         # версии правки — сторожок сам по себе): ПЕРВЫЙ вызов после смерти демона сторожок ловит
@@ -243,6 +258,16 @@ class ProxyHolder:
         # процесс лаунчера в целом не падает и следующий отдельный запуск `odata1c mcp`
         # (`_дождаться_демона` в начале `run_launcher`) поднимает демон заново, как обычно.
         self.апстрим_мёртв: bool = False
+
+    def запомнить(self, ctx) -> None:
+        """Вход каждого обработчика: запомнить downstream-сессию (для `forward_elicit`) и при
+        первом запросе передать клиента демону заголовками. Раньше любого запроса к демону этого
+        обработчика — поэтому уже первый `tools/call` идёт с настоящим клиентом."""
+        self.session = ctx.session
+        if self.клиент_передан or self.http is None:
+            return
+        self.http.headers.update(client_headers(ctx.session))
+        self.клиент_передан = True
 
 
 def forward_elicit(holder: ProxyHolder):
@@ -365,23 +390,23 @@ def build_proxy(
     в памяти (`InMemoryTransport`) не поднимают настоящий TCP-порт, сторожку там нечего слушать."""
 
     async def on_list_tools(ctx, params):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "tools/list", lambda: upstream.list_tools(params=params), holder, host_port
         )
 
     async def on_call_tool(ctx, params: types.CallToolRequestParams):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _вызвать_тул(upstream, params, holder, host_port)
 
     async def on_list_resources(ctx, params):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "resources/list", lambda: upstream.list_resources(params=params), holder, host_port
         )
 
     async def on_list_resource_templates(ctx, params):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "resources/templates/list",
             lambda: upstream.list_resource_templates(params=params),
@@ -390,19 +415,19 @@ def build_proxy(
         )
 
     async def on_read_resource(ctx, params: types.ReadResourceRequestParams):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "resources/read", lambda: upstream.read_resource(params.uri), holder, host_port
         )
 
     async def on_list_prompts(ctx, params):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "prompts/list", lambda: upstream.list_prompts(params=params), holder, host_port
         )
 
     async def on_get_prompt(ctx, params: types.GetPromptRequestParams):
-        holder.session = ctx.session
+        holder.запомнить(ctx)
         return await _переслать(
             "prompts/get",
             lambda: upstream.get_prompt(params.name, params.arguments),
@@ -508,6 +533,9 @@ async def run_launcher(
         streamable_http_client(адрес, http_client=http) as (up_read, up_write),
         ClientSession(up_read, up_write, elicitation_callback=forward_elicit(holder)) as upstream,
     ):
+        # Клиент лаунчера узнаётся из первого запроса downstream-сессии и передаётся демону
+        # заголовками этого HTTP-клиента (`ProxyHolder.запомнить`, план M2, задача 9).
+        holder.http = http
         итог_инициализации = await upstream.initialize()
         proxy = build_proxy(
             upstream,

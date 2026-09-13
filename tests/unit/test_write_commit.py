@@ -826,19 +826,35 @@ async def test_claude_code_выполняет_без_вопроса_сервер
 
 
 @pytest.mark.parametrize(
-    ("имя", "elicitation", "запасной", "механизм"),
+    ("имя", "версия", "elicitation", "запасной", "механизм"),
     [
-        ("claude-code", True, "deny", "claude_code"),
-        ("claude-code", False, "trust_client", "claude_code"),
-        ("Claude Code", False, "deny", "claude_code"),
-        ("other-agent", True, "deny", "elicitation"),
-        ("other-agent", False, "deny", "deny"),
-        (None, False, "trust_client", "trust"),
-        ("", True, "deny", "elicitation"),
+        ("claude-code", "2.1.267", True, "deny", "claude_code"),
+        ("claude-code", "2.1.246", False, "trust_client", "claude_code"),
+        ("claude-code", "3.0.0", False, "deny", "claude_code"),
+        # Задача 9: имя сравнивается точно — похожее имя другого клиента не получает механизм
+        # «подтверждает клиент» (иначе запись без единого подтверждения).
+        ("Claude Code", "2.1.267", False, "deny", "deny"),
+        ("claude_code", "2.1.267", False, "deny", "deny"),
+        ("CLAUDE-CODE", "2.1.267", True, "deny", "elicitation"),
+        (" claude-code", "2.1.267", False, "deny", "deny"),
+        ("claude-code ", "2.1.267", False, "deny", "deny"),
+        ("claude-code-fork", "2.1.267", False, "deny", "deny"),
+        # Версия ниже 2.1.246 (там «не спрашивать больше» ещё было) и нераспознанная — обычный
+        # клиент: elicitation или запасной механизм, но не `claude_code`.
+        ("claude-code", "2.1.245", True, "deny", "elicitation"),
+        ("claude-code", "2.1.245", False, "deny", "deny"),
+        ("claude-code", None, False, "deny", "deny"),
+        ("claude-code", "2.1.300-rc1", False, "deny", "deny"),
+        ("claude-code", "latest", True, "deny", "elicitation"),
+        ("other-agent", "1.0.0", True, "deny", "elicitation"),
+        ("other-agent", "1.0.0", False, "deny", "deny"),
+        (None, None, False, "trust_client", "trust"),
+        ("", None, True, "deny", "elicitation"),
+        ("other-agent", "1.0.0", False, "что-то", "deny"),
     ],
 )
-def test_choose_mechanism(имя, elicitation, запасной, механизм):
-    assert choose_mechanism(имя, elicitation, запасной) == механизм
+def test_choose_mechanism(имя, версия, elicitation, запасной, механизм):
+    assert choose_mechanism(имя, версия, elicitation, запасной) == механизм
 
 
 # ---------------------------------------------------------------------------------------------

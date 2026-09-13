@@ -167,11 +167,15 @@ CLI (SPEC §3.5): `odata1c mcp|daemon|init|base add|base import|base list|base t
    создаёт домашний каталог, поднимает демон и проксирует MCP; логики в нём нет. Сузить видимость
    сессии: `--bases trade_dev,bp_test` (видны только они), `--default trade_dev` (база по
    умолчанию), `--url` (адрес демона явно).
-6. **Что видит модель.** Девять тулов чтения — `odata1c_bases`, `odata1c_find_entity`,
+6. **Что видит модель.** Девять тулов чтения: `odata1c_bases`, `odata1c_find_entity`,
    `odata1c_describe_entity`, `odata1c_query`, `odata1c_get`, `odata1c_info`, `odata1c_reindex`,
    `odata1c_raw_get`, `odata1c_recipe`; ресурсы `odata1c://cheatsheet`, `odata1c://policy/{base}`,
-   `odata1c://index/{base}`, `odata1c://recipes/{base}`; промпт `explore`. Тулов записи нет —
-   это этап M2.
+   `odata1c://index/{base}`, `odata1c://recipes/{base}`; промпт `explore`. Семь тулов записи
+   (этап M2, до приёмки задачи 10): подготовка `odata1c_create`, `odata1c_update`,
+   `odata1c_mark_for_deletion`, `odata1c_action`, `odata1c_undo` — в 1С не пишут, возвращают превью
+   в токенах и `pending_id`; `odata1c_commit` выполняет после подтверждения клиента (Claude Code —
+   диалог разрешения, клиент с elicitation — вопрос демона, прочие — `write_confirm_fallback`);
+   `odata1c_journal` — последние записи. Порядок записи для модели — `odata1c_info("write_protocol")`.
 7. **Раскрытие токена — только для владельца, мимо MCP:**
    `uv run odata1c reveal "[[inn:M4T2Q9XZ7K]]"` печатает реальное значение в терминал.
 

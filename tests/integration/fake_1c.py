@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import pathlib
 import socket
 import urllib.parse
@@ -87,19 +89,67 @@ async def _не_найдено(request: Request) -> Response:
     )
 
 
-def build_app(журнал_запросов: list[str] | None = None) -> ASGIApp:
+class ОбъектыЗаписи:
+    """Объекты «1С» с состоянием для сквозной проверки записи (план M2, задача 9): GET по пути
+    ключа (`Catalog_Контрагенты(guid'…')`) с соблюдением `$select`, PATCH сливает тело с объектом
+    и растит `DataVersion` (P8: растёт на любой записи). `записи` — (метод, путь, тело) каждого
+    пишущего запроса: тест сверяет, что дошло до 1С и сколько раз."""
+
+    def __init__(self, объекты: dict[str, dict]) -> None:
+        self.объекты = {путь: dict(тело) for путь, тело in объекты.items()}
+        self.записи: list[tuple[str, str, dict]] = []
+        self._счётчик = 1
+
+    @staticmethod
+    def версия(номер: int) -> str:
+        return base64.b64encode(номер.to_bytes(8, "big")).decode()
+
+    async def обработать(self, request: Request) -> Response:
+        # Метод, а не `__call__`: экземпляр с `__call__` Starlette считает ASGI-приложением.
+        путь = request.path_params["rest"]
+        объект = self.объекты.get(путь)
+        if объект is None:
+            return await _не_найдено(request)
+        if request.method == "PATCH":
+            тело = json.loads(await request.body())
+            self.записи.append(("PATCH", путь, тело))
+            объект.update(тело)
+            self._счётчик += 1
+            объект["DataVersion"] = self.версия(self._счётчик)
+            return JSONResponse(объект)
+        if request.method != "GET":
+            self.записи.append((request.method, путь, {}))
+            return await _не_найдено(request)
+        выбор = request.query_params.get("$select")
+        поля = set(выбор.split(",")) if выбор else set(объект)
+        return JSONResponse({поле: значение for поле, значение in объект.items() if поле in поля})
+
+
+def build_app(
+    журнал_запросов: list[str] | None = None, *, объекты: ОбъектыЗаписи | None = None
+) -> ASGIApp:
     """`журнал_запросов` — список, в который дописывается путь и строка запроса КАЖДОГО
     обращения, уже раскодированные из процентной записи. Нужен тем, кто проверяет, что именно
     дошло до «1С» (раунд правок 2 по `stop()` и журналу): раскрыл ли гейт токен в настоящее
-    значение, было ли обращение вообще."""
-    приложение = Starlette(
-        routes=[
-            Route("/odata/standard.odata/$metadata", _metadata),
-            Route("/odata/standard.odata/Catalog_Контрагенты", _контрагенты),
-            Route("/odata/standard.odata/Catalog_ФизическиеЛица", _физлица_эхо_отбора),
-            Route("/{rest:path}", _не_найдено),
-        ]
-    )
+    значение, было ли обращение вообще.
+
+    `объекты` — объекты с состоянием для записи (задача 9): их маршрут стоит перед общим «не
+    найдено» и прежних маршрутов не касается."""
+    маршруты = [
+        Route("/odata/standard.odata/$metadata", _metadata),
+        Route("/odata/standard.odata/Catalog_Контрагенты", _контрагенты),
+        Route("/odata/standard.odata/Catalog_ФизическиеЛица", _физлица_эхо_отбора),
+    ]
+    if объекты is not None:
+        маршруты.append(
+            Route(
+                "/odata/standard.odata/{rest:path}",
+                объекты.обработать,
+                methods=["GET", "PATCH", "POST", "PUT", "DELETE"],
+            )
+        )
+    маршруты.append(Route("/{rest:path}", _не_найдено))
+    приложение = Starlette(routes=маршруты)
     if журнал_запросов is None:
         return приложение
 
@@ -120,14 +170,20 @@ def свободный_порт() -> int:
 
 @contextlib.asynccontextmanager
 async def запущенная(
-    port: int | None = None, *, журнал_запросов: list[str] | None = None
+    port: int | None = None,
+    *,
+    журнал_запросов: list[str] | None = None,
+    объекты: ОбъектыЗаписи | None = None,
 ) -> AsyncIterator[int]:
     """Поднять поддельную 1С в фоновой задаче на свободном (или заданном) порту, отдать номер
     порта, остановить при выходе — тот же приём (`uvicorn.Server` + флаг `should_exit`), что
     `odata1c.daemon.serve()` использует для настоящего демона."""
     порт = port if port is not None else свободный_порт()
     настройки = uvicorn.Config(
-        build_app(журнал_запросов), host="127.0.0.1", port=порт, log_level="warning"
+        build_app(журнал_запросов, объекты=объекты),
+        host="127.0.0.1",
+        port=порт,
+        log_level="warning",
     )
     сервер = uvicorn.Server(настройки)
     задача = asyncio.create_task(сервер.serve())

@@ -2321,8 +2321,13 @@ async def test_info_все_темы_объяснимого_объёма(серв
         assert await сервис.info(тема) in текст
 
 
-async def test_info_тема_записи_одной_строкой(сервис):
-    assert "M2" in await сервис.info("write_protocol")
+async def test_info_тема_записи_описывает_протокол(сервис):
+    """Задача 9 плана M2: запись доступна — тема описывает её порядок, а не обещает этап."""
+    текст = await сервис.info("write_protocol")
+    assert "M2" not in текст
+    for обязательное in ("pending_id", "odata1c_commit", "следующем сообщении", "odata1c_undo"):
+        assert обязательное in текст, обязательное
+    assert текст in await сервис.info("all")
 
 
 async def test_info_неизвестная_тема(сервис):

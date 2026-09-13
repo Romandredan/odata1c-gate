@@ -183,9 +183,11 @@ class PendingStore:
 
             if self._clock() > op.expires_at:
                 if op.status == "pending":
+                    # `pending_id` в тексте не повторяется (задача 9, Ruling 51/53/54): это
+                    # аргумент тула, то есть ввод модели, а отказ шлюза ввод не повторяет.
                     raise WriteError(
                         "pending_expired",
-                        f"pending-операция «{pending_id}» истекла (TTL {self._ttl_s} с)",
+                        f"pending-операция истекла (TTL {self._ttl_s} с)",
                         hint="подготовьте операцию заново",
                     )
                 raise _pending_unknown()
