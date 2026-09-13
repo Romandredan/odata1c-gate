@@ -219,6 +219,10 @@ async def test_описания_тулов_и_справочник_называ�
         "готовьте `create` заново",
         "bypassPermissions",
         "dontAsk",
+        # Раунд 2 ревью задачи 8: откат по видимости базы, цепочка откатов, скрытый commit_id.
+        "любая сессия",
+        "последнее звено",
+        "commit_unknown",
     ):
         assert обязательное in WRITE_PROTOCOL, обязательное
     assert "M2" not in WRITE_PROTOCOL
@@ -313,6 +317,9 @@ async def test_клиент_без_elicitation_при_deny_write_unsupported_cli
         подготовка = await подготовить(кл, демон, одинс)
         отказ = ошибка(await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]}))
     assert отказ["code"] == "write_unsupported_client"
+    # Отказ механизма `deny` (демон выбрал его сам по настройке), а не второго рубежа
+    # `WriteService` против `trust` при `deny` (Т7-6): оба рубежа проверяются по отдельности.
+    assert "не умеет подтверждать" in отказ["message"]
     assert одинс.записей == 0
 
 
