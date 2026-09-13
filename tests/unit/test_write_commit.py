@@ -136,7 +136,14 @@ class Среда:
     """`WriteService` поверх настоящего `ToolService`. Журнал — фабрикой: `commit` открывает
     `journal.sqlite` на один вызов (Windows), тест читает его отдельным соединением."""
 
-    def __init__(self, дом, путь_журнала, *, лимитёр: CommitLimiter | None = None) -> None:
+    def __init__(
+        self,
+        дом,
+        путь_журнала,
+        *,
+        лимитёр: CommitLimiter | None = None,
+        запасной: str | None = None,
+    ) -> None:
         self.tools = ToolService(load_config(дом))
         self.стор = PendingStore(600, clock=Часы(1000.0))
         self.путь_журнала = путь_журнала
@@ -147,6 +154,7 @@ class Среда:
             lambda: Journal(путь_журнала),
             self.лимитёр,
             clock=Часы(1_757_000_000.0),
+            confirm_fallback=запасной,
         )
 
     def журнал(self, commit_id: str):
@@ -397,7 +405,7 @@ async def изменить(среда: Среда, data: dict, *, base="ut", ent
 
 
 async def выполнить(
-    среда: Среда, pending_id: str, *, s="s1", mechanism="trust", confirm=None
+    среда: Среда, pending_id: str, *, s="s1", mechanism="claude_code", confirm=None
 ) -> str:
     return await среда.запись.commit(
         SessionScope(), s, pending_id, mechanism=mechanism, confirm=confirm
@@ -448,7 +456,7 @@ async def test_сквозной_update_commit_журнал_и_повтор(ср�
     assert строка.before["DataVersion"] == _версия(1)
     assert строка.after["DataVersion"] != строка.before["DataVersion"]
     assert строка.request["json"] == {"ИНН": НОВЫЙ_ИНН}
-    assert строка.key == {"Ref_Key": ССЫЛКА} and строка.client == "trust"
+    assert строка.key == {"Ref_Key": ССЫЛКА} and строка.client == "claude_code"
     assert строка.committed_at is not None
 
     # Повторный commit — тот же ответ, без второго PATCH (идемпотентность, инвариант 2).
@@ -968,7 +976,7 @@ async def test_словарь_узнаёт_новое_значение_посл�
 async def test_словарь_не_узнаёт_значение_после_невыполненного_commit(среда, одинс, исход):
     одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
     подготовка = await изменить(среда, {"ИНН": НОВЫЙ_ИНН})
-    механизм, подтверждение = "trust", None
+    механизм, подтверждение = "claude_code", None
     if исход == "отклонил":
         механизм, подтверждение = "elicitation", Подтверждение(False)
     elif исход == "устарело":
@@ -1137,3 +1145,246 @@ async def test_замки_не_копятся(среда, одинс):
     await выполнить(среда, подготовка["pending_id"])
     await выполнить(среда, "нет-такой")
     assert среда.запись._замки == {}
+
+
+# ---------------------------------------------------------------------------------------------
+# Раунд 2 ревью задачи 7
+# ---------------------------------------------------------------------------------------------
+
+
+async def создать(среда: Среда, data: dict, *, entity=КОНТРАГЕНТЫ) -> dict:
+    ответ = json.loads(
+        await среда.запись.create(SessionScope(), "s1", base="ut", entity=entity, data=data)
+    )
+    assert "pending_id" in ответ, ответ
+    return ответ
+
+
+def _созданный(одинс: Одинс) -> tuple[str, str]:
+    [путь] = [п for п in одинс.объекты if п.startswith(f"{КОНТРАГЕНТЫ}(guid'")]
+    return путь, путь[len(КОНТРАГЕНТЫ) + len("(guid'") : -2]
+
+
+async def test_Т7_1_ответ_записи_не_JSON_исход_неизвестен(среда, одинс):
+    """1С выполнила PATCH, но тело ответа не JSON (страница посредника с телом запроса): ответ не
+    разобран — исход неизвестен, как при таймауте, а не `internal`. Журнал `unknown`, повтор — тот
+    же ответ без записи. Тело ответа модели не выдаётся, и замены раннего прохода в нём стражу не
+    засчитываются."""
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    записать = одинс._patch
+
+    def страница(request):
+        записать(request)
+        return httpx.Response(200, content=f"<html>OK {request.content.decode()}</html>".encode())
+
+    одинс.patch.side_effect = страница
+
+    текст = await выполнить(среда, подготовка["pending_id"])
+
+    отказ = ошибка(текст)
+    assert "неизвест" in отказ["message"] and "не повтор" in отказ["hint"]
+    assert "odata1c_get" in отказ["hint"]
+    нет_реальных_значений(текст)
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+    строка = среда.журнал(операция.commit_id)
+    assert строка.status == "unknown" and "JSON" in строка.error
+    assert await выполнить(среда, подготовка["pending_id"]) == текст
+    assert одинс.patch.call_count == 1
+
+
+async def test_Т7_1_create_GET_после_сломан_запись_выполнена_ключ_в_журнале(среда, одинс):
+    """`create` выполнен, повторный GET «после» вернул не JSON: запись от этого не отменяется.
+    Ответ — «выполнено» с ключом из ответа POST, без результата и с предупреждением; журнал —
+    `committed` с ключом и пустым `after`; повтор — тот же ответ, POST один."""
+    подготовка = await создать(среда, {"Description": "ООО Проба odata1c-приёмка"})
+    читать = одинс._get
+
+    def после_сломано(request):
+        if "(guid'" in _путь(request):
+            return httpx.Response(200, content=b"not json")
+        return читать(request)
+
+    одинс.get.side_effect = после_сломано
+
+    текст = await выполнить(среда, подготовка["pending_id"])
+
+    ответ = json.loads(текст)
+    _, ссылка = _созданный(одинс)
+    assert ответ["key"] == {"Ref_Key": ссылка} and ответ["result"] is None
+    assert any("перечитать" in п for п in ответ["warnings"])
+    строка = среда.журнал(ответ["commit_id"])
+    assert строка.status == "committed" and строка.key == {"Ref_Key": ссылка}
+    assert строка.after is None
+    assert await выполнить(среда, подготовка["pending_id"]) == текст
+    assert одинс.post.call_count == 1
+
+
+async def test_Т7_1_отмена_во_время_GET_после_create_журнал_committed_с_ключом(среда, одинс):
+    """Клиент отключился после выполненного POST, пока идёт GET «после»: журнал уже `committed` с
+    ключом (записан сразу по ответу 1С, до GET), повтор отвечает «запись выполнена» — ответ в форме
+    выполненного commit с номером записи и ключом, без результата — и запроса не повторяет."""
+    подготовка = await создать(среда, {"Description": "ООО Проба odata1c-приёмка"})
+    клиент = среда.tools._client_for(среда.tools._config.bases["ut"])
+    настоящий_get = клиент.get
+    в_пути = asyncio.Event()
+
+    async def get_зависает(path, params=None, **kw):
+        if "(guid'" in path:
+            в_пути.set()
+            await asyncio.Event().wait()
+        return await настоящий_get(path, params, **kw)
+
+    клиент.get = get_зависает
+    задача = asyncio.create_task(выполнить(среда, подготовка["pending_id"]))
+    await в_пути.wait()
+    задача.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await задача
+
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+    _, ссылка = _созданный(одинс)
+    строка = среда.журнал(операция.commit_id)
+    assert операция.status == "committed"
+    assert строка.status == "committed" and строка.key == {"Ref_Key": ссылка}
+    повтор = json.loads(await выполнить(среда, подготовка["pending_id"]))
+    assert повтор["commit_id"] == операция.commit_id and повтор["key"] == {"Ref_Key": ссылка}
+    assert повтор["result"] is None and any("выполнена" in п for п in повтор["warnings"])
+    assert одинс.post.call_count == 1
+
+
+async def test_Т7_1_сбой_маски_после_запись_выполнена(среда, одинс, monkeypatch):
+    """Любой сбой показа «после» (здесь — маска) не превращает выполненную запись в `internal`."""
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    гейт = среда.tools._gate_for(среда.tools._config.bases["ut"])
+
+    def сломана(*_a, **_k):
+        raise RuntimeError("дефект маски")
+
+    monkeypatch.setattr(гейт, "mask", сломана)
+
+    ответ = json.loads(await выполнить(среда, подготовка["pending_id"]))
+
+    assert "commit_id" in ответ and ответ["result"] is None
+    assert any("результат не показан" in п for п in ответ["warnings"])
+    строка = среда.журнал(ответ["commit_id"])
+    assert строка.status == "committed" and строка.after["ИНН"] == НОВЫЙ_ИНН
+    assert одинс.patch.call_count == 1
+
+
+@pytest.mark.parametrize("статус", [408, 502, 504])
+async def test_Т7_4_ответ_посредника_по_таймауту_исход_неизвестен(среда, одинс, статус):
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    одинс.отказ = httpx.Response(статус, content=b"<html>upstream</html>")
+
+    отказ = ошибка(await выполнить(среда, подготовка["pending_id"]))
+
+    assert "неизвест" in отказ["message"]
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+    assert среда.журнал(операция.commit_id).status == "unknown"
+
+
+async def test_Т7_4_код_платформы_не_число_не_показывается(среда, одинс):
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    одинс.отказ = _ошибка_1с(500, f"Заблокировал {ФИО}", "текст")
+
+    текст = await выполнить(среда, подготовка["pending_id"])
+
+    отказ = ошибка(текст)
+    assert "код ошибки платформы —" in отказ["message"]
+    assert "Иванов" not in текст and "Заблокировал" not in текст
+
+
+async def test_Т7_5_неизвестный_исход_create_ведёт_к_поиску_по_представлению(среда, одинс):
+    подготовка = await создать(среда, {"Description": "ООО Проба odata1c-приёмка"})
+
+    def таймаут(_request):
+        raise httpx.ReadTimeout("1С думает")
+
+    одинс.перед_записью = таймаут
+
+    отказ = ошибка(await выполнить(среда, подготовка["pending_id"]))
+
+    assert "неизвест" in отказ["message"]
+    assert "odata1c_query" in отказ["hint"] and "Description" in отказ["hint"]
+    assert "odata1c_get" not in отказ["hint"]
+
+
+async def test_Т7_6_trust_при_запасном_deny_отказ_без_записи(среда, одинс):
+    """`daemon.yaml` по умолчанию — `write_confirm_fallback: deny`: механизм `trust` недопустим,
+    сколько бы вызывающий его ни передавал. Операция, отклонённая в диалоге, не выполняется
+    следующим `commit` с `trust`."""
+    assert среда.tools._config.daemon.write_confirm_fallback == "deny"
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    await выполнить(
+        среда, подготовка["pending_id"], mechanism="elicitation", confirm=Подтверждение(False)
+    )
+
+    отказ = ошибка(await выполнить(среда, подготовка["pending_id"], mechanism="trust"))
+
+    assert отказ["code"] == "write_unsupported_client"
+    assert одинс.записей == 0
+
+
+async def test_Т7_6_механизм_закрепляется_за_операцией(дом, tmp_path, одинс):
+    """Даже при `trust_client` операцию, которую уже подтверждали диалогом, подтверждают только
+    диалогом: смена механизма между вызовами `commit` одной операции — отказ. Тот же механизм —
+    можно, операция жива до TTL."""
+    среда = Среда(дом, tmp_path / "journal.sqlite", запасной="trust_client")
+    try:
+        одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+        подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+        await выполнить(
+            среда, подготовка["pending_id"], mechanism="elicitation", confirm=Подтверждение(False)
+        )
+
+        отказ = ошибка(await выполнить(среда, подготовка["pending_id"], mechanism="trust"))
+
+        assert отказ["code"] == "permission_denied" and одинс.записей == 0
+        текст = await выполнить(
+            среда, подготовка["pending_id"], mechanism="elicitation", confirm=Подтверждение(True)
+        )
+        assert "commit_id" in json.loads(текст) and одинс.patch.call_count == 1
+    finally:
+        await среда.tools.aclose()
+
+
+async def test_Т7_6_trust_при_запасном_trust_client_выполняет(дом, tmp_path, одинс):
+    среда = Среда(дом, tmp_path / "journal.sqlite", запасной="trust_client")
+    try:
+        одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+        подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+        ответ = json.loads(await выполнить(среда, подготовка["pending_id"], mechanism="trust"))
+        assert "commit_id" in ответ and среда.журнал(ответ["commit_id"]).client == "trust"
+    finally:
+        await среда.tools.aclose()
+
+
+async def test_Т7_3_чужая_сессия_не_ждёт_диалога_владельца(среда, одинс):
+    """Замок — на пару (сессия, операция): чужая сессия не встаёт в очередь за чужой операцией и
+    отвечает `pending_unknown` сразу, как на выдуманный номер."""
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    отпустить, спросили = asyncio.Event(), asyncio.Event()
+
+    async def думает(message):
+        спросили.set()
+        await отпустить.wait()
+        return False
+
+    владелец = asyncio.create_task(
+        выполнить(среда, подготовка["pending_id"], mechanism="elicitation", confirm=думает)
+    )
+    await спросили.wait()
+    try:
+        чужой = await asyncio.wait_for(выполнить(среда, подготовка["pending_id"], s="s2"), 1)
+        выдуманный = await выполнить(среда, "0" * 32, s="s2")
+        assert ошибка(чужой)["code"] == "pending_unknown"
+        assert чужой == выдуманный
+    finally:
+        отпустить.set()
+        await владелец

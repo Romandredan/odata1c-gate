@@ -79,6 +79,9 @@ class PendingOp:
     # шли бы мимо него. Внутри — свёрнутые написания реальных значений, поэтому скрыто так же,
     # как `request`.
     revealed: RevealedValues | None = field(default=None, repr=False, compare=False)
+    # Механизм подтверждения, закреплённый первым `commit` (Т7-6 ревью задачи 7): отклонённую в
+    # диалоге операцию нельзя выполнить следующим вызовом другим механизмом (`trust`).
+    mechanism: str | None = None
 
 
 def _pending_unknown() -> WriteError:

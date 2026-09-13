@@ -329,6 +329,30 @@ class Journal:
             # close_commit) не происходит вовсе. Ошибка программы, а не отказ пользователю.
             raise RuntimeError(f"close_commit вызван для commit_id={commit_id!r} без open_commit")
 
+    def set_after(self, commit_id: str, after: dict | None) -> None:
+        """Дописать состояние «после» к уже закрытой записи (Т7-1 ревью задачи 7).
+
+        `commit` закрывает запись (`close_commit(status="committed", key=…)`) сразу по ответу 1С,
+        до повторного чтения объекта: отмена вызова или сбой чтения иначе оставили бы выполненную
+        запись `started`, а у `create` — без ключа. Состояние «после» приходит отдельным шагом и
+        пишется отдельным вызовом; статус, ключ и время выполнения он не трогает. Отказ — тот же
+        `WriteError("internal")`, что у `close_commit`; строки нет — ошибка программы."""
+        try:
+            with self._connection:
+                курсор = self._connection.execute(
+                    "UPDATE commits SET after_json = ? WHERE commit_id = ?",
+                    (_dump(after), commit_id),
+                )
+        except (sqlite3.Error, TypeError, ValueError) as ошибка:
+            raise WriteError(
+                "internal",
+                "не удалось дописать журнал после выполненной записи",
+                hint="сама запись в 1С уже прошла — не повторяйте commit; проверьте место на"
+                " диске и права на файл журнала",
+            ) from ошибка
+        if курсор.rowcount == 0:
+            raise RuntimeError(f"set_after вызван для commit_id={commit_id!r} без open_commit")
+
     def mark_undone(self, commit_id: str, undone_by: str) -> None:
         """Отмечает исходный коммит как отменённый откатом `undone_by` (SPEC §7.6).
 

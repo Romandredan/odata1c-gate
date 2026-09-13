@@ -167,6 +167,29 @@ def test_close_commit_дописывает_ключ_create_которого_не
     assert журнал.get("c2").key == {"Ref_Key": "11111111-1111-1111-1111-111111111111"}
 
 
+def test_set_after_дописывает_после_не_трогая_статус_и_ключ(open_journal):
+    """Т7-1 ревью задачи 7: `commit` закрывает запись сразу по ответу 1С (статус и ключ), а
+    состояние «после» дописывает отдельным вызовом после повторного чтения."""
+    журнал = open_journal()
+    создание = операция(commit_id="c1", op="create")
+    создание.key = None
+    журнал.open_commit(создание, client="claude_code", before=None)
+    журнал.close_commit("c1", after=None, status="committed", key={"Ref_Key": "r"})
+    выполнено = журнал.get("c1").committed_at
+
+    журнал.set_after("c1", {"Ref_Key": "r", "ИНН": "7707083893"})
+
+    запись = журнал.get("c1")
+    assert запись.after == {"Ref_Key": "r", "ИНН": "7707083893"}
+    assert (запись.status, запись.key, запись.committed_at) == (
+        "committed",
+        {"Ref_Key": "r"},
+        выполнено,
+    )
+    with pytest.raises(RuntimeError):
+        журнал.set_after("нет-такого", {})
+
+
 # --- mark_undone -----------------------------------------------------------------------------
 
 
