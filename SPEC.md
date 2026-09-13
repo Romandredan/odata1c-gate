@@ -2174,7 +2174,7 @@ defaults:
   addr: { mask_for: [Catalog_ФизическиеЛица, Catalog_КонтактныеЛицаПартнеров, Catalog_Пользователи, …] }
 entities:
   Catalog_ФизическиеЛица: { hide: true }         # сущность не видна модели вовсе
-names_for: [Catalog_Контрагенты, Catalog_Организации]   # переопределяет bases.yaml для этой базы
+names_for: [Catalog_Контрагенты, Catalog_Организации]   # список для этой базы, bases.yaml его не знает
 fields:
   Catalog_Контрагенты.ИНН: inn
   Catalog_Контрагенты.КодПоОКПО: keep

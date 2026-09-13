@@ -118,3 +118,18 @@ def test_owner_names_for_читает_список_из_policy_yaml(tmp_path):
     путь.write_text("version: 2\nnames_for: [Catalog_Контрагенты]\n", encoding="utf-8")
 
     assert owner_names_for(tmp_path, "ut") == {"Catalog_Контрагенты"}
+
+
+def test_owner_names_for_пустой_список_это_не_отсутствующий_раздел(tmp_path):
+    """`names_for: []`, явно прописанный владельцем, — не то же самое, что отсутствующий раздел:
+    отсутствие даёт `None` (встроенный список `DEFAULT_NAMES_FOR`), а пустой список — осознанное
+    решение выключить слой 1 целиком и приходит как пустое множество. Разница принципиальна:
+    `classify_field(..., names_for=set())` не защищает ни `Description`, ни ФИО ни у одной сущности
+    (предостережение — `tests/unit/test_tools_service.py`, комментарий к находкам Р61/атаке на
+    `_цель_пути`). Тест фиксирует это поведение явно, а не оставляет его неочевидным следствием
+    устройства `Policy.names_for()`."""
+    путь = policy_path(tmp_path, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nnames_for: []\n", encoding="utf-8")
+
+    assert owner_names_for(tmp_path, "ut") == set()
