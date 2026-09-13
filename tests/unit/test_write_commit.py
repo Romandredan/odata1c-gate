@@ -12,6 +12,7 @@
 
 import asyncio
 import base64
+import dataclasses
 import json
 import re
 import urllib.parse
@@ -24,12 +25,14 @@ from conftest import без_навигаций, ничего_не_скрыто, 
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.service import refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
-from odata1c.index.repository import IndexRepository
+from odata1c.index.repository import EntityDescription, IndexRepository
 from odata1c.registry.registry import SessionScope
 from odata1c.tools.service import ToolService
+from odata1c.write import service
 from odata1c.write.confirm import choose_mechanism
 from odata1c.write.errors import WriteError
 from odata1c.write.journal import Journal
@@ -633,25 +636,91 @@ async def test_нет_отпечатка_у_операции_отказ_а_не_
     assert отказ["code"] == "pending_stale" and одинс.записей == 0
 
 
-async def test_Ruling_55_отпечаток_записи_регистра(среда, одинс):
-    """У записи регистра нет `DataVersion`: отпечаток — SHA-256 канонического JSON полей записи.
-    Не изменилась — запись идёт; изменилось поле, которого тело не касается, — `pending_stale`."""
-    запись_курса = {"Period": "2026-01-01T00:00:00", "Валюта_Key": ССЫЛКА_ВАЛЮТЫ}
-    одинс.положить(ПУТЬ_КУРСА, {**запись_курса, "Кратность": 1, "Курс": 90.5})
+def _описание_записи(*имена: str, версия: bool = False) -> EntityDescription:
+    поля = [{"name": имя, "edm_type": "Edm.String"} for имя in имена]
+    if версия:
+        поля.append({"name": "DataVersion", "edm_type": "Edm.String"})
+    return EntityDescription(
+        name="InformationRegister_Проба",
+        kind="InformationRegister",
+        russian_kind="РегистрСведений",
+        parent_entity=None,
+        is_tabular_part=False,
+        is_records=False,
+        is_virtual=False,
+        virtual_kind=None,
+        key_fields=["Period", "Валюта_Key"],
+        description_field=None,
+        fields=поля,
+        children=[],
+        actions=[],
+        members=[],
+        navigations={},
+        is_independent_register=True,
+    )
 
-    первая = await изменить(среда, {"Курс": 91.25}, entity=КУРСЫ, key=КЛЮЧ_КУРСА)
-    операция = await среда.стор.take(первая["pending_id"], "s1")
-    assert операция.data_version.startswith("sha256:") and len(операция.data_version) == 71
-    ответ = json.loads(await выполнить(среда, первая["pending_id"]))
-    assert ответ["result"]["Курс"] == 91.25
-    assert json.loads(одинс.тела_записи[0]) == {"Курс": 91.25}
-    assert среда.журнал(ответ["commit_id"]).before["Кратность"] == 1
 
-    вторая = await изменить(среда, {"Курс": 92.0}, entity=КУРСЫ, key=КЛЮЧ_КУРСА)
-    одинс.изменить_извне(ПУТЬ_КУРСА, Кратность=10)
-    отказ = ошибка(await выполнить(среда, вторая["pending_id"]))
-    assert отказ["code"] == "pending_stale"
-    assert одинс.patch.call_count == 1
+def test_Ruling_55_отпечаток_записи_регистра_функцией():
+    """Механика Ruling 55 на уровне функции (Ruling 60 закрыл запись регистров, и сквозной тест
+    `commit` записи регистра больше не собрать подготовкой). У записи регистра нет `DataVersion`:
+    отпечаток — SHA-256 канонического JSON полей записи без служебных. Та же запись — тот же
+    отпечаток при другом порядке ключей; изменилось поле, которого тело не касается, — другой."""
+    описание = _описание_записи("Period", "Валюта_Key", "Курс", "Кратность")
+    запись_ = {"Period": "2026-01-01T00:00:00", "Валюта_Key": ССЫЛКА_ВАЛЮТЫ, "Кратность": 1}
+    набор = RevealedValues()
+
+    отпечаток = service._отпечаток(описание, {**запись_, "Курс": 90.5}, набор)
+    переставлено = {"Курс": 90.5, "odata.metadata": "…", **запись_}
+
+    assert отпечаток.startswith("sha256:") and len(отпечаток) == 71
+    assert service._отпечаток(описание, переставлено, набор) == отпечаток
+    assert service._отпечаток(описание, {**запись_, "Курс": 90.5, "Кратность": 10}, набор) != (
+        отпечаток
+    )
+    # Сущность с `DataVersion` — отпечаток и есть `DataVersion`.
+    с_версией = _описание_записи("Description", версия=True)
+    assert service._отпечаток(с_версией, {"DataVersion": "AAAA"}, набор) == "AAAA"
+
+
+def test_Ruling_55_отпечаток_по_развёрнутым_значениям_раннего_прохода():
+    """Строка, переписанная ранним проходом (`ScrubbedText`), в отпечаток идёт исходным
+    значением: иначе строки раннего прохода подготовки и `commit` дали бы разный хэш при
+    неизменной записи."""
+    описание = _описание_записи("ИНН", "Комментарий")
+    набор = RevealedValues()
+    исходная = {"ИНН": ИНН, "Комментарий": f"ИНН {ИНН} проверен"}
+    переписанная = {
+        "ИНН": набор.scrubbed("[[inn:ABCDEFGHJK]]", original=ИНН, hits=1),
+        "Комментарий": набор.scrubbed(
+            "ИНН [[inn:ABCDEFGHJK]] проверен", original=исходная["Комментарий"], hits=1
+        ),
+    }
+
+    assert service._отпечаток(описание, переписанная, набор) == service._отпечаток(
+        описание, исходная, набор
+    )
+
+
+def test_ключ_созданного_из_ответа_POST():
+    """Ключ созданного объекта из ответа POST: у записи регистра — поля ключа с исходными
+    значениями строк раннего прохода; поля ключа нет — `None`; `Ref_Key` не формы GUID — `None`
+    (путь перечитывания не строится из чего попало)."""
+    набор = RevealedValues()
+    регистр = _описание_записи("Period", "Валюта_Key", "Курс")
+    ответ = {
+        "Period": "2026-01-01T00:00:00",
+        "Валюта_Key": набор.scrubbed("[[inn:ABCDEFGHJK]]", original=ССЫЛКА_ВАЛЮТЫ, hits=1),
+        "Курс": 91.25,
+    }
+    справочник = dataclasses.replace(регистр, key_fields=["Ref_Key"])
+
+    assert service._ключ_созданного(регистр, ответ, набор) == {
+        "Period": "2026-01-01T00:00:00",
+        "Валюта_Key": ССЫЛКА_ВАЛЮТЫ,
+    }
+    assert service._ключ_созданного(регистр, {"Period": "2026-01-01T00:00:00"}, набор) is None
+    assert service._ключ_созданного(справочник, {"Ref_Key": "не-guid"}, набор) is None
+    assert service._ключ_созданного(справочник, {"Ref_Key": ССЫЛКА}, набор) == {"Ref_Key": ССЫЛКА}
 
 
 # Синтетический независимый регистр с ключом класса `inn` (как в задаче 5, M-3): ключ приходит
@@ -683,29 +752,6 @@ async def среда_синт(tmp_path, edmx_ut_real):
     с = Среда(_дом(tmp_path, текст.encode("utf-8")), tmp_path / "journal.sqlite")
     yield с
     await с.tools.aclose()
-
-
-async def test_Ruling_55_отпечаток_по_развёрнутым_значениям_раннего_прохода(среда_синт, одинс):
-    среда = среда_синт
-    ток = токен(среда.tools, ИНН, entity=РЕГИСТР_ИНН)
-    путь = f"{РЕГИСТР_ИНН}(ИНН='{ИНН}')"
-    одинс.положить(путь, {"ИНН": ИНН, "Комментарий": f"ИНН {ИНН} проверен"})
-
-    подготовка = await изменить(
-        среда, {"Комментарий": "проверка снята"}, entity=РЕГИСТР_ИНН, key={"ИНН": ток}
-    )
-    текст = await выполнить(среда, подготовка["pending_id"])
-
-    ответ = json.loads(текст)
-    assert "commit_id" in ответ, текст
-    assert ответ["result"] == {"ИНН": ток, "Комментарий": "проверка снята"}
-    assert ответ["key"] == {"ИНН": ток}
-    assert ИНН not in текст and "[[lit:" not in текст
-    строка = среда.журнал(ответ["commit_id"])
-    # Журнал — реальные значения, а не строки раннего прохода с токенами.
-    assert строка.before == {"ИНН": ИНН, "Комментарий": f"ИНН {ИНН} проверен"}
-    assert строка.after == {"ИНН": ИНН, "Комментарий": "проверка снята"}
-    assert строка.key == {"ИНН": ИНН}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1428,58 +1474,10 @@ async def test_Т7_3_чужая_сессия_не_ждёт_диалога_вла
         await владелец
 
 
-async def test_страховочный_ответ_отмены_через_стража_ключ_регистра_токеном(
-    среда_синт, одинс, monkeypatch
-):
-    """Отмена после ответа 1С на `create` записи регистра с ключом класса `inn`: страховочный
-    ответ повтору построен до GET «после», прошёл стража базы, и составной ключ в нём — токеном
-    (маской полей ключа из ответа POST), а не реальным ИНН и не `null`."""
-    среда = среда_синт
-    прошли_стража = _следить_за_стражем(среда, monkeypatch)
-    подготовка = json.loads(
-        await среда.запись.create(
-            SessionScope(),
-            "s1",
-            base="ut",
-            entity=РЕГИСТР_ИНН,
-            data={"ИНН": ИНН, "Комментарий": "odata1c-приёмка"},
-        )
-    )
-    assert "pending_id" in подготовка, подготовка
-    клиент = среда.tools._client_for(среда.tools._config.bases["ut"])
-    настоящий_get = клиент.get
-    в_пути = asyncio.Event()
-
-    async def get_зависает(path, params=None, **kw):
-        if path.startswith(f"{РЕГИСТР_ИНН}("):
-            в_пути.set()
-            await asyncio.Event().wait()
-        return await настоящий_get(path, params, **kw)
-
-    клиент.get = get_зависает
-    задача = asyncio.create_task(выполнить(среда, подготовка["pending_id"]))
-    await в_пути.wait()
-    задача.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await задача
-
-    операция = await среда.стор.take(подготовка["pending_id"], "s1")
-    assert операция.status == "committed" and операция.result in прошли_стража
-    повтор = await выполнить(среда, подготовка["pending_id"])
-    ответ = json.loads(повтор)
-    assert ответ["commit_id"] == операция.commit_id and ответ["result"] is None
-    assert re.fullmatch(r"\[\[inn:[^\]]+\]\]", ответ["key"]["ИНН"])
-    assert ИНН not in повтор
-    assert среда.журнал(операция.commit_id).key == {"ИНН": ИНН}
-    assert одинс.post.call_count == 1
-
-
 # ---------------------------------------------------------------------------------------------
 # Раунд 3 ревью задачи 7
 # ---------------------------------------------------------------------------------------------
 
-# ИНН с верной контрольной суммой, которого словарь фикстуры не знает.
-ЧИСТЫЙ_ИНН = "7702070139"
 _GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
 
@@ -1552,75 +1550,37 @@ async def test_Н2_1_сбой_до_сборки_страховки_не_выда
     assert операция.status == "committed" and одинс.patch.call_count == 1
 
 
-def _post_без_записи(одинс: Одинс, сущность: str):
-    """1С отвечает 201 на POST записи, но записи нет — GET «после» получит 404."""
-    исходный = одинс._post
-
-    def post(request):
-        if _путь(request) == сущность:
-            одинс._запись(request)
-            return httpx.Response(201, json=json.loads(request.content))
-        return исходный(request)
-
-    одинс.post.side_effect = post
-
-
-async def test_Н2_2_ключ_из_ответа_POST_не_пишется_в_словарь(среда_синт, одинс):
-    """`create` записи регистра с ключом класса `inn` открытым литералом: 1С ответила 201, GET
-    «после» записи не нашёл. Ключ в ответе — токеном, но словарь значение не узнал: учится он
-    только из GET «после» (решение 13 плана, Ruling 48)."""
+@pytest.mark.parametrize(
+    ("операция", "data"),
+    [
+        pytest.param("create", {"ИНН": ИНН, "Комментарий": "odata1c-приёмка"}, id="create"),
+        pytest.param("update", {"Комментарий": "стал"}, id="update"),
+    ],
+)
+async def test_Ruling_60_запись_регистра_не_готовится_commit_не_до_чего(
+    среда_синт, одинс, операция, data
+):
+    """Ruling 60: запись регистра сведений в первой поставке не готовится — ни `create` с ключом
+    открытым литералом, ни `update` по ключу-токену. Прежние тесты этого места (Н2-2, Н2-3,
+    страховочный ответ отмены с ключом регистра) сторожили механику `commit` записи регистра:
+    ключ из ответа POST маской без записи в словарь, словарь учится из GET «после», ключ-токен
+    без ложного `guard_replaced`. Код этой механики остаётся для поставки, которая запись
+    регистров откроет; её юнит-часть — `_ключ_созданного` и `_отпечаток` выше."""
     среда = среда_синт
-    _post_без_записи(одинс, РЕГИСТР_ИНН)
-    подготовка = await создать(
-        среда, {"ИНН": ЧИСТЫЙ_ИНН, "Комментарий": "odata1c-приёмка"}, entity=РЕГИСТР_ИНН
-    )
+    if операция == "create":
+        ответ = await среда.запись.create(
+            SessionScope(), "s1", base="ut", entity=РЕГИСТР_ИНН, data=data
+        )
+    else:
+        ключ = {"ИНН": токен(среда.tools, ИНН, entity=РЕГИСТР_ИНН)}
+        ответ = await среда.запись.update(
+            SessionScope(), "s1", base="ut", entity=РЕГИСТР_ИНН, key=ключ, data=data
+        )
 
-    ответ = json.loads(await выполнить(среда, подготовка["pending_id"]))
+    отказ = ошибка(ответ)
 
-    assert ответ["result"] is None and ответ["key"]["ИНН"].startswith("[[inn:")
-    assert any("перечитать" in п for п in ответ["warnings"])
-    assert not словарь_знает(среда.tools, ЧИСТЫЙ_ИНН)
-    assert ЧИСТЫЙ_ИНН not in json.dumps(ответ, ensure_ascii=False)
-
-
-async def test_Н2_2_словарь_учится_из_GET_после_create_регистра(среда_синт, одинс):
-    среда = среда_синт
-    исходный = одинс._post
-
-    def post_регистр(request):
-        if _путь(request) == РЕГИСТР_ИНН:
-            одинс._запись(request)
-            тело = json.loads(request.content)
-            одинс.положить(f"{РЕГИСТР_ИНН}(ИНН='{ЧИСТЫЙ_ИНН}')", тело)
-            return httpx.Response(201, json=тело)
-        return исходный(request)
-
-    одинс.post.side_effect = post_регистр
-    подготовка = await создать(
-        среда, {"ИНН": ЧИСТЫЙ_ИНН, "Комментарий": "odata1c-приёмка"}, entity=РЕГИСТР_ИНН
-    )
-
-    ответ = json.loads(await выполнить(среда, подготовка["pending_id"]))
-
-    assert ответ["result"]["ИНН"] == ответ["key"]["ИНН"]
-    assert словарь_знает(среда.tools, ЧИСТЫЙ_ИНН)
-
-
-async def test_Н2_3_ключ_токен_без_ложного_guard_replaced(среда_синт, одинс):
-    """Ключ записи — токен, раскрытый при подготовке: ранний проход чтения «до» заменяет его в
-    ответе 1С, но это чтение модели не выдаётся — `guard_replaced` в ответе `commit` не ставится.
-    Обычное чтение той же записи — тоже без него."""
-    среда = среда_синт
-    ток = токен(среда.tools, ИНН, entity=РЕГИСТР_ИНН)
-    одинс.положить(f"{РЕГИСТР_ИНН}(ИНН='{ИНН}')", {"ИНН": ИНН, "Комментарий": "был"})
-    подготовка = await изменить(
-        среда, {"Комментарий": "стал"}, entity=РЕГИСТР_ИНН, key={"ИНН": ток}
-    )
-
-    текст = await выполнить(среда, подготовка["pending_id"])
-
-    нет_реальных_значений(текст)
-    assert json.loads(текст)["result"]["ИНН"] == ток
+    assert отказ["code"] == "permission_denied" and РЕГИСТР_ИНН in отказ["message"]
+    assert одинс.записей == 0 and одинс.get.call_count == 0
 
 
 async def test_Н2_4_отказ_deny_и_trust_не_закрепляет_механизм(среда, одинс):

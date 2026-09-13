@@ -1,7 +1,7 @@
 """Разрешения записи: строгий порядок проверок SPEC §7.1 (инвариант 4 — до pending-операции).
 
 Порядок (первый отказ побеждает): 1) сущность скрыта гейтом → `entity_hidden`; 2) база только для
-чтения → `base_read_only`; 3) регистр, подчинённый регистратору, и флаги операций
+чтения → `base_read_only`; 3) регистр (любой, Ruling 60) и флаги операций
 (`post_documents`/`mark_deletion`) → `permission_denied`; 4) виртуальная таблица — отказ всегда →
 `permission_denied`; 5) `deny_entities`/`allow_entities` → `permission_denied`; 6) поле из
 `deny_fields` → `field_write_denied`.
@@ -9,8 +9,9 @@
 Ruling 57 (2026-09-13, находка раунда 3 задачи 6) сузил Ruling 39: регистр шаг 3 узнаёт по виду
 сущности (`kind`), а не по `is_records` — основной набор `AccumulationRegister_X` (ключ
 `Recorder`) проходил мимо флага. Запись в зависимый регистр в первой поставке отклоняется при
-любом `register_direct_write`; независимый регистр сведений по-прежнему пишется по одному
-`write: true`.
+любом `register_direct_write`; независимый регистр сведений тогда ещё писался по одному
+`write: true`. Ruling 60 (И-3 итогового ревью M2) закрыл и его: запись регистров не проверена на
+живой 1С, а POST по существующему ключу регистра сведений может заместить запись без «до» в журнале.
 """
 
 from __future__ import annotations
@@ -111,35 +112,14 @@ def test_на_роли_dev_по_умолчанию_разрешено():
     проверить(база(), сущность(), "update", ["Comment"])
 
 
-def test_независимый_регистр_сведений_на_create_при_register_direct_write_false_разрешено():
-    """Независимый регистр сведений пишется по одному `write: true`, флаг `register_direct_write`
-    его не касается вовсе (SPEC §7.1) — в отличие от любого набора записей регистра с
-    обязательным регистратором (накопления, бухгалтерии, расчёта, регистра сведений с
-    регистратором), которому этот же флаг нужен явно включённым (Ruling 39, тесты
-    `test_накопления_с_флагом_включён_разрешено` и
-    `test_зависимый_регистр_сведений_с_флагом_включён_разрешён`)."""
-    b = база(permissions=Permissions(register_direct_write=False))
-    e = сущность(
-        "InformationRegister_КурсыВалют",
-        "InformationRegister",
-        is_records=True,
-        is_independent_register=True,
-    )
-    проверить(b, e, "create")
-
-
-def test_независимый_регистр_сведений_при_register_direct_write_true_разрешено():
-    """Ruling 57 не трогает независимый регистр сведений: и при включённом флаге он пишется."""
-    e = сущность(
-        "InformationRegister_КурсыВалют",
-        "InformationRegister",
-        is_independent_register=True,
-    )
-    for op in ("create", "update"):
-        проверить(база(permissions=Permissions(register_direct_write=True)), e, op)
-
-
-ЗАВИСИМЫЕ_РЕГИСТРЫ = [
+РЕГИСТРЫ = [
+    # Ruling 60: независимый регистр сведений — тоже отказ (прежде писался по `write: true`).
+    pytest.param(
+        сущность(
+            "InformationRegister_КурсыВалют", "InformationRegister", is_independent_register=True
+        ),
+        id="сведений-независимый",
+    ),
     # Основной набор (ключ `Recorder`): у него `is_records=False` — прежний шаг 3 его не видел.
     pytest.param(
         сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister"),
@@ -178,12 +158,13 @@ def test_независимый_регистр_сведений_при_register_
 
 @pytest.mark.parametrize("флаг", [False, True], ids=["без-флага", "с-флагом"])
 @pytest.mark.parametrize("op", ["create", "update", "mark_for_deletion"])
-@pytest.mark.parametrize("e", ЗАВИСИМЫЕ_РЕГИСТРЫ)
-def test_Ruling_57_зависимый_регистр_отклоняется_при_любом_флаге(e, op, флаг):
+@pytest.mark.parametrize("e", РЕГИСТРЫ)
+def test_Ruling_57_60_регистр_отклоняется_при_любом_флаге(e, op, флаг):
     """Ruling 57: регистр узнаётся по виду сущности; запись в регистр, подчинённый регистратору,
     в первой поставке не поддерживается ни при каком `register_direct_write` — движения
     формирует проведение документа. POST набора с `Recorder` мог бы переписать движения документа,
-    а проба P8 этого не проверяла."""
+    а проба P8 этого не проверяла. Ruling 60: то же для независимого регистра сведений — POST по
+    существующему ключу мог бы заместить запись, а «до» у `create` нет."""
     b = база(
         permissions=Permissions(register_direct_write=флаг, mark_deletion=True, post_documents=True)
     )
@@ -191,7 +172,7 @@ def test_Ruling_57_зависимый_регистр_отклоняется_пр
         проверить(b, e, op)
     assert инфо.value.code == "permission_denied"
     assert e.name in инфо.value.message
-    assert "подчинённых регистратору" in инфо.value.hint
+    assert "первой поставке не поддерживается" in инфо.value.hint
     assert "odata1c_action" in инфо.value.hint and "Post" in инфо.value.hint
 
 
