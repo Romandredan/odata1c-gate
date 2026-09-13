@@ -34,7 +34,13 @@ from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_d
 from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy
-from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
+from odata1c.gate.service import (
+    auto_policy_path,
+    classifier_for,
+    open_dictionary,
+    policy_path,
+    refresh_policy,
+)
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import reindex
 from odata1c.index.repository import IndexCorruptError
@@ -295,12 +301,13 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
     print(результат.message)
     # Политика — на каждом реиндексе, а не только перестроившем индекс (находка П1, тот же довод,
     # что у `ToolService.reindex`): раздел `auto` зависит и от классификатора, а тот меняется с
-    # версией шлюза. Сообщение печатается, только если файл действительно переписан.
-    путь_политики = policy_path(home, base.name)
-    было = путь_политики.read_bytes() if путь_политики.exists() else None
+    # версией шлюза. Сообщение печатается, только если файл авторазметки действительно переписан
+    # (ADR-0015: реиндекс пишет только `policy.auto.yaml`, файл владельца `policy.yaml` не трогает).
+    путь_авторазметки = auto_policy_path(home, base.name)
+    было = путь_авторазметки.read_bytes() if путь_авторазметки.exists() else None
     на_проверку = refresh_policy(home, base)
-    if путь_политики.read_bytes() != было:
-        print(f"политика обновлена: {путь_политики}")
+    if путь_авторазметки.read_bytes() != было:
+        print(f"политика обновлена: {путь_авторазметки}")
         if на_проверку:
             print(f"поля классов org и person на проверку ({len(на_проверку)}):")
             for поле in на_проверку[:20]:

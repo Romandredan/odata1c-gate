@@ -91,34 +91,47 @@ class BaseGate:
         dictionary: Dictionary,
         guard: Guard,
         policy_path: pathlib.Path,
+        auto_path: pathlib.Path | None = None,
     ) -> None:
         self._base = base
         self._dictionary = dictionary
         self._guard = guard
         self._policy_path = pathlib.Path(policy_path)
+        self._auto_path = pathlib.Path(auto_path) if auto_path else None
         self.mode = base.gate.mode
-        self._mtime: float | None = None
+        self._stamp: tuple | None = None
         self._masker: Masker | None = None
         self.refresh()
 
+    def _отметка(self) -> tuple:
+        """Отпечаток обоих файлов политики (ADR-0015): владелец правит `policy.yaml`, реиндекс —
+        `policy.auto.yaml`, и перемена любого из них требует пересборки `Masker`."""
+
+        def одна(путь: pathlib.Path | None):
+            return (путь.stat().st_mtime, путь.stat().st_size) if путь and путь.exists() else None
+
+        return (одна(self._policy_path), одна(self._auto_path))
+
     def refresh(self, *, force: bool = False) -> None:
-        """Перечитать политику, если файл изменился с прошлого раза. Политику перезаписывает и
-        реиндекс (раздел auto), и пользователь (fields) — демон живёт дольше одной версии файла.
-        Сверка mtime дешевле разбора YAML на каждый вызов. Отсутствующий файл политики —
-        не ошибка и не повод падать (`load_policy` отдаёт пустую `Policy`): демон поднимается
-        и без политики, с пустыми классами.
+        """Перечитать политику, если один из файлов изменился с прошлого раза. Политику
+        перезаписывает и реиндекс (`policy.auto.yaml` целиком), и владелец (`policy.yaml`) —
+        демон живёт дольше одной версии файла. Сверка отпечатка (mtime, size) дешевле разбора YAML
+        на каждый вызов; размер в паре с mtime — та же страховка, что и раньше (mtime на Windows
+        не наносекунды), только на оба файла разом. Отсутствующий файл политики — не ошибка и не
+        повод падать (`load_policy` отдаёт пустую `Policy`): демон поднимается и без политики,
+        с пустыми классами.
 
         `force=True` — перечитать безусловно (план M1d, задача 7): тот, кто ТОЛЬКО ЧТО сам
         переписал политику (`ToolService.reindex` → `refresh_policy`), не может опираться на
-        mtime. Прежнее значение снято этим же гейтом секундой раньше, и если файловая система
-        отдала обеим отметкам одно значение (разрешение mtime на Windows — не наносекунды),
-        обычный `refresh()` счёл бы новую политику прежней и оставил бы маскировщик на старых
-        классах полей — то есть новое защищаемое поле ушло бы модели открытым."""
-        mtime = self._policy_path.stat().st_mtime if self._policy_path.exists() else None
-        if not force and mtime == self._mtime and self._masker is not None:
+        отпечаток. Прежнее значение снято этим же гейтом секундой раньше, и если файловая система
+        отдала обеим отметкам одно значение, обычный `refresh()` счёл бы новую политику прежней и
+        оставил бы маскировщик на старых классах полей — то есть новое защищаемое поле ушло бы
+        модели открытым."""
+        отметка = self._отметка()
+        if not force and отметка == self._stamp and self._masker is not None:
             return
-        policy = load_policy(self._policy_path)
-        self._policy, self._mtime = policy, mtime
+        policy = load_policy(self._policy_path, self._auto_path)
+        self._policy, self._stamp = policy, отметка
         self._masker = Masker(self._dictionary, policy, mode=self.mode, base=self._base.name)
 
     def _обратная_подмена(self, shape: Shape) -> Unmasker:

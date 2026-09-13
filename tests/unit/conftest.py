@@ -6,10 +6,29 @@ import httpx
 import pytest
 
 from odata1c.config.models import Limits
+from odata1c.gate.service import policy_path
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.repository import IndexRepository
 
 ОБРАЗЦЫ = pathlib.Path(__file__).parent.parent / "fixtures" / "edmx"
+
+
+def обеспечить_policy_yaml(home: pathlib.Path, base_name: str) -> pathlib.Path:
+    """Создать пустой файл владельца `policy.yaml`, если его ещё нет.
+
+    ADR-0015: `refresh_policy` больше не создаёт файл владельца — она пишет только
+    `policy.auto.yaml` (см. `odata1c.gate.service.refresh_policy`). Файл владельца создаёт
+    `base add` из шаблона (задача плана, ещё не реализована), а в тестах, что настраивают базу
+    напрямую — минуя `base add`, — эту роль берёт на себя эта функция: без неё тесты, дописывающие
+    правила в `policy.yaml` (`entities.hide` и подобные), падали бы с `FileNotFoundError`.
+    Минимальное содержимое — как у будущего шаблона `base add` (SPEC §6.9): версия и
+    `scan_free_text` включён по умолчанию."""
+    путь = policy_path(home, base_name)
+    if not путь.exists():
+        путь.parent.mkdir(parents=True, exist_ok=True)
+        путь.write_text("version: 2\nscan_free_text: true\n", encoding="utf-8")
+    return путь
+
 
 # По одному правдоподобному значению на каждый класс гейта (`tokens.CLASSES`, кроме `keep`).
 # Общий набор для всех параметризованных проверок «по всем классам сразу»: урок ревью

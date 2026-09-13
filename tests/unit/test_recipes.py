@@ -17,6 +17,7 @@ from conftest import (
     ЗНАЧЕНИЯ_КЛАССОВ,
     без_навигаций,
     ничего_не_скрыто,
+    обеспечить_policy_yaml,
     строение_неизвестно,
     эхо_отбора,
 )
@@ -484,6 +485,7 @@ def дом(tmp_path, edmx_ut_real):
     хранилище.write(parse_edmx(edmx_ut_real))
     хранилище.close()
     refresh_policy(home, config.bases["ut"])
+    обеспечить_policy_yaml(home, "ut")
     (home / "bases" / "ut" / "recipes.yaml").write_text(РЕЦЕПТЫ_ТЕСТА, encoding="utf-8")
     return home
 

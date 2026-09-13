@@ -21,7 +21,12 @@ import uuid
 import httpx
 import pytest
 import respx
-from conftest import без_навигаций, ничего_не_скрыто, строение_неизвестно
+from conftest import (
+    без_навигаций,
+    ничего_не_скрыто,
+    обеспечить_policy_yaml,
+    строение_неизвестно,
+)
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -125,6 +130,7 @@ def _дом(tmp_path, edmx: bytes):
         хранилище.write(parse_edmx(edmx))
         хранилище.close()
         refresh_policy(home, config.bases[имя])
+        обеспечить_policy_yaml(home, имя)
     return home
 
 

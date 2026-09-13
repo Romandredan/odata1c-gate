@@ -17,12 +17,13 @@ from conftest import (
     ЗНАЧЕНИЯ_КЛАССОВ,
     без_навигаций,
     ничего_не_скрыто,
+    обеспечить_policy_yaml,
     строение_неизвестно,
     эхо_отбора,
 )
 
 from odata1c.cli import main
-from odata1c.gate.service import policy_path, refresh_policy
+from odata1c.gate.service import auto_policy_path, policy_path, refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import PARSER_VERSION, index_path
 from odata1c.index.repository import IndexRepository
@@ -66,6 +67,7 @@ def _дом(tmp_path, edmx_ut_real):
     хранилище.write(parse_edmx(edmx_ut_real))
     хранилище.close()
     refresh_policy(home, config.bases["ut"])
+    обеспечить_policy_yaml(home, "ut")
     return home
 
 
@@ -2093,18 +2095,16 @@ async def test_reindex_без_скрытых_показывает_разницу
 
 
 async def test_reindex_пересобирает_политику_и_гейт_её_видит(сервис, respx_ut, edmx_ut_real, дом):
-    """После перестройки индекса политика пересобрана И гейт её перечитал.
+    """После перестройки индекса авторазметка пересобрана И гейт её перечитал.
 
-    Пока гейт держит прежнюю политику, маскировщик знает прежние классы полей — то есть поле,
+    Пока гейт держит прежнюю авторазметку, маскировщик знает прежние классы полей — то есть поле,
     ставшее защищаемым при этом реиндексе, ушло бы модели открытым. Проверяется с пустого места:
-    политика удалена, гейт это увидел (поле не защищено), и только реиндекс возвращает защиту.
-    """
-    from odata1c.gate.service import policy_path
-
-    # Поле выбрано так, чтобы защита зависела ИМЕННО от политики: `ИНН` узнаёт запасной
-    # классификатор по имени поля даже с пустой политикой, а `Description` контрагента относит
-    # к классу `org` только раздел `auto`, собранный по индексу.
-    policy_path(дом, "ut").unlink()
+    файл авторазметки удалён, гейт это увидел (поле не защищено), и только реиндекс возвращает
+    защиту (ADR-0015: классы полей — в `policy.auto.yaml`, файл владельца их не несёт)."""
+    # Поле выбрано так, чтобы защита зависела ИМЕННО от авторазметки: `ИНН` узнаёт запасной
+    # классификатор по имени поля даже без неё, а `Description` контрагента относит к классу
+    # `org` только раздел `auto`, собранный по индексу.
+    auto_policy_path(дом, "ut").unlink()
     гейт = сервис._gate_for(сервис._config.bases["ut"])
     гейт.refresh()
     assert not гейт.is_protected("Catalog_Контрагенты", "Description", shape=строение_неизвестно)
@@ -2113,7 +2113,7 @@ async def test_reindex_пересобирает_политику_и_гейт_е�
     данные = json.loads(await сервис.reindex(SessionScope(), base="ut", force=True))
 
     assert данные["changed"] is True
-    assert policy_path(дом, "ut").exists()
+    assert auto_policy_path(дом, "ut").exists()
     assert гейт.is_protected("Catalog_Контрагенты", "Description", shape=строение_неизвестно)
 
 
@@ -2171,10 +2171,12 @@ async def test_перечисление_открыто_и_при_словаре_
 
 
 def _записать_auto(дом, ключ: str, класс: str) -> None:
-    путь = policy_path(дом, "ut")
-    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
-    политика["auto"][ключ] = класс
-    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+    """Устаревшая авторазметка (ADR-0015: раздел `auto` — в `policy.auto.yaml`, не в файле
+    владельца), как её мог записать прежний классификатор шлюза до правки П1."""
+    путь = auto_policy_path(дом, "ut")
+    авторазметка = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    авторазметка["auto"][ключ] = класс
+    путь.write_text(yaml.safe_dump(авторазметка, allow_unicode=True), encoding="utf-8")
 
 
 async def test_reindex_без_изменений_пересобирает_устаревший_auto(
@@ -2195,8 +2197,8 @@ async def test_reindex_без_изменений_пересобирает_уст
     данные = json.loads(await сервис.reindex(SessionScope(), base="ut"))
 
     assert данные["changed"] is False
-    политика = yaml.safe_load(policy_path(дом, "ut").read_text(encoding="utf-8"))
-    assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
+    авторазметка = yaml.safe_load(auto_policy_path(дом, "ut").read_text(encoding="utf-8"))
+    assert "Catalog_Контрагенты.ЮрФизЛицо" not in авторазметка["auto"]
     assert гейт.field_class("Catalog_Контрагенты", "ЮрФизЛицо", shape=строение_неизвестно) is None
     # Смена классов без перемены `$metadata` меняет то, как приходят значения, посреди сессии;
     # модель узнаёт об этом из ответа, а не из «у того же контрагента вдруг другое значение».
@@ -2672,11 +2674,24 @@ async def test_raw_get_неизвестная_база(сервис):
 # ---------------------------------------------------------------------------------------------
 
 
-async def test_resource_policy_отдаёт_текст_политики(сервис):
+async def test_resource_policy_отдаёт_текст_политики(сервис, дом):
+    """Ресурс отдаёт файл владельца дословно: правило, вписанное в `fields`, видно в тексте.
+
+    ADR-0015: классы `auto` живут в `policy.auto.yaml`, и сегодняшний `resource_policy` их не
+    видит вовсе — объединённый вид с источником каждой строки (владелец | авто) назначен
+    задаче 4; здесь проверяется то, что уже работает — ручное правило владельца."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(
+        путь.read_text(encoding="utf-8") + "fields:\n  Catalog_Контрагенты.ИНН: inn\n",
+        encoding="utf-8",
+    )
+
     текст = await сервис.resource_policy(SessionScope(), "ut")
 
     assert "Catalog_Контрагенты.ИНН" in текст
-    assert "auto" in текст
+    assert "fields" in текст
 
 
 async def test_resource_policy_чужой_базы_не_видна_суженной_сессии(сервис):
@@ -2730,10 +2745,10 @@ async def test_resource_policy_не_называет_скрытые_сущнос
 
 
 async def test_resource_policy_не_выдаёт_скрытое_дырой_в_mask_for(сервис, дом):
-    """Ruling 29, вторая форма (ревью раундов 4 и 5): `defaults.addr.mask_for` в сгенерированной
-    политике — всегда имена из константы `СУЩНОСТИ_ФИЗЛИЦ`, одинаковые у всех баз. Когда
-    из него вычёркивалось скрытое имя, недостающее вычислялось однозначно: эталон известен из
-    поставки.
+    """Ruling 29, вторая форма (ревью раундов 4 и 5): `defaults.addr.mask_for` — список имён,
+    известный заранее (владелец мог вписать его сам, как здесь, — до задачи 4 ресурс не видит
+    список авторазметки вовсе, ADR-0015). Когда из него вычёркивалось скрытое имя, недостающее
+    вычислялось однозначно: эталон известен.
 
     Поправка ревьюера к исходному предложению — заменять список пометкой ВСЕГДА, когда у базы есть
     скрытые, а не только при пересечении со скрытыми: иначе сама пометка сообщает, что скрыта одна
@@ -2748,7 +2763,9 @@ async def test_resource_policy_не_выдаёт_скрытое_дырой_в_ma
     from odata1c.gate.service import policy_path
 
     путь = policy_path(дом, "ut")
-    исходный = путь.read_text(encoding="utf-8")
+    исходный = путь.read_text(encoding="utf-8") + yaml.safe_dump(
+        {"defaults": {"addr": {"mask_for": sorted(СУЩНОСТИ_ФИЗЛИЦ)}}}, allow_unicode=True
+    )
     assert set(yaml.safe_load(исходный)["defaults"]["addr"]["mask_for"]) == СУЩНОСТИ_ФИЗЛИЦ, (
         "образец не тот: в сгенерированной политике нет эталонного mask_for"
     )

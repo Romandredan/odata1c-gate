@@ -42,7 +42,13 @@ from odata1c.gate.masking import (
 from odata1c.gate.pipeline import СТРОЖАЙШИЙ_УРОВЕНЬ, BaseGate, guard_only
 from odata1c.gate.policy import PolicyError, redact_policy
 from odata1c.gate.revealed import RevealedValues
-from odata1c.gate.service import classifier_for, open_dictionary, policy_path, refresh_policy
+from odata1c.gate.service import (
+    auto_policy_path,
+    classifier_for,
+    open_dictionary,
+    policy_path,
+    refresh_policy,
+)
 from odata1c.gate.unmasking import GateError
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path
@@ -476,6 +482,7 @@ class ToolService:
                 dictionary=self._dictionary,
                 guard=self._guard,
                 policy_path=policy_path(self._config.home, base.name),
+                auto_path=auto_policy_path(self._config.home, base.name),
             )
             self._gates[base.name] = гейт
         return гейт
@@ -1824,11 +1831,14 @@ class ToolService:
             # `auto` жил до первой перемены в конфигурации 1С или до `force`. Файл при этом
             # переписывается, только если меняется содержимое (`refresh_policy`), а гейт
             # перечитывает его принудительно — по той же причине, что и раньше (mtime на Windows).
-            путь_политики = policy_path(self._config.home, base_config.name)
-            прежняя_политика = путь_политики.read_bytes() if путь_политики.exists() else None
+            путь_авторазметки = auto_policy_path(self._config.home, base_config.name)
+            прежняя_авторазметка = (
+                путь_авторазметки.read_bytes() if путь_авторазметки.exists() else None
+            )
             refresh_policy(self._config.home, base_config)
             политика_переписана = (
-                прежняя_политика is not None and путь_политики.read_bytes() != прежняя_политика
+                прежняя_авторазметка is not None
+                and путь_авторазметки.read_bytes() != прежняя_авторазметка
             )
             гейт.refresh(force=True)
             if результат.changed:

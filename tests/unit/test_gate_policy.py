@@ -1,11 +1,12 @@
-"""Политика базы: приоритет разделов, скрытые сущности, слияние секции auto (SPEC §6.9)."""
+"""Политика базы: приоритет разделов, скрытые сущности, сборка политики из двух файлов —
+`policy.yaml` владельца и `policy.auto.yaml` авторазметки (SPEC §6.9, ADR-0015)."""
 
 import textwrap
 
 import pytest
 import yaml
 
-from odata1c.gate.policy import PolicyError, generate_policy, load_policy, merge_auto
+from odata1c.gate.policy import PolicyError, generate_policy, load_policy, strip_auto_section
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.repository import IndexRepository
 
@@ -131,16 +132,45 @@ def test_неизвестное_поле_без_класса(политика):
     assert политика.sensitivity_of("Catalog_Номенклатура", "Артикул") is None
 
 
-def test_слияние_auto_не_трогает_ручные_разделы():
-    существующая = {
-        "version": 2,
-        "fields": {"Catalog_Контрагенты.ИНН": "inn"},
-        "auto": {"Catalog_Контрагенты.КПП": "kpp"},
-    }
-    новая = merge_auto(существующая, {"Catalog_Контрагенты.ОГРН": "ogrn"})
+def test_политика_из_двух_файлов_приоритет_владельца(tmp_path):
+    владелец = tmp_path / "policy.yaml"
+    авто = tmp_path / "policy.auto.yaml"
+    владелец.write_text(
+        "version: 2\nfields:\n  Catalog_Контрагенты.КодПоОКПО: keep\n"
+        "defaults:\n  addr:\n    mask_for: [Catalog_Партнеры]\n",
+        encoding="utf-8",
+    )
+    авто.write_text(
+        "version: 2\ndefaults:\n  corr: keep\n  bic: keep\n"
+        "  addr:\n    mask_for: [Catalog_ФизическиеЛица]\n"
+        "auto:\n  Catalog_Контрагенты.КодПоОКПО: org\n  Catalog_Контрагенты.ИНН: inn\n",
+        encoding="utf-8",
+    )
+    политика = load_policy(владелец, авто)
+    assert политика.sensitivity_of("Catalog_Контрагенты", "КодПоОКПО") == "keep"
+    assert политика.sensitivity_of("Catalog_Контрагенты", "ИНН") == "inn"
+    assert политика.addr_masked("Catalog_Партнеры")
+    assert политика.addr_masked("Catalog_ФизическиеЛица")
 
-    assert новая["fields"] == {"Catalog_Контрагенты.ИНН": "inn"}
-    assert новая["auto"] == {"Catalog_Контрагенты.ОГРН": "ogrn"}
+
+def test_без_файла_авторазметки_политика_владельца_работает(tmp_path):
+    владелец = tmp_path / "policy.yaml"
+    владелец.write_text("version: 2\nentities:\n  Catalog_X: {hide: true}\n", encoding="utf-8")
+    политика = load_policy(владелец, tmp_path / "policy.auto.yaml")
+    assert политика.is_hidden("Catalog_X")
+
+
+def test_strip_auto_section_сохраняет_комментарии(tmp_path):
+    файл = tmp_path / "policy.yaml"
+    файл.write_text(
+        "# шапка владельца\nversion: 2\nfields: {}   # мои правила\nauto:\n  Catalog_A.B: inn\n",
+        encoding="utf-8",
+    )
+    assert strip_auto_section(файл) is True
+    текст = файл.read_text(encoding="utf-8")
+    assert "# шапка владельца" in текст and "# мои правила" in текст
+    assert "auto:" not in текст and "Catalog_A.B" not in текст
+    assert strip_auto_section(файл) is False
 
 
 def test_политика_без_файла_даёт_умолчания(tmp_path):

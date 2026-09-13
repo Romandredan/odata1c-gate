@@ -55,17 +55,20 @@ def test_reindex_строит_индекс_на_базе_без_индекса(t
 def test_reindex_без_изменений_пересобирает_устаревший_auto(tmp_path, capsys, edmx_ut_real):
     """Находка П1, доставка правки классификатора через командную строку: `$metadata` тот же,
     а раздел `auto` устарел (так его записал прежний классификатор) — обычный `reindex` без
-    `--force` обязан его пересобрать и сказать об этом; повторный вызов — промолчать."""
+    `--force` обязан его пересобрать и сказать об этом; повторный вызов — промолчать.
+
+    ADR-0015: устаревшая авторазметка правится в `policy.auto.yaml` — реиндекс владельца
+    (`policy.yaml`) не трогает вовсе."""
     import yaml
 
     home = _домашний_с_базой(tmp_path)
     respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(200, content=edmx_ut_real))
     _замокать_завершение_сеанса()
     assert main(["reindex", "ut", "--home", str(home)]) == 0
-    путь = home / "bases" / "ut" / "policy.yaml"
-    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
-    политика["auto"]["Catalog_Контрагенты.ЮрФизЛицо"] = "person"
-    путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+    путь = home / "bases" / "ut" / "policy.auto.yaml"
+    авторазметка = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    авторазметка["auto"]["Catalog_Контрагенты.ЮрФизЛицо"] = "person"
+    путь.write_text(yaml.safe_dump(авторазметка, allow_unicode=True), encoding="utf-8")
     capsys.readouterr()
 
     assert main(["reindex", "ut", "--home", str(home)]) == 0
@@ -73,8 +76,8 @@ def test_reindex_без_изменений_пересобирает_устаре
 
     assert "без изменений" in вывод
     assert "политика обновлена" in вывод
-    политика = yaml.safe_load(путь.read_text(encoding="utf-8"))
-    assert "Catalog_Контрагенты.ЮрФизЛицо" not in политика["auto"]
+    авторазметка = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    assert "Catalog_Контрагенты.ЮрФизЛицо" not in авторазметка["auto"]
 
     assert main(["reindex", "ut", "--home", str(home)]) == 0
     assert "политика обновлена" not in capsys.readouterr().out

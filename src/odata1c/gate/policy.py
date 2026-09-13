@@ -4,13 +4,20 @@
 поля) > `defaults` (глобальные умолчания, применяются к уже найденному значению) > `auto`
 (автоматика reindex). Признак скрытости сущности (`entities.hide`) — отдельная настройка и в
 этом приоритете не участвует (поправка SPEC §6.9, 2026-09-09: исходная формула ошибочно смешивала
-обе оси). Секцию `auto` перезаписывает реиндекс, ручные разделы (`fields`, `entities`, `custom`,
-`names_for`, `defaults`) не трогаются никогда.
+обе оси).
+
+Поправка 2026-09-14 (ADR-0015): политика живёт в двух файлах. `policy.yaml` — только владелец,
+машина его не переписывает; всё, что вычислил реиндекс (раздел `auto` и умолчания авторазметки),
+лежит в `policy.auto.yaml` рядом (`odata1c.gate.service.refresh_policy`). `load_policy` собирает
+действующую политику в памяти: правила владельца поверх авторазметки. Ручные разделы (`fields`,
+`entities`, `custom`, `names_for`, `defaults` владельца) не трогаются никогда.
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import os
 import pathlib
 import re
 
@@ -166,18 +173,35 @@ class Policy:
         return собранное
 
 
-def load_policy(path: pathlib.Path) -> Policy:
+def load_policy(path: pathlib.Path, auto_path: pathlib.Path | None = None) -> Policy:
+    """Собрать действующую политику базы (ADR-0015): правила владельца (`path`, `policy.yaml`)
+    поверх авторазметки (`auto_path`, `policy.auto.yaml`, см. `read_auto`).
+
+    Без `auto_path` — прежнее поведение (один файл, раздел `auto` в нём же): нужен и тестам
+    старого формата, и `owner_names_for` — вызывающему, которому авторазметка не нужна вовсе.
+
+    Раздел `auto` в файле владельца ещё возможен до первого реиндекса новой версии
+    (`service.refresh_policy` уносит его в `policy.auto.yaml` только на первом вызове) — он
+    участвует в слиянии, но уступает файлу авторазметки. Умолчания собираются `merge_defaults`:
+    владелец поверх авторазметки, `defaults.addr.mask_for` — объединением списков."""
     path = pathlib.Path(path)
-    if not path.exists():
-        return Policy()
-    данные = _разобрать_yaml(path)
+    данные = _разобрать_yaml(path) if path.exists() else {}
     _проверить_разделы(данные, path)
+
+    if auto_path is not None:
+        авто = read_auto(auto_path)
+        _auto = {**(данные.get("auto") or {}), **(авто.get("auto") or {})}
+        _defaults = merge_defaults(авто.get("defaults") or {}, данные.get("defaults") or {})
+    else:
+        _auto = данные.get("auto") or {}
+        _defaults = данные.get("defaults") or {}
+
     return Policy(
         scan_free_text=bool(данные.get("scan_free_text", True)),
-        _defaults=данные.get("defaults") or {},
+        _defaults=_defaults,
         _entities=данные.get("entities") or {},
         _fields=данные.get("fields") or {},
-        _auto=данные.get("auto") or {},
+        _auto=_auto,
         _custom=данные.get("custom") or {},
         _names_for=данные.get("names_for"),
     )
@@ -264,11 +288,11 @@ def _разобрать_yaml(path: pathlib.Path) -> dict:
     return данные or {}
 
 
-def _проверить_тип_раздела(данные: dict, ключ: str) -> None:
+def _проверить_тип_раздела(данные: dict, ключ: str, path: pathlib.Path) -> None:
     значение = данные.get(ключ)
     if значение is not None and not isinstance(значение, dict):
         raise PolicyError(
-            f"policy.yaml: раздел {ключ} должен быть словарём, получено {type(значение).__name__}"
+            f"{path.name}: раздел {ключ} должен быть словарём, получено {type(значение).__name__}"
         )
 
 
@@ -276,7 +300,7 @@ def _проверить_разделы(данные: dict, path: pathlib.Path) -
     """Раздел неожиданного типа и недопустимое regex своего класса — ошибка при чтении политики,
     а не при первом обращении к полю посреди обработки ответа тула (SPEC §6.9)."""
     for раздел in ("defaults", "entities", "fields", "auto", "custom"):
-        _проверить_тип_раздела(данные, раздел)
+        _проверить_тип_раздела(данные, раздел, path)
     имена = данные.get("names_for")
     if имена is not None and not isinstance(имена, list):
         raise PolicyError(
@@ -331,7 +355,73 @@ def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
     }
 
 
-def merge_auto(existing: dict, generated_auto: dict) -> dict:
-    результат = dict(existing)
-    результат["auto"] = dict(generated_auto)
-    return результат
+АВТОРАЗМЕТКА_ШАПКА = (
+    "# odata1c: авторазметка гейта — классы полей, вычисленные реиндексом по индексу (SPEC §4.3).\n"
+    "# НЕ РЕДАКТИРОВАТЬ: файл пересобирается каждым реиндексом.\n"
+    "# Правила владельца — в policy.yaml рядом.\n"
+)
+
+
+def read_auto(path: pathlib.Path) -> dict:
+    """Прочитать `policy.auto.yaml` (или, до первого реиндекса новой версии, раздел `auto` файла
+    владельца — формат обоих файлов одинаков): разделы `defaults` и `auto`. Нет файла — демон ещё
+    не индексировал базу, это не ошибка, а пустой словарь `{}` (а не словарь с пустыми `defaults`
+    и `auto` — вызывающий отличает «файла нет совсем» от «файл есть, но пуст»)."""
+    if not path.exists():
+        return {}
+    данные = _разобрать_yaml(path)
+    _проверить_тип_раздела(данные, "auto", path)
+    _проверить_тип_раздела(данные, "defaults", path)
+    return {"defaults": данные.get("defaults") or {}, "auto": данные.get("auto") or {}}
+
+
+def dump_auto(path: pathlib.Path, *, defaults: dict, auto: dict) -> None:
+    """Переписать `policy.auto.yaml` целиком: атомарно (временный файл рядом, `os.replace`), с
+    предупреждающей шапкой (`АВТОРАЗМЕТКА_ШАПКА`). Комментарии владельца здесь беречь не от чего —
+    файл целиком принадлежит машине (ADR-0015); обратимый разбор (`ruamel.yaml`) нужен только
+    `strip_auto_section` — там, где правки владельца рядом с разделом `auto` теряться не должны."""
+    тело = yaml.safe_dump(
+        {"version": 2, "defaults": defaults, "auto": auto}, allow_unicode=True, sort_keys=True
+    )
+    временный = path.with_suffix(".yaml.new")
+    временный.write_text(АВТОРАЗМЕТКА_ШАПКА + тело, encoding="utf-8")
+    os.replace(временный, path)
+
+
+def merge_defaults(авто: dict, владелец: dict) -> dict:
+    """Умолчания классов: владелец поверх авторазметки; `addr.mask_for` — объединение списков
+    (авторазметка знает справочники людей по индексу, Ruling 36; владелец мог добавить своих —
+    ни один список не должен вытеснить другой)."""
+    итог = copy.deepcopy(авто)
+    for ключ, значение in владелец.items():
+        if ключ == "addr" and isinstance(значение, dict):
+            адрес = итог.setdefault("addr", {})
+            список = list(
+                dict.fromkeys([*(адрес.get("mask_for") or []), *(значение.get("mask_for") or [])])
+            )
+            адрес.update({к: в for к, в in значение.items() if к != "mask_for"})
+            адрес["mask_for"] = список
+        else:
+            итог[ключ] = значение
+    return итог
+
+
+def strip_auto_section(path: pathlib.Path) -> bool:
+    """Унести раздел `auto` из файла владельца (первый реиндекс новой версии, ADR-0015, SPEC
+    §4.3): обратимый разбор `ruamel.yaml` сохраняет комментарии и порядок остальных разделов —
+    обычный `yaml.safe_dump` их бы стёр. `True` — раздел был и удалён; `False` — файла владельца
+    эта версия уже не касается (обычный случай на каждом следующем реиндексе)."""
+    from ruamel.yaml import YAML
+
+    yaml_rt = YAML()
+    yaml_rt.preserve_quotes = True
+    with path.open(encoding="utf-8") as f:
+        данные = yaml_rt.load(f)
+    if not isinstance(данные, dict) or "auto" not in данные:
+        return False
+    del данные["auto"]
+    временный = path.with_suffix(".yaml.new")
+    with временный.open("w", encoding="utf-8") as f:
+        yaml_rt.dump(данные, f)
+    os.replace(временный, path)
+    return True

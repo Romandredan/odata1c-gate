@@ -20,6 +20,9 @@ dependencies = [
     "httpx2>=2.12",
     "pydantic>=2.7",
     "pyyaml>=6.0",
+    # Обратимый разбор YAML для конструктора политики (ADR-0015): запись правила владельца в
+    # policy.yaml с сохранением его комментариев (strip_auto_section — первый потребитель).
+    "ruamel.yaml>=0.18",
     "lxml>=5.2",
     "snowballstemmer>=2.2",
     "ahocorasick-rs>=0.22",

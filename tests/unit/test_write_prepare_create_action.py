@@ -19,7 +19,13 @@ import httpx
 import pytest
 import respx
 import yaml
-from conftest import без_класса_пути, без_навигаций, ничего_не_скрыто, строение_неизвестно
+from conftest import (
+    без_класса_пути,
+    без_навигаций,
+    ничего_не_скрыто,
+    обеспечить_policy_yaml,
+    строение_неизвестно,
+)
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
@@ -135,6 +141,7 @@ def дом(tmp_path, edmx_ut_real):
         хранилище.write(parse_edmx(edmx_ut_real))
         хранилище.close()
         refresh_policy(home, config.bases[имя])
+        обеспечить_policy_yaml(home, имя)
     return home
 
 
@@ -1065,6 +1072,7 @@ async def _среда_на(tmp_path, edmx: bytes, bases_yaml: str, поля: dic
         хранилище.write(parse_edmx(edmx))
         хранилище.close()
         refresh_policy(home, config.bases[имя])
+        обеспечить_policy_yaml(home, имя)
     if поля:
         путь = policy_path(home, "ut")
         политика = yaml.safe_load(путь.read_text(encoding="utf-8")) or {}

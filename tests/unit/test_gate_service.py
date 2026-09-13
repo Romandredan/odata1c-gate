@@ -1,4 +1,8 @@
-"""Политика базы после реиндекса и локальное раскрытие токена (SPEC §4.3, §3.5, §14.5)."""
+"""Политика базы после реиндекса и локальное раскрытие токена (SPEC §4.3, §3.5, §14.5).
+
+ADR-0015: реиндекс (`refresh_policy`) пишет только `policy.auto.yaml`; файл владельца
+`policy.yaml` не трогает — кроме единственного случая, первого вызова новой версии на базе, где
+раздел `auto` ещё лежит в файле владельца (миграция, `strip_auto_section`)."""
 
 import textwrap
 
@@ -6,7 +10,13 @@ import pytest
 import yaml
 
 from odata1c.config.models import BaseConfig
-from odata1c.gate.service import classifier_for, owner_names_for, policy_path, refresh_policy
+from odata1c.gate.service import (
+    auto_policy_path,
+    classifier_for,
+    owner_names_for,
+    policy_path,
+    refresh_policy,
+)
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
@@ -34,7 +44,7 @@ def дом_с_индексом(tmp_path, edmx_synthetic):
 
 def test_политика_создаётся_с_секцией_auto(дом_с_индексом):
     refresh_policy(дом_с_индексом, база())
-    данные = yaml.safe_load(policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
+    данные = yaml.safe_load(auto_policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
 
     assert данные["auto"]["Catalog_Контрагенты.ИНН"] == "inn"
     assert данные["auto"]["Catalog_Контрагенты.КПП"] == "kpp"
@@ -43,7 +53,7 @@ def test_политика_создаётся_с_секцией_auto(дом_с_и
 
 def test_описание_контрагентов_попадает_в_класс_названий(дом_с_индексом):
     refresh_policy(дом_с_индексом, база())
-    данные = yaml.safe_load(policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
+    данные = yaml.safe_load(auto_policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
     assert данные["auto"]["Catalog_Контрагенты.Description"] == "org"
 
 
@@ -63,7 +73,41 @@ def test_повторный_вызов_без_изменений_не_возвр
     assert второй_вызов == []
 
 
+def test_реиндекс_пишет_только_авторазметку_и_не_переписывает_её_повторно(дом_с_индексом):
+    """Шаг 6 плана: `policy.auto.yaml` получает предупреждающую шапку и раздел `auto`; файл
+    владельца с разделом `auto` и комментарием после вызова теряет `auto`, но не комментарий;
+    повторный вызов без перемен файл авторазметки не переписывает (ADR-0015)."""
+    путь_владельца = policy_path(дом_с_индексом, "ut")
+    путь_владельца.parent.mkdir(parents=True, exist_ok=True)
+    путь_владельца.write_text(
+        "# мой комментарий владельца\nversion: 2\nfields: {}\n"
+        "auto:\n  Catalog_Устаревший.Поле: inn\n",
+        encoding="utf-8",
+    )
+
+    refresh_policy(дом_с_индексом, база())
+
+    путь_авто = auto_policy_path(дом_с_индексом, "ut")
+    текст_авто = путь_авто.read_text(encoding="utf-8")
+    assert "НЕ РЕДАКТИРОВАТЬ" in текст_авто
+    авто = yaml.safe_load(текст_авто)
+    assert авто["auto"]["Catalog_Контрагенты.ИНН"] == "inn"
+
+    текст_владельца = путь_владельца.read_text(encoding="utf-8")
+    assert "# мой комментарий владельца" in текст_владельца
+    assert "auto:" not in текст_владельца
+
+    отметка_до = путь_авто.stat().st_mtime_ns
+    содержимое_до = путь_авто.read_bytes()
+    refresh_policy(дом_с_индексом, база())
+    assert путь_авто.stat().st_mtime_ns == отметка_до  # файл не переписан повторно
+    assert путь_авто.read_bytes() == содержимое_до
+
+
 def test_ручные_разделы_не_затираются(дом_с_индексом):
+    """Раздел `auto`, ещё лежащий в файле владельца (база со старым `policy.yaml`), первый вызов
+    новой версии уносит в `policy.auto.yaml` целиком (`strip_auto_section`) — ручные разделы
+    (`fields`, `entities`) остаются на месте, старое значение `auto` не переживает перенос."""
     путь = policy_path(дом_с_индексом, "ut")
     путь.parent.mkdir(parents=True, exist_ok=True)
     путь.write_text(
@@ -82,10 +126,12 @@ def test_ручные_разделы_не_затираются(дом_с_инд�
 
     refresh_policy(дом_с_индексом, база())
     данные = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    авто = yaml.safe_load(auto_policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
 
     assert данные["fields"] == {"Catalog_Контрагенты.ИНН": "keep"}
     assert данные["entities"]["Catalog_БанковскиеСчета"]["hide"] is True
-    assert "Catalog_Устаревший.Поле" not in данные["auto"]  # старое auto заменено целиком
+    assert "auto" not in данные  # унесено в policy.auto.yaml
+    assert "Catalog_Устаревший.Поле" not in авто["auto"]  # старое auto заменено целиком
 
 
 def test_список_названий_базы_учитывается(дом_с_индексом):
@@ -96,10 +142,13 @@ def test_список_названий_базы_учитывается(дом_с
     путь.write_text("version: 2\nnames_for: [Catalog_БанковскиеСчета]\n", encoding="utf-8")
 
     refresh_policy(дом_с_индексом, база())
-    данные = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    авто = yaml.safe_load(auto_policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
 
-    assert данные["auto"]["Catalog_БанковскиеСчета.Description"] == "org"
-    assert "Catalog_Контрагенты.Description" not in данные["auto"]
+    assert авто["auto"]["Catalog_БанковскиеСчета.Description"] == "org"
+    assert "Catalog_Контрагенты.Description" not in авто["auto"]
+    # Раздел names_for — ручной, реиндекс его не трогает.
+    владелец = yaml.safe_load(путь.read_text(encoding="utf-8"))
+    assert владелец["names_for"] == ["Catalog_БанковскиеСчета"]
 
 
 def test_классификатор_совместим_с_реиндексом(tmp_path):
