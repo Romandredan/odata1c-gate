@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 
 import httpx2
@@ -424,6 +425,98 @@ async def _сценарий_подделок(home, порт: int, объекты
     assert "commit_id" in выполнено, текст
     assert _механизм_в_журнале(home, выполнено["commit_id"]) == "claude_code"
     assert объекты.записи == [("PATCH", ПУТЬ, {"ИНН": НОВЫЙ_ИНН})]
+
+
+def _сессии_из_журнала(home) -> list[str]:
+    """Идентификаторы сессий, которые SDK пишет в журнал демона на INFO («Created new transport
+    with session ID: …») — так их прочитает любой процесс того же пользователя."""
+    текст = (home / "logs" / "daemon.log").read_text(encoding="utf-8")
+    return re.findall(r"session ID: ([0-9a-f]{32})", текст)
+
+
+async def _сырой_вызов(порт: int, sid: str, номер: int, тул: str, аргументы: dict) -> str:
+    """`tools/call` одним POST в чужую живую сессию — без SDK-клиента и без подписи, как `curl`."""
+    async with httpx2.AsyncClient(timeout=httpx2.Timeout(30)) as http:
+        ответ = await http.post(
+            daemon_url(порт),
+            headers={
+                SESSION_ID_HEADER: sid,
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+                "mcp-protocol-version": "2025-11-25",
+            },
+            content=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": номер,
+                    "method": "tools/call",
+                    "params": {"name": тул, "arguments": аргументы},
+                }
+            ),
+        )
+    assert ответ.status_code == 200, ответ.status_code
+    for строка in ответ.text.splitlines():
+        if строка.startswith("data:"):
+            сообщение = json.loads(строка[len("data:") :])
+            if сообщение.get("id") == номер:
+                return сообщение["result"]["content"][0]["text"]
+    raise AssertionError("ответа на вызов нет")
+
+
+async def test_идентификатор_сессии_из_журнала_не_даёт_записи_без_подписи(tmp_path):
+    """Обход подписи через идентификатор сессии: SDK пишет `mcp-session-id` в журнал демона и
+    принимает живую сессию от любого, кто его предъявит (проверено исполнением), а механизм
+    запоминается по сессии. Процесс модели читает идентификатор сессии Claude Code, которая уже
+    писала (механизм `claude_code`), и шлёт в неё `update` и `commit` без подписи — отказ, в 1С
+    ничего: механизм Claude Code действует только на подписанном лаунчером запросе."""
+    объекты = _объекты()
+    async with запущенная(объекты=объекты) as порт_1с:
+        home = _дом(tmp_path, порт_1с)
+        async with _демон(home) as порт:
+
+            async def сценарий() -> None:
+                async with через_лаунчер(
+                    home, порт, имя="claude-code", версия="2.1.267", ответ=ДА
+                ) as кл:
+                    подготовка = await _подготовить(кл)
+                    текст = await кл.вызвать(
+                        "odata1c_commit", {"pending_id": подготовка["pending_id"]}
+                    )
+                    assert "commit_id" in json.loads(текст), текст
+                    assert len(объекты.записи) == 1 and кл.вопросы == []
+
+                    [sid] = _сессии_из_журнала(home)
+                    подготовлено = json.loads(
+                        await _сырой_вызов(
+                            порт,
+                            sid,
+                            101,
+                            "odata1c_update",
+                            {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}},
+                        )
+                    )
+                    assert "pending_id" in подготовлено, подготовлено
+                    отказ = _ошибка(
+                        await _сырой_вызов(
+                            порт,
+                            sid,
+                            102,
+                            "odata1c_commit",
+                            {"pending_id": подготовлено["pending_id"]},
+                        )
+                    )
+                    assert отказ["code"] == "write_unsupported_client"
+                    assert len(объекты.записи) == 1
+                    # Сессия осталась сессией Claude Code: подписанный запрос лаунчера пишет.
+                    своя = await кл.json(
+                        "odata1c_update",
+                        {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}},
+                    )
+                    итог = await кл.вызвать("odata1c_commit", {"pending_id": своя["pending_id"]})
+                    assert "commit_id" in json.loads(итог), итог
+                    assert len(объекты.записи) == 2 and кл.вопросы == []
+
+            await asyncio.wait_for(сценарий(), ПРЕДЕЛ_СЦЕНАРИЯ_С)
 
 
 async def test_демон_без_ключа_не_выдаёт_claude_code_и_предупреждает(tmp_path):

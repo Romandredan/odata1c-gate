@@ -67,9 +67,11 @@ def test_А3_механизм_закреплён_первым_вызовом_с�
     cc = д.ClientIdentity(name="claude-code", version="2.1.267", elicitation=False, verified=True)
     assert механизмы.choose("s1", elic) == "elicitation"
     assert механизмы.choose("s1", cc) == "elicitation"  # не сменился
-    # Обратный порядок — своя сессия: claude_code остаётся claude_code.
+    # Обратный порядок — своя сессия: механизм сессии остаётся claude_code, но действует только на
+    # подписанном запросе; неподписанный в той же сессии получает отказ (Ruling 59).
     assert механизмы.choose("s2", cc) == "claude_code"
-    assert механизмы.choose("s2", elic) == "claude_code"
+    assert механизмы.choose("s2", elic) == "deny"
+    assert механизмы.choose("s2", cc) == "claude_code"
 
 
 def test_А4_trust_только_при_trust_client():

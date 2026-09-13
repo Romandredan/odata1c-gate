@@ -258,6 +258,28 @@ def test_claude_code_только_проверенному_клиенту():
     assert доверие.choose("f", ClientIdentity("claude-code", "2.1.267", False)) == "trust"
 
 
+def test_claude_code_сессии_только_на_подписанном_запросе():
+    """Механизм запоминается по ключу сессии, а ключ — `mcp-session-id`, который не секрет: SDK
+    пишет его в журнал демона («Created new transport with session ID», проверено исполнением),
+    и живую сессию принимает от любого, кто его предъявит. Поэтому в сессии Claude Code каждый
+    пишущий запрос обязан нести подпись лаунчера: без неё — `deny`, запомненный механизм сессии
+    при этом не меняется."""
+    механизмы = SessionMechanisms("deny")
+    подписанный = ClientIdentity("claude-code", "2.1.267", True, verified=True)
+    assert механизмы.choose("s", подписанный) == "claude_code"
+    for чужой in (
+        ClientIdentity("claude-code", "2.1.267", True),
+        ClientIdentity("mcp", "0.1.0", True),
+        ClientIdentity(None, None, False),
+    ):
+        assert механизмы.choose("s", чужой) == "deny", чужой
+    assert механизмы.choose("s", подписанный) == "claude_code"
+    # И при `trust_client`: неподписанный запрос в сессии Claude Code — не от лаунчера этой сессии.
+    доверие = SessionMechanisms("trust_client")
+    assert доверие.choose("t", подписанный) == "claude_code"
+    assert доверие.choose("t", ClientIdentity("x", "1", False)) == "deny"
+
+
 # ---------------------------------------------------------------------------------------------
 # Демон: ключ читается при старте
 # ---------------------------------------------------------------------------------------------
