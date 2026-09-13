@@ -387,6 +387,16 @@ class Journal:
                 "UPDATE commits SET undone_by = ? WHERE commit_id = ?", (undone_by, commit_id)
             )
 
+    def undo_of(self, commit_id: str) -> str | None:
+        """Откатом какой записи является `commit_id` — обратный запрос по `undone_by` (находка
+        B-2 ревью задачи 4: `undo_of` отдельным столбцом не хранится, связь извлекается из
+        `undone_by` исходной). `None` — запись не откат или её исходная не отмечена."""
+        строка = self._connection.execute(
+            "SELECT commit_id FROM commits WHERE undone_by = ? ORDER BY rowid LIMIT 1",
+            (commit_id,),
+        ).fetchone()
+        return None if строка is None else строка["commit_id"]
+
     def get(self, commit_id: str) -> JournalEntry | None:
         строка = self._connection.execute(
             "SELECT * FROM commits WHERE commit_id = ?", (commit_id,)
