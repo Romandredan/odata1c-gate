@@ -18,6 +18,9 @@ Elicitation (запрос демона к пользователю — прот�
 записи (ADR-0012, план M2 задача 9), а `initialize` демону шлёт сам лаунчер — раньше, чем
 подключится клиент, и со своим именем. Поэтому первый же обработчик передаёт клиента демону
 заголовками HTTP (`ProxyHolder.запомнить`, `daemon.client_headers`), как область видимости.
+Эти заголовки лаунчер подписывает ключом домашнего каталога (`launcher.key`, Ruling 59) на каждом
+запросе, у которого уже есть `mcp-session-id` (`client_signer`): демон выдаёт механизм «подтверждает
+сам клиент» только подписанному клиенту, а не любому процессу, назвавшемуся Claude Code.
 
 Обрыв связи с демоном посреди сессии (раунд правок 1, находка 1) не должен ронять весь процесс
 голым traceback и не должен вешать вызов клиента навсегда: каждый из семи обработчиков перехватывает
@@ -53,11 +56,17 @@ from mcp.shared.exceptions import MCPError
 
 from odata1c.config.home import ensure_home
 from odata1c.config.loader import load_config
-from odata1c.config.writer import ensure_gate_secret, ensure_templates
+from odata1c.config.writer import ensure_gate_secret, ensure_launcher_key, ensure_templates
 from odata1c.daemon import (
+    CLIENT_ELICITATION_HEADER,
+    CLIENT_NAME_HEADER,
+    CLIENT_SIG_HEADER,
+    CLIENT_VERSION_HEADER,
     SCOPE_BASES_HEADER,
     SCOPE_DEFAULT_HEADER,
+    SESSION_ID_HEADER,
     client_headers,
+    client_signature,
     daemon_url,
     is_listening,
     spawn_detached,
@@ -268,6 +277,34 @@ class ProxyHolder:
             return
         self.http.headers.update(client_headers(ctx.session))
         self.клиент_передан = True
+
+
+def client_signer(key: bytes | None):
+    """Хук запроса HTTP-клиента лаунчера (`event_hooks["request"]`): подписать заголовки клиента
+    ключом лаунчера для сессии этого запроса (Ruling 59, `daemon.client_signature`).
+
+    Хук, а не заголовок, выставленный один раз, — потому что подпись привязана к `mcp-session-id`,
+    а его ставит транспорт SDK на каждый запрос, и у `initialize` его ещё нет (проверено
+    исполнением: хук видит заголовок сессии на всех запросах после `initialize`, и выставленная им
+    подпись доходит до `ctx.headers` тула). Нет сессии, заголовков клиента или ключа — запрос
+    уходит без подписи: демон сочтёт клиента непроверенным."""
+
+    async def подписать(request: httpx2.Request) -> None:
+        заголовки = request.headers
+        сессия = заголовки.get(SESSION_ID_HEADER)
+        имя = заголовки.get(CLIENT_NAME_HEADER)
+        if key is None or not сессия or имя is None:
+            заголовки.pop(CLIENT_SIG_HEADER, None)
+            return
+        заголовки[CLIENT_SIG_HEADER] = client_signature(
+            key,
+            сессия,
+            имя,
+            заголовки.get(CLIENT_VERSION_HEADER, ""),
+            заголовки.get(CLIENT_ELICITATION_HEADER, ""),
+        )
+
+    return подписать
 
 
 def forward_elicit(holder: ProxyHolder):
@@ -511,10 +548,14 @@ async def run_launcher(
     init` не выполняли (SPEC §2.1 п. 1 поручает это лаунчеру), а `load_config` требует непустой
     `gate_secret` в `daemon.yaml`. Тем же способом, что и `cmd_init` — вызовы идемпотентны,
     повторный `ensure_*` на уже готовом домашнем каталоге ничего не меняет.
+
+    Ключ лаунчера (Ruling 59) — тоже здесь и тоже до подъёма демона: демон читает его только при
+    старте, и поднятый этим лаунчером демон должен его застать.
     """
     ensure_home(home)
     ensure_templates(home)
     ensure_gate_secret(home / "daemon.yaml")
+    ключ = ensure_launcher_key(home)
 
     if url is not None:
         адрес = url
@@ -529,7 +570,11 @@ async def run_launcher(
     заголовки = scope_headers(bases, default)
     host_port = _host_port_из_адреса(адрес)
     async with (
-        httpx2.AsyncClient(headers=заголовки, timeout=таймаут) as http,
+        httpx2.AsyncClient(
+            headers=заголовки,
+            timeout=таймаут,
+            event_hooks={"request": [client_signer(ключ)]},
+        ) as http,
         streamable_http_client(адрес, http_client=http) as (up_read, up_write),
         ClientSession(up_read, up_write, elicitation_callback=forward_elicit(holder)) as upstream,
     ):

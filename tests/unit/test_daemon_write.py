@@ -8,6 +8,9 @@
 - elicitation — только явное «yes» выполняет запись; «no», `decline`, `cancel`, пустой ответ,
   «YES» — отказ, операция остаётся подготовленной;
 - клиент без elicitation при `deny` — `write_unsupported_client`, в 1С ни одного запроса записи;
+- механизм `claude_code` — только клиенту, подписанному лаунчером (Ruling 59): имя `claude-code`
+  в `initialize` ничем не заверено, и в памяти (подписи нет) его не получает никто — подпись и её
+  проверка по частям в `test_launcher_key.py`;
 - `_meta["anthropic/requiresUserInteraction"]` у `odata1c_commit`;
 - операция одной сессии не видна другой;
 - отказы не повторяют ввод модели — и отказы SDK на аргумент не того типа тоже.
@@ -323,17 +326,30 @@ async def test_клиент_без_elicitation_при_deny_write_unsupported_cli
     assert одинс.записей == 0
 
 
-async def test_claude_code_выполняет_без_вопроса_сервера(демон, одинс):
-    """Claude Code подтверждает сам — диалогом разрешения по `_meta` тула; сервер при этом не
-    спрашивает, даже если клиент объявил elicitation (ADR-0012: без второго диалога)."""
+async def test_claude_code_без_подписи_с_elicitation_демон_спрашивает(демон, одинс):
+    """Ruling 59: имя `claude-code` в `initialize` ничем не заверено — назваться так может любой
+    локальный процесс. Без подписи лаунчера механизм `claude_code` не выдаётся: клиент с
+    elicitation получает вопрос демона. Настоящий Claude Code через лаунчер — без вопроса
+    (`test_write_end_to_end.py`)."""
+    assert демон.слой.launcher_key is not None  # ключ у демона есть — подписи нет у клиента
     async with клиент(демон, имя="claude-code", версия="2.1.267", ответ=ДА) as кл:
         подготовка = await подготовить(кл, демон, одинс)
         текст = await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]})
     ответ = json.loads(текст)
     assert "commit_id" in ответ, текст
-    assert кл.вопросы == []
-    assert демон.журнал(ответ["commit_id"]).client == "claude_code"
+    assert len(кл.вопросы) == 1
+    assert демон.журнал(ответ["commit_id"]).client == "elicitation"
     assert одинс.patch.call_count == 1
+
+
+async def test_claude_code_без_подписи_и_без_elicitation_при_deny_отказ(демон, одинс):
+    """Обратная форма `test_А1` ревьюера задачи 9: `curl` называет себя `claude-code` и
+    elicitation не объявляет — при `deny` запись недоступна, в 1С ни одного запроса записи."""
+    async with клиент(демон, имя="claude-code", версия="2.1.267") as кл:
+        подготовка = await подготовить(кл, демон, одинс)
+        отказ = ошибка(await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]}))
+    assert отказ["code"] == "write_unsupported_client"
+    assert кл.вопросы == [] and одинс.patch.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -429,8 +445,9 @@ def test_механизм_выбирается_первым_вызовом_и_з
     assert механизмы.choose("s", ClientIdentity("x", "1", True)) == "elicitation"
     # Та же сессия назвалась иначе (новый протокол шлёт клиента в каждом запросе) — механизм
     # прежний: сменить его посреди сессии нельзя.
-    assert механизмы.choose("s", ClientIdentity("claude-code", "2.1.267", False)) == "elicitation"
-    assert механизмы.choose("t", ClientIdentity("claude-code", "2.1.267", False)) == "claude_code"
+    claude_code = ClientIdentity("claude-code", "2.1.267", False, verified=True)
+    assert механизмы.choose("s", claude_code) == "elicitation"
+    assert механизмы.choose("t", claude_code) == "claude_code"
     часы.сейчас = 150
     assert механизмы.purge() == 2
     assert механизмы.choose("s", ClientIdentity("other", "1", False)) == "deny"
@@ -464,27 +481,29 @@ def test_заголовки_клиента_ASCII_и_обратно():
         заголовки = client_headers(_сессия_клиента(имя, "1.2.3", С_ELICITATION))
         for значение in заголовки.values():
             значение.encode("ascii")
-        клиент_ = client_from_request(_ctx(заголовки))
+        клиент_ = client_from_request(_ctx(заголовки), None)
         assert клиент_.name == (имя or None)
         assert клиент_.version == "1.2.3" and клиент_.elicitation is True
 
 
 def test_заголовки_клиента_без_elicitation_и_без_обратного_канала():
-    без = client_from_request(_ctx(client_headers(_сессия_клиента("x", "1", None))))
+    без = client_from_request(_ctx(client_headers(_сессия_клиента("x", "1", None))), None)
     assert без.elicitation is False
     # Новый протокол (2026-07-28) запросов сервера к клиенту не допускает: elicitation объявлена,
     # но переслать её лаунчер не сможет — для демона её нет.
     нет_канала = client_headers(_сессия_клиента("x", "1", С_ELICITATION, can_send=False))
-    assert client_from_request(_ctx(нет_канала)).elicitation is False
+    assert client_from_request(_ctx(нет_канала), None).elicitation is False
     # Только URL-режим — форма не поддерживается.
     только_url = types.ClientCapabilities(
         elicitation=types.ElicitationCapability(url=types.UrlElicitationCapability())
     )
-    assert client_from_request(_ctx(client_headers(_сессия_клиента("x", "1", только_url)))) == (
-        client_from_request(_ctx(client_headers(_сессия_клиента("x", "1", None))))
+    с_url = client_from_request(_ctx(client_headers(_сессия_клиента("x", "1", только_url))), None)
+    без_elicitation = client_from_request(
+        _ctx(client_headers(_сессия_клиента("x", "1", None))), None
     )
+    assert с_url == без_elicitation
     # Клиент не представился — имени нет, а не имя лаунчера.
-    аноним = client_from_request(_ctx(client_headers(_сессия_клиента(None, None, None))))
+    аноним = client_from_request(_ctx(client_headers(_сессия_клиента(None, None, None))), None)
     assert аноним.name is None and аноним.elicitation is False
 
 
@@ -501,16 +520,16 @@ def test_заголовки_клиента_важнее_initialize_соедин�
         CLIENT_VERSION_HEADER: "1",
         CLIENT_ELICITATION_HEADER: "0",
     }
-    клиент_ = client_from_request(_ctx(заголовки, params=лаунчер, caps=С_ELICITATION))
+    клиент_ = client_from_request(_ctx(заголовки, params=лаунчер, caps=С_ELICITATION), None)
     assert (клиент_.name, клиент_.elicitation) == ("other", False)
-    прямой = client_from_request(_ctx({}, params=лаунчер, caps=С_ELICITATION))
+    прямой = client_from_request(_ctx({}, params=лаунчер, caps=С_ELICITATION), None)
     assert (прямой.name, прямой.version, прямой.elicitation) == ("mcp", "0.1.0", True)
 
 
 def test_длинное_имя_клиента_не_ломает_заголовки():
     заголовки = client_headers(_сессия_клиента("я" * 5000, "1", None))
     assert all(len(значение) <= 1024 for значение in заголовки.values())
-    assert client_from_request(_ctx(заголовки)).name is None
+    assert client_from_request(_ctx(заголовки), None).name is None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -563,6 +582,19 @@ async def test_сбой_обёртки_демона_вне_сервиса_отк
     assert ИНН not in текст and "RuntimeError" not in текст
     assert "RuntimeError" in caplog.text
     assert ИНН not in caplog.text
+
+
+@pytest.mark.parametrize("имя", [f"odata1c_{ИНН}", f"Клиент {ИНН}", "odata1c_commit_"])
+async def test_незнакомый_тул_отказ_без_имени(демон, имя):
+    """Н9-2 ревью задачи 9: SDK отвечал на незнакомый тул «Unknown tool: <имя>» — имя, ввод
+    модели, дословно и мимо стража. Отказ — `params_invalid` §5.2 без имени (Ruling 53)."""
+    async with клиент(демон) as кл:
+        результат = await кл.сессия.call_tool(имя, {"pending_id": ИНН})
+    текст = результат.content[0].text
+    отказ = ошибка(текст)
+    assert отказ["code"] == "params_invalid"
+    assert ИНН not in текст and имя not in текст
+    assert результат.is_error
 
 
 async def test_отказы_commit_и_undo_не_повторяют_идентификатор(демон, одинс):
@@ -662,14 +694,14 @@ def test_лаунчер_передаёт_клиента_заголовками_�
     первая = _сессия_клиента("claude-code", "2.1.267", С_ELICITATION)
     держатель.запомнить(pytypes.SimpleNamespace(session=первая))
     assert держатель.session is первая
-    assert client_from_request(_ctx(dict(http.headers))) == ClientIdentity(
+    assert client_from_request(_ctx(dict(http.headers)), None) == ClientIdentity(
         "claude-code", "2.1.267", True
     )
     assert http.headers["x-odata1c-bases"] == "ut"
     вторая = _сессия_клиента("other", "1", None)
     держатель.запомнить(pytypes.SimpleNamespace(session=вторая))
     assert держатель.session is вторая
-    assert client_from_request(_ctx(dict(http.headers))).name == "claude-code"
+    assert client_from_request(_ctx(dict(http.headers)), None).name == "claude-code"
     # Без HTTP-клиента (прокси в памяти) — только сессия.
     без_http = ProxyHolder()
     без_http.запомнить(pytypes.SimpleNamespace(session=первая))

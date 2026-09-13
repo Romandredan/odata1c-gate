@@ -25,6 +25,16 @@ MCP Streamable HTTP на `127.0.0.1:<port>`. Тулы чтения — тонк�
   Поэтому клиента лаунчер пересылает заголовками (`CLIENT_NAME_HEADER` и соседние), тем же путём,
   что область видимости, а демон берёт клиента из них, когда они есть;
 - `_meta` тула (`anthropic/requiresUserInteraction`) лаунчер пересылает клиенту как есть.
+
+Подпись лаунчера (Ruling 59, раунд 2 задачи 9). Демон без аутентификации до M4, и назваться
+`claude-code` — в `initialize` или заголовком — может любой локальный процесс, в том числе `curl`
+из Bash модели после prompt-injection в данных 1С. Механизм `claude_code` («подтверждает сам
+клиент») такому процессу означал бы `commit` без единого диалога. Поэтому лаунчер подписывает
+заголовки своего клиента ключом домашнего каталога (`launcher.key`), привязывая подпись к
+`mcp-session-id`, а демон выдаёт `claude_code` только клиенту с верной подписью
+(`client_signature`, `client_from_request`, `SessionMechanisms`). Процесс, который прочитает ключ,
+подпись подделает — она поднимает цену обхода с одной команды до видимой цепочки действий, а не
+заменяет аутентификацию (M4).
 """
 
 from __future__ import annotations
@@ -32,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -56,7 +68,7 @@ from pydantic import ValidationError
 from odata1c.config.home import check_file_permissions, ensure_home
 from odata1c.config.loader import load_config
 from odata1c.config.models import AppConfig, Limits
-from odata1c.config.writer import ensure_gate_secret, процесс_жив
+from odata1c.config.writer import ensure_gate_secret, read_launcher_key, процесс_жив
 from odata1c.index.reindex import index_path
 from odata1c.registry.registry import SessionScope
 from odata1c.tools.service import ToolService
@@ -139,12 +151,18 @@ SESSION_ID_HEADER = "mcp-session-id"
 # «1», если клиент объявил её в форме И лаунчер может переслать ему запрос (`can_send_request`).
 # Прямой HTTP-клиент их не шлёт — демон берёт его из `initialize` самого соединения.
 #
-# Доверие то же, что у `clientInfo.name` (ADR-0012): имя клиента никто не заверяет, поддельный
-# заголовок не хуже поддельного `initialize`. Модель ни того, ни другого не задаёт: она управляет
-# только аргументами тулов.
+# Имя клиента само по себе не заверено ничем — ни в заголовке, ни в `initialize`. Заверяет его
+# подпись лаунчера (Ruling 59): `CLIENT_SIG_HEADER` — HMAC-SHA256 ключом `launcher.key` от
+# `mcp-session-id` и трёх заголовков клиента в том виде, в каком они идут по сети. Без верной
+# подписи клиент не проверен, и механизм `claude_code` ему не выдаётся (`SessionMechanisms`).
 CLIENT_NAME_HEADER = "x-odata1c-client-name"
 CLIENT_VERSION_HEADER = "x-odata1c-client-version"
 CLIENT_ELICITATION_HEADER = "x-odata1c-client-elicitation"
+CLIENT_SIG_HEADER = "x-odata1c-client-sig"
+
+# Метка формата подписи: подпись этой версии не совпадёт ни с какой другой строкой под тем же
+# ключом, если формат канонического набора когда-нибудь поменяется.
+_МЕТКА_ПОДПИСИ = "odata1c-client-sig-v1"
 
 # Длиннее — значение не передаётся вовсе (клиент «неизвестен»): имя в сотни килобайт превысило бы
 # предел заголовков сервера, и отказ 431 ложился бы на КАЖДЫЙ запрос сессии, включая чтение.
@@ -154,11 +172,13 @@ _ПРЕДЕЛ_ЗАГОЛОВКА = 1024
 @dataclasses.dataclass(frozen=True)
 class ClientIdentity:
     """Клиент сессии для выбора механизма подтверждения (ADR-0012): `clientInfo.name`,
-    `clientInfo.version` и может ли демон спросить его через elicitation."""
+    `clientInfo.version`, может ли демон спросить его через elicitation и заверены ли эти
+    сведения подписью лаунчера (`verified`, Ruling 59). По умолчанию — не заверены."""
 
     name: str | None
     version: str | None
     elicitation: bool
+    verified: bool = False
 
 
 def _elicitation_формы(возможности) -> bool:
@@ -206,17 +226,55 @@ def client_headers(session) -> dict[str, str]:
     }
 
 
-def client_from_request(ctx) -> ClientIdentity:
+def client_signature(key: bytes, session_id: str, name: str, version: str, elicitation: str) -> str:
+    """Подпись заголовков клиента (Ruling 59): HMAC-SHA256 ключом лаунчера, шестнадцатеричная.
+
+    Подписываются значения в том виде, в каком идут по сети (процентная запись имени и версии,
+    `1`/`0`): лаунчер и демон видят одни и те же байты, и раскодирование одной из сторон подпись
+    не ломает. Набор — JSON-список с меткой формата: граница полей однозначна (`"ab","c"` и
+    `"a","bc"` — разные строки). `session_id` — чтобы подпись одной сессии не подошла другой."""
+    набор = json.dumps(
+        [_МЕТКА_ПОДПИСИ, session_id, name, version, elicitation],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hmac.new(key, набор.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def _подпись_клиента_верна(заголовки: Mapping[str, str], key: bytes | None) -> bool:
+    """Верна ли подпись заголовков клиента этого запроса. Нет ключа у демона, нет сессии или
+    подписи — не верна. Сравнение — за постоянное время и по байтам: подпись приходит от кого
+    угодно, в том числе не-ASCII строкой."""
+    сессия = заголовки.get(SESSION_ID_HEADER)
+    присланная = заголовки.get(CLIENT_SIG_HEADER)
+    if key is None or not сессия or not присланная:
+        return False
+    ожидаемая = client_signature(
+        key,
+        сессия,
+        заголовки.get(CLIENT_NAME_HEADER, ""),
+        заголовки.get(CLIENT_VERSION_HEADER, ""),
+        заголовки.get(CLIENT_ELICITATION_HEADER, ""),
+    )
+    return hmac.compare_digest(ожидаемая.encode("ascii"), присланная.encode("utf-8", "replace"))
+
+
+def client_from_request(ctx, key: bytes | None) -> ClientIdentity:
     """Клиент вызова тула: заголовки лаунчера, если они есть, иначе `initialize` соединения.
 
     Заголовки — целиком или никак: имя есть — elicitation тоже из заголовка, и его отсутствие —
-    «нет» (механизм без вопроса сервера не выбирается, остаётся `deny`/`trust` по настройке)."""
+    «нет» (механизм без вопроса сервера не выбирается, остаётся `deny`/`trust` по настройке).
+
+    `key` — ключ лаунчера, прочитанный демоном при старте (`None` — ключа нет). Клиент проверен
+    (`verified`), только если заголовки подписаны этим ключом для этой сессии. Клиент из
+    `initialize` не проверен никогда: подписи там нет, и назваться может кто угодно."""
     заголовки = ctx.headers or {}
     if CLIENT_NAME_HEADER in заголовки:
         return ClientIdentity(
             name=urllib.parse.unquote(заголовки.get(CLIENT_NAME_HEADER, "")) or None,
             version=urllib.parse.unquote(заголовки.get(CLIENT_VERSION_HEADER, "")) or None,
             elicitation=заголовки.get(CLIENT_ELICITATION_HEADER) == "1",
+            verified=_подпись_клиента_верна(заголовки, key),
         )
     return client_of_session(ctx.session)
 
@@ -263,7 +321,12 @@ class SessionMechanisms:
     здесь — выбор, там — отказ сменить его посреди операции.
 
     `fallback` — `write_confirm_fallback` демона. Запись сессии без вызовов дольше `idle_s`
-    убирается (`purge`): вернувшаяся сессия выберет механизм заново — по тому же клиенту тот же."""
+    убирается (`purge`): вернувшаяся сессия выберет механизм заново — по тому же клиенту тот же.
+
+    Механизм `claude_code` — только клиенту, заверенному подписью лаунчера (`verified`, Ruling
+    59). Имя непроверенного клиента в выбор не идёт вовсе: с объявленной elicitation демон
+    спрашивает сам, без неё — `deny` или `trust` по `write_confirm_fallback` (`trust_client` —
+    явная настройка владельца, подпись её не отменяет)."""
 
     def __init__(
         self,
@@ -281,9 +344,8 @@ class SessionMechanisms:
         сейчас = self._clock()
         запись = self._записи.get(session_key)
         if запись is None:
-            механизм = choose_mechanism(
-                client.name, client.version, client.elicitation, self._запасной
-            )
+            имя, версия = (client.name, client.version) if client.verified else (None, None)
+            механизм = choose_mechanism(имя, версия, client.elicitation, self._запасной)
             запись = self._записи[session_key] = [механизм, сейчас]
         запись[1] = сейчас
         return запись[0]
@@ -345,20 +407,34 @@ def pending_grace_s(config: AppConfig) -> int:
 
 @dataclasses.dataclass
 class WriteLayer:
-    """Слой записи демона: сервис, его хранилище, ключи сессий и механизмы подтверждения."""
+    """Слой записи демона: сервис, его хранилище, ключи сессий, механизмы подтверждения и ключ
+    лаунчера для проверки подписи клиента (`None` — ключа не было при старте)."""
 
     write: WriteService
     store: PendingStore
     keys: SessionKeys
     mechanisms: SessionMechanisms
+    launcher_key: bytes | None = None
 
 
 def build_write_layer(service: ToolService) -> WriteLayer:
     """Слой записи поверх `ToolService` по настройкам того же домашнего каталога: TTL операции —
     `limits.pending_ttl_s`, журнал — `journal.sqlite` (открывается на вызов), запасной механизм —
     `write_confirm_fallback` из `daemon.yaml` (Т7-6: и `WriteService`, и выбор механизма берут его
-    отсюда, а не от вызывающего)."""
+    отсюда, а не от вызывающего).
+
+    Ключ лаунчера читается здесь, один раз — при старте демона (Ruling 59): не с диска на каждый
+    запрос, смена ключа — перезапуск. Демон его не создаёт — это делают лаунчер и `odata1c init`.
+    Нет ключа — подпись клиента не проверить: механизм `claude_code` не выдаётся никому, в
+    журнал — предупреждение. Ни ключа, ни имени его файла в журнале нет."""
     config = service._config
+    ключ = read_launcher_key(config.home)
+    if ключ is None:
+        _log.warning(
+            "ключ лаунчера не найден или повреждён — подпись клиента не проверить, механизм "
+            "подтверждения Claude Code не выдаётся никому (Claude Code получит вопрос демона "
+            "или отказ); `odata1c init` создаст ключ, затем перезапустите демон"
+        )
     запасной = config.daemon.write_confirm_fallback
     хранилище = PendingStore(config.daemon.limits.pending_ttl_s, grace_s=pending_grace_s(config))
     путь_журнала = config.home / "journal.sqlite"
@@ -374,6 +450,7 @@ def build_write_layer(service: ToolService) -> WriteLayer:
         store=хранилище,
         keys=SessionKeys(),
         mechanisms=SessionMechanisms(запасной),
+        launcher_key=ключ,
     )
 
 
@@ -406,7 +483,13 @@ class _GateServer(MCPServer):
     executing tool …» — не формат §5.2 и мимо стража, — а в журнал демона пишет
     `logger.exception` с текстом исходного исключения. Здесь он становится отказом `internal`
     через стража сервиса, а трассировка идёт через ту же защиту журнала, что у `ToolService`
-    (`trace`)."""
+    (`trace`).
+
+    Третий — незнакомое имя тула (Н9-2 ревью задачи 9): SDK отвечал «Unknown tool: <имя>», отражая
+    имя — ввод модели — дословно и мимо стража. Незарегистрированное имя отсекается здесь, до SDK,
+    проверкой регистрации (а не сравнением с английским текстом SDK, который может смениться):
+    отказ `params_invalid` без имени (Ruling 53). Код — `params_invalid`: имя тула — аргумент
+    вызова `tools/call`, отдельного кода в перечне §5.2 для этого нет."""
 
     def __init__(
         self,
@@ -420,6 +503,14 @@ class _GateServer(MCPServer):
         self._трассировка = trace
 
     async def call_tool(self, name, arguments, context=None):
+        if self._tool_manager.get_tool(name) is None:
+            raise ToolError(
+                self._отказ(
+                    "params_invalid",
+                    "тул с таким именем не объявлен; имя в отказе не повторяется",
+                    "перечень тулов — tools/list",
+                )
+            )
         try:
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError:
@@ -696,9 +787,11 @@ def build_server(
 
     def сессия_записи(ctx: Context) -> tuple[SessionScope, str, Механизм]:
         """Область видимости, ключ сессии и её механизм подтверждения. Механизм выбирается
-        первым пишущим вызовом сессии (решение 6 плана) — подготовкой, откатом или `commit`."""
+        первым пишущим вызовом сессии (решение 6 плана) — подготовкой, откатом или `commit`.
+        К этому вызову `mcp-session-id` у лаунчера уже есть (его нет только у `initialize`), и
+        подпись клиента к нему привязана (Ruling 59)."""
         ключ = слой.keys.key(ctx)
-        механизм = слой.mechanisms.choose(ключ, client_from_request(ctx))
+        механизм = слой.mechanisms.choose(ключ, client_from_request(ctx, слой.launcher_key))
         return scope_from_headers(ctx.headers), ключ, механизм
 
     @server.tool(

@@ -24,7 +24,12 @@ from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
 from odata1c.config.models import ИМЯ_БАЗЫ, BaseConfig
-from odata1c.config.writer import append_base, ensure_gate_secret, ensure_templates
+from odata1c.config.writer import (
+    append_base,
+    ensure_gate_secret,
+    ensure_launcher_key,
+    ensure_templates,
+)
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
 from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
@@ -204,6 +209,9 @@ def cmd_init(home: pathlib.Path) -> int:
     # на диск. Вызов идемпотентен — если секрет уже есть (файл существовал и до этой команды),
     # он не меняется.
     ensure_gate_secret(home / "daemon.yaml")
+    # Ключ лаунчера (Ruling 59): им лаунчер подписывает своего клиента для демона. Тоже
+    # идемпотентно; ни ключ, ни его файл команда не печатает.
+    ensure_launcher_key(home)
     print(f"домашний каталог: {home}")
     print(f"опишите базы в {home / 'bases.yaml'}")
     print("перенести базы из прежнего сервера: odata1c base import <путь к 1c-odata.env>")

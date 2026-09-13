@@ -9,7 +9,11 @@
 - elicitation демона доходит до клиента лаунчера и ответ возвращается (проба P3 — теперь на
   настоящем `commit`);
 - `_meta["anthropic/requiresUserInteraction"]` у `odata1c_commit` виден клиенту за лаунчером;
-- `mcp-session-id` — ключ сессии: у двух лаунчеров разные сессии, операция одной не видна другой.
+- `mcp-session-id` — ключ сессии: у двух лаунчеров разные сессии, операция одной не видна другой;
+- подпись лаунчера (Ruling 59): механизм `claude_code` получает только клиент, чьи заголовки
+  подписал настоящий лаунчер ключом дома. Прямой HTTP-клиент — как `curl` из Bash модели — с
+  именем `claude-code` в `initialize` или в заголовках, с подписью чужой сессии или другим ключом
+  механизм не получает; демон, поднятый без ключа, не выдаёт его никому.
 
 Живая 1С не нужна; демон владельца на 7171 не трогается — свой порт и свой домашний каталог.
 """
@@ -22,21 +26,38 @@ import json
 import os
 import sys
 
+import httpx2
 import mcp.types as types
 import pytest
 from fake_1c import EDMX_ФИКСТУРА, REF_KEY, ИНН, НАЗВАНИЕ, ОбъектыЗаписи, запущенная, свободный_порт
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from sse_starlette import sse
 
 from odata1c.config.home import ensure_home
 from odata1c.config.loader import load_config
-from odata1c.config.writer import ensure_gate_secret
-from odata1c.daemon import daemon_url, serve
+from odata1c.config.writer import (
+    LAUNCHER_KEY_FILE,
+    ensure_gate_secret,
+    ensure_launcher_key,
+    read_launcher_key,
+)
+from odata1c.daemon import (
+    CLIENT_ELICITATION_HEADER,
+    CLIENT_NAME_HEADER,
+    CLIENT_SIG_HEADER,
+    CLIENT_VERSION_HEADER,
+    SESSION_ID_HEADER,
+    client_signature,
+    daemon_url,
+    serve,
+)
 from odata1c.gate.service import refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
+from odata1c.write.journal import Journal
 
 ПРЕДЕЛ_СЦЕНАРИЯ_С = 90
 КОНТРАГЕНТЫ = "Catalog_Контрагенты"
@@ -63,10 +84,14 @@ def _объекты() -> ОбъектыЗаписи:
     )
 
 
-def _дом(tmp_path, порт_1с: int):
+def _дом(tmp_path, порт_1с: int, *, ключ: bool = True):
+    """Дом, как после `odata1c init`: с ключом лаунчера (`ключ=False` — дом, где init был до
+    Ruling 59: демон, поднятый на нём, ключа не находит)."""
     home = tmp_path / "home"
     ensure_home(home)
     ensure_gate_secret(home / "daemon.yaml")
+    if ключ:
+        ensure_launcher_key(home)
     (home / "bases.yaml").write_text(
         "default: ut\n"
         "bases:\n"
@@ -265,9 +290,10 @@ async def _сценарий_отказов(home, порт: int, объекты: 
         assert "commit_id" in json.loads(свой), свой
         assert len(объекты.записи) == 1
 
-    # Claude Code: имя доходит до демона сквозь лаунчер, и демон не спрашивает сам — подтверждает
-    # диалог разрешения клиента по `_meta` тула (ADR-0012: без второго диалога), хотя elicitation
-    # клиент объявил. Возвращаем ИНН обратно, чтобы запись была видна в 1С.
+    # Claude Code: имя доходит до демона сквозь лаунчер, подписанное его ключом (Ruling 59), и
+    # демон не спрашивает сам — подтверждает диалог разрешения клиента по `_meta` тула (ADR-0012:
+    # без второго диалога), хотя elicitation клиент объявил. Возвращаем ИНН обратно, чтобы запись
+    # была видна в 1С.
     async with через_лаунчер(home, порт, имя="claude-code", версия="2.1.267", ответ=ДА) as кл:
         ответ = await кл.json(
             "odata1c_update", {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}}
@@ -277,6 +303,15 @@ async def _сценарий_отказов(home, порт: int, объекты: 
         assert "commit_id" in json.loads(текст), текст
         assert кл.вопросы == []
         assert объекты.записи[-1] == ("PATCH", ПУТЬ, {"ИНН": ИНН})
+        assert _механизм_в_журнале(home, json.loads(текст)["commit_id"]) == "claude_code"
+
+
+def _механизм_в_журнале(home, commit_id: str) -> str:
+    журнал = Journal(home / "journal.sqlite")
+    try:
+        return журнал.get(commit_id).client
+    finally:
+        журнал.close()
 
 
 @pytest.mark.parametrize("имя", ["Claude Code", "claude_code"])
@@ -297,3 +332,126 @@ async def test_похожее_имя_сквозь_лаунчер_не_claude_cod
                 assert объекты.записи == []
 
             await asyncio.wait_for(сценарий(), ПРЕДЕЛ_СЦЕНАРИЯ_С)
+
+
+# ---------------------------------------------------------------------------------------------
+# Подпись лаунчера (Ruling 59)
+# ---------------------------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def напрямую(порт: int, *, имя: str, версия="2.1.267", заголовки=None, подпись=None):
+    """Прямой HTTP-клиент демона без лаунчера — так демон видит `curl` или скрипт из Bash модели:
+    имя в `initialize`, по желанию — заголовки клиента, как у лаунчера, и `подпись(sid)` —
+    значение заголовка подписи для своей сессии. elicitation клиент не объявляет."""
+
+    async def хук(request: httpx2.Request) -> None:
+        if заголовки:
+            request.headers.update(заголовки)
+        sid = request.headers.get(SESSION_ID_HEADER)
+        if sid and подпись is not None:
+            request.headers[CLIENT_SIG_HEADER] = подпись(sid)
+
+    async with (
+        httpx2.AsyncClient(
+            event_hooks={"request": [хук]}, timeout=httpx2.Timeout(10, read=None)
+        ) as http,
+        streamable_http_client(daemon_url(порт), http_client=http) as (r, w),
+        ClientSession(r, w, client_info=types.Implementation(name=имя, version=версия)) as сессия,
+    ):
+        await сессия.initialize()
+        yield Клиент(сессия, [])
+
+
+CLAUDE_CODE = {
+    CLIENT_NAME_HEADER: "claude-code",
+    CLIENT_VERSION_HEADER: "2.1.267",
+    CLIENT_ELICITATION_HEADER: "0",
+}
+
+
+async def test_прямой_клиент_без_подписи_лаунчера_не_получает_claude_code(tmp_path):
+    объекты = _объекты()
+    async with запущенная(объекты=объекты) as порт_1с:
+        home = _дом(tmp_path, порт_1с)
+        async with _демон(home) as порт:
+            await asyncio.wait_for(_сценарий_подделок(home, порт, объекты), ПРЕДЕЛ_СЦЕНАРИЯ_С)
+
+
+async def _сценарий_подделок(home, порт: int, объекты: ОбъектыЗаписи) -> None:
+    ключ = read_launcher_key(home)
+    assert ключ is not None
+
+    def верная(sid: str) -> str:
+        return client_signature(ключ, sid, "claude-code", "2.1.267", "0")
+
+    def чужим_ключом(sid: str) -> str:
+        return client_signature(os.urandom(32), sid, "claude-code", "2.1.267", "0")
+
+    # Подпись, подслушанная у настоящей сессии: клиент с верной подписью своей сессии делает один
+    # запрос (подготовки не нужно) — его подпись и перехватывается.
+    перехвачено: list[str] = []
+
+    def перехватить(sid: str) -> str:
+        перехвачено.append(верная(sid))
+        return перехвачено[-1]
+
+    async with напрямую(порт, имя="x", заголовки=CLAUDE_CODE, подпись=перехватить) as кл:
+        await кл.сессия.list_tools()
+    assert перехвачено
+
+    подделки = {
+        "имя claude-code в initialize": {},
+        "заголовки claude-code без подписи": {"заголовки": CLAUDE_CODE},
+        "подпись чужой сессии": {"заголовки": CLAUDE_CODE, "подпись": lambda sid: перехвачено[-1]},
+        "подпись другим ключом": {"заголовки": CLAUDE_CODE, "подпись": чужим_ключом},
+    }
+    for что, параметры in подделки.items():
+        async with напрямую(порт, имя="claude-code", **параметры) as кл:
+            подготовка = await _подготовить(кл)
+            текст = await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]})
+        assert _ошибка(текст)["code"] == "write_unsupported_client", что
+        assert объекты.записи == [], что
+        for секрет in (ключ.hex(), перехвачено[-1]):
+            assert секрет not in текст, что
+
+    # Положительный контроль: верная подпись своей сессии — механизм `claude_code`, запись без
+    # вопроса демона. Без него «отказ во всех случаях» не отличался бы от сломанной проверки.
+    async with напрямую(порт, имя="x", заголовки=CLAUDE_CODE, подпись=верная) as кл:
+        подготовка = await _подготовить(кл)
+        текст = await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]})
+    выполнено = json.loads(текст)
+    assert "commit_id" in выполнено, текст
+    assert _механизм_в_журнале(home, выполнено["commit_id"]) == "claude_code"
+    assert объекты.записи == [("PATCH", ПУТЬ, {"ИНН": НОВЫЙ_ИНН})]
+
+
+async def test_демон_без_ключа_не_выдаёт_claude_code_и_предупреждает(tmp_path):
+    """Демон поднят на доме без ключа (init был до Ruling 59). Лаунчер ключ создаст сам, но демон
+    читает его только при старте: до перезапуска подписи проверить нечем, и настоящий Claude Code
+    получает вопрос демона (elicitation), а не запись без вопроса. В журнал демона — предупреждение
+    без имени файла и без ключа."""
+    объекты = _объекты()
+    async with запущенная(объекты=объекты) as порт_1с:
+        home = _дом(tmp_path, порт_1с, ключ=False)
+        async with _демон(home) as порт:
+
+            async def сценарий() -> None:
+                async with через_лаунчер(
+                    home, порт, имя="claude-code", версия="2.1.267", ответ=ДА
+                ) as кл:
+                    подготовка = await _подготовить(кл)
+                    текст = await кл.вызвать(
+                        "odata1c_commit", {"pending_id": подготовка["pending_id"]}
+                    )
+                выполнено = json.loads(текст)
+                assert "commit_id" in выполнено, текст
+                assert len(кл.вопросы) == 1
+                assert _механизм_в_журнале(home, выполнено["commit_id"]) == "elicitation"
+
+            await asyncio.wait_for(сценарий(), ПРЕДЕЛ_СЦЕНАРИЯ_С)
+    ключ = read_launcher_key(home)
+    assert ключ is not None  # лаунчер создал ключ сам
+    журнал = (home / "logs" / "daemon.log").read_text(encoding="utf-8")
+    assert "ключ лаунчера" in журнал
+    assert LAUNCHER_KEY_FILE not in журнал and ключ.hex() not in журнал
