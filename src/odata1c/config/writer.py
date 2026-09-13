@@ -61,7 +61,7 @@ def ensure_templates(home: pathlib.Path) -> None:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов
     #   independent_register_delete: false   # DELETE записей регистров сведений без регистратора
-    #   register_direct_write: false # POST/PATCH в регистры накопления, бухгалтерии, расчёта
+    #   register_direct_write: false # в первой поставке не действует (Ruling 57)
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]

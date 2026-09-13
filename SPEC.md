@@ -245,7 +245,7 @@ bases:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов
     #   independent_register_delete: false   # DELETE записей регистров сведений без регистратора (odata1c_delete_record)
-    #   register_direct_write: false # POST/PATCH в регистры накопления, бухгалтерии, расчёта и регистры с регистратором
+    #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта (§7.1, Ruling 57)
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
