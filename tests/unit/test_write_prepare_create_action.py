@@ -11,6 +11,7 @@
 """
 
 import json
+import pathlib
 
 import httpx
 import pytest
@@ -738,6 +739,333 @@ def test_body_preview_строка_на_каждое_поле_в_порядке_
         {"field": "Комментарий", "value": "x"},
         {"field": "КИ", "value": строки},
     ]
+
+
+async def test_М6_1_токен_названия_в_Description_объект_превью_тот_же_токен(среда, одинс):
+    """М6-1 ревью задачи 6: `object` — из данных модели, а не из раскрытого тела. Иначе реальное
+    название ушло бы в `object` и его заменил бы только страж — последний рубеж."""
+    запись, стор, tools = среда
+    название = токен(tools, НАЗВАНИЕ, поле="Description")
+    assert название.startswith("[[org:")
+
+    текст = await создать(запись, {"Description": название, "ИНН": ЕЩЁ_ИНН})
+
+    нет_реальных_значений(текст)
+    ответ = json.loads(текст)
+    assert ответ["object"] == {"Description": название}
+    операция = await стор.take(ответ["pending_id"], "sess-1")
+    assert операция.preview["object"] == {"Description": название}
+    assert операция.request["json"]["Description"] == НАЗВАНИЕ
+
+
+# ---------------------------------------------------------------------------------------------
+# Ruling 56 (Н6-1, Н6-3 ревью задачи 6): строка табличной части раскрывается по своей сущности
+# ---------------------------------------------------------------------------------------------
+
+ИСТОРИЯ_КПП = "Catalog_Контрагенты_ИсторияКПП"
+ВСД = "Catalog_ВетеринарноСопроводительныйДокументВЕТИС"
+МАРШРУТ = f"{ВСД}_Маршрут"
+АДРЕС_ДОСТАВКИ = "г. Пробный, ул. Вымышленная, д. 7, кв. 12"
+
+# Табличная часть `ИсторияКПП` в урезанной фикстуре не опубликована (поле `Collection(…)` есть,
+# сущности строки нет); на живой УТ табличные части публикуются набором `<владелец>_<ТЧ>` (P4).
+_ТИП_ИСТОРИИ = f"""<EntityType Name="{ИСТОРИЯ_КПП}">
+        <Key><PropertyRef Name="Ref_Key"/><PropertyRef Name="LineNumber"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="LineNumber" Type="Edm.Int64" Nullable="false"/>
+        <Property Name="Период" Type="Edm.DateTime" Nullable="true"/>
+        <Property Name="КПП" Type="Edm.String" Nullable="true"/>
+      </EntityType>
+      """
+# ВСД ВЕТИС — тем же устройством, что на полном `$metadata` УТ (скан ревьюера): поле строки
+# `Маршрут.Адрес` по своей сущности — `keep`, а имя «Адрес» на владельце классифицируется `addr`.
+_ТИПЫ_ВСД = f"""<EntityType Name="{ВСД}">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="DataVersion" Type="Edm.String" Nullable="true"/>
+        <Property Name="DeletionMark" Type="Edm.Boolean" Nullable="true"/>
+        <Property Name="Description" Type="Edm.String" Nullable="true"/>
+        <Property Name="Маршрут" Type="Collection(StandardODATA.{МАРШРУТ}_RowType)"
+          Nullable="true"/>
+      </EntityType>
+      <EntityType Name="{МАРШРУТ}">
+        <Key><PropertyRef Name="Ref_Key"/><PropertyRef Name="LineNumber"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="LineNumber" Type="Edm.Int64" Nullable="false"/>
+        <Property Name="Адрес" Type="Edm.String" Nullable="true"/>
+        <Property Name="АдресПредставление" Type="Edm.String" Nullable="true"/>
+      </EntityType>
+      """
+_НАБОРЫ = (
+    f'<EntitySet Name="{ИСТОРИЯ_КПП}" EntityType="StandardODATA.{ИСТОРИЯ_КПП}"/>\n        '
+    f'<EntitySet Name="{ВСД}" EntityType="StandardODATA.{ВСД}"/>\n        '
+    f'<EntitySet Name="{МАРШРУТ}" EntityType="StandardODATA.{МАРШРУТ}"/>\n        '
+)
+
+
+def _edmx_с_табличными_частями(edmx: bytes) -> bytes:
+    текст = edmx.decode("utf-8")
+    тип, набор = f'<EntityType Name="{КИ}">', f'<EntitySet Name="{КИ}"'
+    assert тип in текст and набор in текст
+    текст = текст.replace(тип, _ТИП_ИСТОРИИ + _ТИПЫ_ВСД + тип, 1)
+    return текст.replace(набор, _НАБОРЫ + набор, 1).encode("utf-8")
+
+
+async def _среда_на(tmp_path, edmx: bytes, bases_yaml: str, поля: dict[str, str] | None = None):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(bases_yaml, encoding="utf-8")
+    config = load_config(home)
+    for имя in config.bases:
+        хранилище = IndexRepository(index_path(home, имя))
+        хранилище.write(parse_edmx(edmx))
+        хранилище.close()
+        refresh_policy(home, config.bases[имя])
+    if поля:
+        путь = policy_path(home, "ut")
+        политика = yaml.safe_load(путь.read_text(encoding="utf-8")) or {}
+        политика.setdefault("fields", {}).update(поля)
+        путь.write_text(yaml.safe_dump(политика, allow_unicode=True), encoding="utf-8")
+    tools = ToolService(load_config(home))
+    стор = PendingStore(600, clock=Часы(1000.0))
+    журнал = Journal(tmp_path / "journal.sqlite")
+    запись = WriteService(tools, стор, журнал, CommitLimiter(), clock=Часы(1_757_000_000.0))
+    return запись, стор, tools, журнал
+
+
+@pytest.fixture
+async def среда_тч(tmp_path, edmx_ut_real):
+    """Фикстура с опубликованными `ИсторияКПП` и ВСД ВЕТИС; политика — как её строит реиндекс,
+    плюс ручной `keep` на `ИсторияКПП.КПП` (владелец счёл историю КПП неконфиденциальной)."""
+    запись, стор, tools, журнал = await _среда_на(
+        tmp_path,
+        _edmx_с_табличными_частями(edmx_ut_real),
+        BASES_YAML,
+        {f"{ИСТОРИЯ_КПП}.КПП": "keep"},
+    )
+    yield запись, стор, tools
+    журнал.close()
+    await tools.aclose()
+
+
+def _классы(tools: ToolService, *пары: tuple[str, str]) -> list[str | None]:
+    гейт = tools._gate_for(tools._config.bases["ut"])
+    репозиторий = tools._open_index(tools._config.bases["ut"])
+    try:
+        строение = tools._строение(репозиторий)
+        return [гейт.field_class(сущность, поле, shape=строение) for сущность, поле in пары]
+    finally:
+        репозиторий.close()
+
+
+async def test_Н6_1_токен_адреса_в_поле_строки_открытом_по_её_сущности_отказ(среда_тч, одинс):
+    """Н6-1 ревью задачи 6 в обратной форме. `Маршрут.Адрес` ВСД по своей сущности — `keep`
+    (чтение отдаёт его открытым), а имя «Адрес» на владельце — `addr`. Раньше строка
+    раскрывалась от владельца, и токен адреса доставки уходил в 1С реальным адресом — после
+    `commit` чтение показало бы его открытым, а у `addr` нет последнего рубежа в страже. Теперь
+    строка раскрывается по своей сущности: токен `addr` в поле `keep` — отказ, операции нет."""
+    запись, стор, tools = среда_тч
+    assert _классы(tools, (МАРШРУТ, "Адрес"), (ВСД, "Адрес")) == ["keep", "addr"]
+    адрес = токен(tools, АДРЕС_ДОСТАВКИ, entity=РЕАЛИЗАЦИЯ, поле="АдресДоставки")
+    assert адрес.startswith("[[addr:")
+
+    текст = await создать(
+        запись, {"Description": "ВСД проба", "Маршрут": [{"Адрес": адрес}]}, entity=ВСД
+    )
+
+    отказ = ошибка(текст)
+    assert отказ["code"] == "token_type_mismatch", отказ
+    assert АДРЕС_ДОСТАВКИ not in текст
+    assert стор._ops == {}
+    assert not одинс.обращались
+
+
+async def test_Н6_1б_токен_КПП_шапки_в_строку_с_keep_отказ(среда_тч, одинс):
+    """Цифровой класс: владелец открыл КПП в истории (`keep` на поле строки), токен КПП шапки,
+    прочитанный через настоящий `get`, в эту строку не раскрывается. Раньше раскрывался по
+    классу «КПП» шапки, и на чтении такой КПП ловил только страж."""
+    запись, стор, tools = среда_тч
+    assert _классы(tools, (ИСТОРИЯ_КПП, "КПП")) == ["keep"]
+    кпп = (await прочитать_контрагента(tools, одинс))["КПП"]
+    assert кпп.startswith("[[") and КПП not in кпп
+
+    текст = await создать(запись, {"Description": "ООО Проба", "ИсторияКПП": [{"КПП": кпп}]})
+
+    assert ошибка(текст)["code"] == "token_type_mismatch"
+    assert КПП not in текст
+    assert стор._ops == {}
+    assert not одинс.обращались
+
+
+async def test_Н6_3_строка_табличной_части_с_защищаемым_корнем_имени_создаётся(среда_тч, одинс):
+    """Н6-3: имя табличной части `ИсторияКПП` содержит корень защищаемого имени, и раскрытие
+    строки от владельца отклоняло любое её строковое поле правилом пути отбора («промежуточный
+    сегмент указывает на связанный объект»). По своей сущности поле строки — обычное поле."""
+    запись, стор, _ = среда_тч
+    строки = [{"LineNumber": 1, "Период": "2026-01-01T00:00:00", "КПП": "770701002"}]
+
+    ответ = json.loads(await создать(запись, {"Description": "ООО Проба", "ИсторияКПП": строки}))
+
+    assert "pending_id" in ответ, ответ
+    операция = await стор.take(ответ["pending_id"], "sess-1")
+    assert операция.request["json"]["ИсторияКПП"] == строки
+    assert not одинс.обращались
+
+
+async def test_нумерация_токенов_сквозная_по_всему_телу(среда, одинс):
+    """Ruling 54 при раскрытии строк отдельными вызовами: номер токена в отказе — по порядку
+    всего тела, как его видит модель, а место называет табличную часть, номер строки и поле
+    (имена из индекса). Токен шапки стоит в теле ПОСЛЕ табличной части — и нумеруется после её
+    токенов, хотя шапка раскрывается первой (без заранее выданных номеров он стал бы «первым»,
+    а отклонённый токен строки — «вторым»)."""
+    запись, _, tools = среда
+    ток_инн = токен(tools, НОВЫЙ_ИНН)
+    чужой = "[[inn:ZZZZZZZZZZ]]"
+
+    отказ = ошибка(
+        await создать(
+            запись,
+            {
+                "Description": "ООО Проба",
+                "КонтактнаяИнформация": [
+                    {"Тип": "Телефон", "Представление": НОВЫЙ_ТЕЛЕФОН},
+                    {"Тип": "Телефон", "Представление": чужой},
+                ],
+                "ИНН": ток_инн,
+            },
+        )
+    )
+
+    текст = json.dumps(отказ, ensure_ascii=False)
+    assert (
+        "первый токен в теле записи, табличная часть «КонтактнаяИнформация», строка 2, "
+        "поле «Представление»" in отказ["message"]
+    ), отказ
+    assert ток_инн not in текст and чужой not in текст
+
+
+async def test_нумерация_токенов_не_начинается_заново_в_строке(среда, одинс):
+    """Второй токен тела — в строке 1 после токена шапки: «второй», а не «первый»."""
+    запись, _, tools = среда
+    ток_инн = токен(tools, НОВЫЙ_ИНН)
+
+    отказ = ошибка(
+        await создать(
+            запись,
+            {
+                "ИНН": ток_инн,
+                "КонтактнаяИнформация": [{"Тип": "Телефон", "Представление": "[[inn:ZZZZZZZZZZ]]"}],
+            },
+        )
+    )
+
+    assert (
+        "второй токен в теле записи, табличная часть «КонтактнаяИнформация», строка 1, "
+        "поле «Представление»" in отказ["message"]
+    ), отказ
+
+
+BASES_DENY_КИ = BASES_YAML.replace(
+    "deny_fields: [", f"deny_entities: [{КИ}]\n      deny_fields: [", 1
+)
+
+
+@pytest.fixture
+async def среда_запрет_ки(tmp_path, edmx_ut_real):
+    assert "deny_entities" in BASES_DENY_КИ
+    запись, стор, tools, журнал = await _среда_на(tmp_path, edmx_ut_real, BASES_DENY_КИ)
+    yield запись, стор, tools
+    журнал.close()
+    await tools.aclose()
+
+
+async def test_Н6_2_deny_entities_табличной_части_не_обходится_через_create_владельца(
+    среда_запрет_ки, одинс
+):
+    """Н6-2: запрет записи в табличную часть действует и на её строки в теле `create` владельца —
+    тем же кодом и текстом, что прямая запись в неё. Владелец без строк этой части создаётся."""
+    запись, стор, _ = среда_запрет_ки
+    прямо = ошибка(await создать(запись, {"Тип": "Телефон"}, entity=КИ))
+    через_владельца = ошибка(
+        await создать(
+            запись, {"Description": "ООО Проба", "КонтактнаяИнформация": [{"Тип": "Телефон"}]}
+        )
+    )
+    без_строк = json.loads(await создать(запись, {"Description": "ООО Проба"}))
+
+    assert через_владельца["code"] == прямо["code"] == "permission_denied"
+    assert через_владельца["message"] == прямо["message"]
+    assert "pending_id" in без_строк
+    assert len(стор._ops) == 1
+    assert not одинс.обращались
+
+
+# Полный `$metadata` живой УТ (проба P4; файл вне git) и политика, построенная реиндексом, — без
+# единой ручной правки владельца. Нет файла — тесты пропускаются.
+ПОЛНЫЙ_ДАМП = pathlib.Path(__file__).parent.parent / "fixtures" / "edmx" / "probe.full.edmx"
+
+
+@pytest.fixture
+async def среда_полная(tmp_path):
+    if not ПОЛНЫЙ_ДАМП.exists():
+        pytest.skip("нет probe.full.edmx")
+    запись, стор, tools, журнал = await _среда_на(tmp_path, ПОЛНЫЙ_ДАМП.read_bytes(), BASES_YAML)
+    yield запись, стор, tools
+    журнал.close()
+    await tools.aclose()
+
+
+async def test_Н6_1_полный_metadata_адрес_доставки_не_раскрывается_в_маршрут_ВСД(
+    среда_полная, одинс
+):
+    """Воспроизведение ревьюера на полном `$metadata` в обратной форме: модель читает заказ
+    настоящим `get`, адрес доставки — токеном; строка маршрута ВСД с этим токеном — отказ."""
+    запись, стор, tools = среда_полная
+    заказ = "Document_ЗаказКлиента"
+    assert _классы(tools, (заказ, "АдресДоставки"), (МАРШРУТ, "Адрес")) == ["addr", "keep"]
+    одинс.объект({"Ref_Key": ССЫЛКА_ДОК, "DataVersion": ВЕРСИЯ, "АдресДоставки": АДРЕС_ДОСТАВКИ})
+    прочитано = json.loads(await tools.get(SessionScope(), base="ut", entity=заказ, key=ССЫЛКА_ДОК))
+    адрес = прочитано["item"]["АдресДоставки"]
+    assert адрес.startswith("[[addr:")
+    одинс.get.reset()
+
+    текст = await создать(запись, {"Маршрут": [{"Адрес": адрес}]}, entity=ВСД)
+
+    assert ошибка(текст)["code"] == "token_type_mismatch"
+    assert АДРЕС_ДОСТАВКИ not in текст
+    assert стор._ops == {}
+    assert not одинс.обращались
+
+
+СТРОКИ_Н6_3 = [
+    pytest.param(
+        "Document_ПодтверждениеЗачисленияЗарплаты",
+        "Сотрудники",
+        {"БИКБанкаСчета": "044525225", "ИдентификаторСтроки": "строка-1"},
+        id="ПодтверждениеЗачисленияЗарплаты.Сотрудники",
+    ),
+    pytest.param(
+        "Catalog_МашиночитаемыеДоверенностиОрганизаций",
+        "ФИО",
+        {"Владелец": "доверитель"},
+        id="МашиночитаемыеДоверенности.ФИО",
+    ),
+]
+
+
+@pytest.mark.parametrize(("сущность", "часть", "строка"), СТРОКИ_Н6_3)
+async def test_Н6_3_полный_metadata_строки_табличных_частей_создаются(
+    среда_полная, одинс, сущность, часть, строка
+):
+    """Две из 18 табличных частей УТ, строки которых раньше отклонялись ложным `filter_syntax`."""
+    запись, стор, _ = среда_полная
+
+    ответ = json.loads(await создать(запись, {часть: [строка]}, entity=сущность))
+
+    assert "pending_id" in ответ, ответ
+    операция = await стор.take(ответ["pending_id"], "sess-1")
+    assert операция.request["json"][часть] == [строка]
+    assert not одинс.обращались
 
 
 # ---------------------------------------------------------------------------------------------

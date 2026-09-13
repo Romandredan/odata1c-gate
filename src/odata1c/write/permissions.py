@@ -131,12 +131,7 @@ def check_write(
 
     # Шаг 5: список сущностей базы. `deny_entities` проверяется первым: он приоритетнее пустого
     # `allow_entities` (пустой список — «без ограничения», а не «ничего нельзя»).
-    if entity.name in base.permissions.deny_entities:
-        raise WriteError(
-            "permission_denied",
-            f"запись в сущность «{entity.name}» запрещена политикой базы",
-            hint=f"уберите «{entity.name}» из permissions.deny_entities в bases.yaml",
-        )
+    check_entity_denied(base, entity.name)
     if base.permissions.allow_entities and entity.name not in base.permissions.allow_entities:
         raise WriteError(
             "permission_denied",
@@ -146,6 +141,22 @@ def check_write(
 
     # Шаг 6: запрещённые поля.
     check_fields(base, entity.name, fields)
+
+
+def check_entity_denied(base: BaseConfig, entity: str) -> None:
+    """Запретная половина шага 5 SPEC §7.1: сущность в `deny_entities` → `permission_denied`.
+
+    Отдельно — ради строк табличных частей в `create` (Н6-2 ревью задачи 6 M2): владелец, который
+    запретил запись в табличную часть, не должен получить её строки через тело `create` объекта.
+    `allow_entities` к сущности строки не применяется (и поэтому не здесь): он перечисляет объекты,
+    а не их табличные части, — разрешение владельца покрывает его строки. Имя в тексте — из
+    `deny_entities` владельца, не ввод модели."""
+    if entity in base.permissions.deny_entities:
+        raise WriteError(
+            "permission_denied",
+            f"запись в сущность «{entity}» запрещена политикой базы",
+            hint=f"уберите «{entity}» из permissions.deny_entities в bases.yaml",
+        )
 
 
 def check_fields(base: BaseConfig, entity: str, fields: Iterable[str]) -> None:
