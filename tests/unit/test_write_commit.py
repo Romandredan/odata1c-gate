@@ -1509,6 +1509,8 @@ async def test_Т7_5_неизвестный_исход_create_ведёт_к_по
     assert отказ["code"] == "commit_outcome_unknown" and "неизвест" in отказ["message"]
     assert "odata1c_query" in отказ["hint"] and "Description" in отказ["hint"]
     assert "odata1c_get" not in отказ["hint"]
+    # Хвост Ruling 63: значения для отбора — из аргументов своего вызова, в превью их больше нет.
+    assert "из превью" not in отказ["hint"] and "вашего вызова" in отказ["hint"]
 
 
 async def test_Т7_6_trust_при_запасном_deny_отказ_без_записи(среда, одинс):
