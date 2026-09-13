@@ -298,6 +298,9 @@ def test_close_отпускает_файл_для_удаления(tmp_path):
 
 
 def test_повреждённый_файл_даёт_writeerror_с_подсказкой(tmp_path):
+    """М-2 ревью итоговых правок M2: отказ уходит модели (§5.2), поэтому полного пути в нём нет —
+    он назвал бы домашний каталог вместе с именем пользователя ОС. В тексте — имя файла и где он
+    лежит; полный путь пишется в журнал демона."""
     путь = tmp_path / "journal.sqlite"
     путь.write_bytes(b"not a real sqlite database, just random junk bytes 12345")
 
@@ -305,8 +308,10 @@ def test_повреждённый_файл_даёт_writeerror_с_подсказ
         Journal(путь)
 
     assert ошибка.value.code == "internal"
-    assert str(путь) in str(ошибка.value)
-    assert str(путь) in ошибка.value.hint
+    текст = str(ошибка.value) + ошибка.value.hint
+    assert str(путь) not in текст and str(tmp_path) not in текст
+    assert "journal.sqlite в домашнем каталоге шлюза" in str(ошибка.value)
+    assert "journal.sqlite в домашнем каталоге шлюза" in ошибка.value.hint
 
 
 # --- двойной open_commit / close_commit без open_commit — ошибка программы --------------------
@@ -536,7 +541,9 @@ def test_несовместимая_версия_схемы_даёт_writeerror(
         Journal(путь)
 
     assert ошибка.value.code == "internal"
-    assert str(путь) in str(ошибка.value)
+    # М-2: полного пути в тексте для модели нет — только имя файла и где он лежит.
+    assert str(путь) not in str(ошибка.value) + ошибка.value.hint
+    assert "journal.sqlite в домашнем каталоге шлюза" in str(ошибка.value)
 
 
 # --- B-5: recent(limit) — границы -----------------------------------------------------------------
