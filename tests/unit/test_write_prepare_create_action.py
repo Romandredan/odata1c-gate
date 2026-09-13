@@ -11,6 +11,7 @@
 """
 
 import functools
+import inspect
 import json
 import pathlib
 
@@ -18,11 +19,16 @@ import httpx
 import pytest
 import respx
 import yaml
-from conftest import без_навигаций, ничего_не_скрыто, строение_неизвестно
+from conftest import без_класса_пути, без_навигаций, ничего_не_скрыто, строение_неизвестно
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
+from odata1c.gate.contact_info import EntityShape
+from odata1c.gate.dictionary import Dictionary
+from odata1c.gate.pipeline import BaseGate
+from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.service import policy_path, refresh_policy
+from odata1c.gate.unmasking import GateError, Unmasker
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
@@ -702,7 +708,10 @@ async def test_отказы_create_называют_поле_и_нужный_т�
     assert "odata1c_action" in проведение["hint"]
     assert "odata1c_mark_for_deletion" in пометка["hint"]
     assert КОНТРАГЕНТЫ in строка["hint"] and "КонтактнаяИнформация" in строка["hint"]
-    assert "reindex" in вне_индекса["hint"]
+    # `ИсторияКПП` в урезанной фикстуре — коллекция без сущности строки: реиндекс того же
+    # `$metadata` её не добавит, подсказки «обновите индекс» нет (Н6r2-2).
+    assert "табличные части этой сущности через create не задаются" in вне_индекса["message"]
+    assert "reindex" not in вне_индекса["hint"] and "регистр" not in вне_индекса["hint"]
     assert "ГоловнойКонтрагент_Key" in навигация["hint"]
 
 
@@ -969,6 +978,143 @@ async def test_нумерация_токенов_не_начинается_за�
         "второй токен в теле записи, табличная часть «КонтактнаяИнформация», строка 1, "
         "поле «Представление»" in отказ["message"]
     ), отказ
+
+
+# --- Н6r2-1: место строки в отказе строит гейт, а не вызывающий ------------------------------
+
+ВЛАДЕЛЕЦ_Т = "Catalog_Проба"
+СТРОКА_Т = "Catalog_Проба_Товары"
+ЧУЖОЙ_ТОКЕН = "[[inn:ZZZZZZZZZZ]]"
+
+
+def _раскрыть_строку(tmp_path, *, имя_в_индексе: bool = True, **параметры):
+    """`Unmasker.write` строки табличной части с неизвестным словарю токеном в поле `ИНН`:
+    отказ `token_unknown` называет место. Строение — синтетика: владелец знает поле «Товары»
+    (или нет), строка знает `ИНН` и владельца."""
+    строения = {
+        ВЛАДЕЛЕЦ_Т: EntityShape(
+            fields=frozenset({"Description"} | ({"Товары"} if имя_в_индексе else set()))
+        ),
+        СТРОКА_Т: EntityShape(fields=frozenset({"ИНН"}), parent=ВЛАДЕЛЕЦ_Т),
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    словарь = Dictionary(tmp_path / "gate.sqlite", "секрет ровно для обратной подмены".encode())
+    try:
+        обратно = Unmasker(
+            словарь,
+            base="ut",
+            field_class=lambda сущность, поле, *, strict=False: (
+                "inn" if (сущность, поле) == (СТРОКА_Т, "ИНН") else None
+            ),
+            path_class=без_класса_пути,
+            shape=строения.get,
+        )
+        with pytest.raises(GateError) as отказ:
+            обратно.write(
+                {"ИНН": ЧУЖОЙ_ТОКЕН},
+                entity=СТРОКА_Т,
+                current=None,
+                revealed=RevealedValues(),
+                numbering={"[[inn:AAAAAAAAAA]]": 1},
+                **параметры,
+            )
+    finally:
+        словарь.close()
+    return отказ.value
+
+
+def test_Н6r2_1_имя_табличной_части_в_отказе_гейт_берёт_из_индекса(tmp_path):
+    """Вызывающий передаёт только номер строки; имя табличной части гейт выводит из строения
+    (`EntityShape.parent`) и проверяет, что владелец знает такое поле (Ruling 53)."""
+    отказ = _раскрыть_строку(tmp_path, row=2)
+
+    assert отказ.code == "token_unknown", отказ
+    assert "второй токен в теле записи, табличная часть «Товары», строка 2, поле «ИНН»" in str(
+        отказ
+    ), отказ
+
+
+def test_Н6r2_1_имя_табличной_части_вне_индекса_в_отказ_не_попадает(tmp_path):
+    """Владелец не знает поля «Товары» — имя из сущности строки не подтверждено индексом и в текст
+    не идёт; место — номер строки без имени."""
+    отказ = _раскрыть_строку(tmp_path, имя_в_индексе=False, row=2)
+
+    assert "Товары" not in str(отказ) + отказ.hint
+    assert "в теле записи, строка 2 табличной части, поле «ИНН»" in str(отказ), отказ
+
+
+def test_Н6r2_1_сигнатура_раскрытия_не_берёт_свободного_текста(tmp_path):
+    """В текст отказа от вызывающего идёт только номер строки: параметра-строки места нет ни у
+    гейта, ни у `Unmasker`, а номер — целое не меньше 1 (строка и `bool` отклоняются)."""
+    for функция in (Unmasker.write, BaseGate.inbound_write):
+        параметры = inspect.signature(функция, eval_str=True).parameters
+        assert "place" not in параметры
+        assert параметры["row"].annotation == int | None
+        assert all(
+            параметр.kind is not inspect.Parameter.VAR_KEYWORD for параметр in параметры.values()
+        )
+    for номер, плохой in enumerate(("в теле записи, табличная часть «x», строка 1", True, 0, 1.0)):
+        with pytest.raises(TypeError):
+            _раскрыть_строку(tmp_path / str(номер), row=плохой)
+
+
+# --- Н6r2-2: табличная часть без сущности строки -----------------------------------------------
+
+РЕГИСТР_НАКОПЛЕНИЯ = "AccumulationRegister_ДвиженияДенежныеСредстваКонтрагент"
+ТЕЛО_НАБОРА = {
+    "Recorder": ССЫЛКА_ДОК,
+    "Recorder_Type": "StandardODATA.Document_X",
+    "RecordSet": [{"LineNumber": "1"}],
+}
+BASES_РЕГИСТРЫ = BASES_YAML.replace(
+    "deny_fields: [", "register_direct_write: true\n      deny_fields: [", 1
+)
+
+
+@pytest.fixture
+async def среда_регистры(tmp_path, edmx_ut_real):
+    assert "register_direct_write: true" in BASES_РЕГИСТРЫ
+    запись, стор, tools, журнал = await _среда_на(tmp_path, edmx_ut_real, BASES_РЕГИСТРЫ)
+    yield запись, стор, tools
+    журнал.close()
+    await tools.aclose()
+
+
+async def test_Н6r2_2_табличная_часть_без_сущности_строки_отказ_без_реиндекса(
+    среда_регистры, одинс
+):
+    """`RecordSet` регистра — поле-коллекция, у строк которого нет своей сущности среди детей
+    владельца (строки — `…_RecordType`). Отказ — при разборе тела, прямо и без ложной подсказки
+    «обновите индекс»: реиндекс здесь ничего не изменит."""
+    запись, стор, _ = среда_регистры
+
+    отказ = ошибка(await создать(запись, ТЕЛО_НАБОРА, entity=РЕГИСТР_НАКОПЛЕНИЯ))
+
+    assert отказ["code"] == "params_invalid", отказ
+    assert "табличные части этой сущности через create не задаются" in отказ["message"]
+    assert "RecordSet" in отказ["message"] and "набор записей регистра" in отказ["hint"]
+    текст = отказ["message"] + отказ["hint"]
+    assert "обновите" not in текст and "reindex" not in текст
+    assert not одинс.обращались and стор._ops == {}
+
+
+async def test_Н6r2_3_шаги_владельца_раньше_шагов_табличных_частей(среда, одинс):
+    """SPEC §7.1: сначала все шаги владельца, потом табличные части. База только для чтения
+    отклоняет набор записей своим шагом раньше разбора `RecordSet`; запрет поля шапки
+    (`deny_fields`) называется раньше запрета поля строки, хотя шапка в теле стоит второй."""
+    запись, стор, _ = среда
+
+    только_чтение = ошибка(await создать(запись, ТЕЛО_НАБОРА, base="ro", entity=РЕГИСТР_НАКОПЛЕНИЯ))
+    два_запрета = ошибка(
+        await создать(
+            запись, {"КонтактнаяИнформация": [{"Регион": "Москва"}], "КодПоОКПО": "09226071"}
+        )
+    )
+
+    assert только_чтение["code"] == "base_read_only", только_чтение
+    assert два_запрета["code"] == "field_write_denied", два_запрета
+    assert "КодПоОКПО" in два_запрета["message"] and "Регион" not in два_запрета["message"]
+    assert not одинс.обращались and стор._ops == {}
 
 
 BASES_DENY_КИ = BASES_YAML.replace(

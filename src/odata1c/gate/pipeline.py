@@ -227,7 +227,7 @@ class BaseGate:
         revealed: RevealedValues,
         strict: bool = False,
         numbering: dict[str, int] | None = None,
-        place: str | None = None,
+        row: int | None = None,
     ) -> dict:
         """Тело PATCH/POST пишущего тула M2: токены → реальные значения (Б-1). `current` —
         текущее состояние объекта так, как его вернул `client.get(..., scrub=self.scrubber(
@@ -236,9 +236,10 @@ class BaseGate:
         `token_ambiguous`; молчаливого выбора нет. Анти-оракульные и классовые правила — те же,
         что у `inbound_value`. `revealed`, `shape`, `strict` — как у `inbound_filter`.
 
-        `numbering`/`place` — тело, раскрываемое несколькими вызовами (Ruling 56, `create`: строка
+        `numbering`/`row` — тело, раскрываемое несколькими вызовами (Ruling 56, `create`: строка
         табличной части — от имени своей сущности): общая нумерация токенов всего тела
-        (`unmasking.number_tokens`) и место для текста отказа; см. `Unmasker.write`."""
+        (`unmasking.number_tokens`) и номер строки; место для текста отказа гейт строит сам по
+        индексу, строки от вызывающего там нет; см. `Unmasker.write`."""
         if self.mode == "off":
             return data
         return self._обратная_подмена(shape).write(
@@ -248,7 +249,7 @@ class BaseGate:
             revealed=revealed,
             strict=strict,
             numbering=numbering,
-            place=place,
+            row=row,
         )
 
     def check_open_literal(
