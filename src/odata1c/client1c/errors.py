@@ -14,7 +14,11 @@ class OdataError(Exception):
     `identifiers+names` текст ошибки 1С модели не отдаётся вовсе — 1С называет в нём объекты и
     пользователей, а новое название детекторы не узнают. Модель получает только статус, код
     платформы и категорию, и их нельзя доставать разбором уже замаскированного текста. Отсутствие
-    статуса значит ещё и другое: 1С не ответила, и исход записи неизвестен."""
+    статуса значит ещё и другое: 1С не ответила, и исход записи неизвестен.
+
+    `platform_error` — тело ответа разобрано как ошибка платформы (`odata.error` или `error` с
+    кодом или сообщением). 5xx без неё ответила не 1С — страница веб-сервера или посредника перед
+    ней (ФП-2 ревью итоговых правок M2): запрос мог дойти до 1С и выполниться."""
 
     def __init__(
         self,
@@ -31,6 +35,7 @@ class OdataError(Exception):
         self.hint = hint
         self.status = status
         self.platform_code = platform_code
+        self.platform_error = False
 
 
 # Код `odata.error.code`, которым платформа отвечает на объект по ключу, которого нет (живая
@@ -50,7 +55,9 @@ class OdataError(Exception):
 def map_error(status: int, body: str) -> OdataError:
     ошибка = _map_error(status, body)
     ошибка.status = status
-    ошибка.platform_code = _ошибка_платформы(body)[0]
+    код, текст = _ошибка_платформы(body)
+    ошибка.platform_code = код
+    ошибка.platform_error = bool(код or текст)
     return ошибка
 
 
