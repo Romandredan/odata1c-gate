@@ -82,3 +82,23 @@ MCPServer.tool(self, name=None, title=None, description=None, annotations=None,
    этим `_meta`. Программно подтверждено только то, что клиент видит поле. Требует подключения
    пробного сервера командой `claude mcp add` и вызова тула в живой сессии; версию Claude Code
    записать в отчёт — SPEC §15 отмечает, что поведение исправлено в 2.1.246.
+
+## Дополнение 2026-09-13: поведение Claude Code по документации (к задаче 9 плана M2)
+
+Ручная проверка из следствия 4 по-прежнему за приёмкой M2 (задача 10). До неё — что обещает
+документация Claude Code, страница «Choose a permission mode»
+(<https://code.claude.com/docs/en/permission-modes>):
+
+- «Claude Code doesn't auto-approve the following in any mode, including `bypassPermissions`: …
+  MCP tools marked `requiresUserInteraction`».
+- Автоматический режим: «MCP tools marked `requiresUserInteraction` prompt you directly even when an
+  allow rule matches» и такие вызовы «never reach the classifier» — классификатор их не одобряет.
+- Режим `dontAsk`: такие тулы отклоняются, «because their approval card needs an answer this mode
+  never collects».
+- Известная регрессия ([anthropics/claude-code#58757](https://github.com/anthropics/claude-code/issues/58757)):
+  в `bypassPermissions` тул с этим флагом блокируется ошибкой «unsupervised mode» без диалога —
+  `odata1c_commit` там недоступен; обход — режим с запросами разрешений.
+
+Следствие для инварианта 2: в Claude Code подтверждение `odata1c_commit` держится на клиенте в
+любом режиме, правило «всегда разрешать» его не снимает. Приёмка задачи 10 проверяет это вживую
+(диалог появляется в ручном и автоматическом режиме; версия Claude Code — в отчёт).
