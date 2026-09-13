@@ -53,6 +53,24 @@ def test_обрыв_транспорта_оставляет_улику(журн�
     assert "SSE stream disconnected" in журнал.read_text(encoding="utf-8")
 
 
+def test_идентификатор_сессии_не_попадает_в_журнал(журнал):
+    """Р59-5 ревью Ruling 59: менеджер сессий SDK пишет идентификатор живой сессии на INFO. По нему
+    демон узнаёт сессию, и в журнале, который владелец отдаёт при разборе ошибок, его быть не
+    должно. WARNING того же логгера (беда процесса) по-прежнему попадает в журнал."""
+    logging.getLogger("mcp.server.streamable_http_manager").info(
+        "Created new transport with session ID: 55d3d2c4763d494bbfc8a9c3213d58e9"
+    )
+    logging.getLogger("mcp.server.streamable_http").info(
+        "Terminating session: 9d92f42c44294ae9856d5f60319e3e6b"
+    )
+    logging.getLogger("mcp.server.streamable_http_manager").warning("менеджер сессий: беда")
+
+    содержимое = журнал.read_text(encoding="utf-8")
+    assert "55d3d2c4763d494bbfc8a9c3213d58e9" not in содержимое
+    assert "9d92f42c44294ae9856d5f60319e3e6b" not in содержимое
+    assert "менеджер сессий: беда" in содержимое
+
+
 def test_поток_запросов_httpx_журнал_не_заливает(журнал):
     """Обратная сторона: httpx пишет на INFO строку про КАЖДЫЙ запрос к 1С («HTTP Request: GET …
     200 OK»). У шлюза таких строк столько же, сколько обращений модели, и в журнале демона они

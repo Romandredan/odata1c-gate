@@ -1238,6 +1238,13 @@ def _обеспечить_потоки_вывода(home: pathlib.Path) -> None:
     "uvicorn": (None, True),
     "uvicorn.error": (logging.INFO, True),
     "mcp": (logging.INFO, True),
+    # Р59-5 ревью Ruling 59: менеджер сессий SDK пишет на INFO «Created new transport with session
+    # ID: …», транспорт — «Terminating session: …». Идентификатор сессии — не данные 1С, но по
+    # нему демон узнаёт сессию: процесс, прочитавший журнал, мог предъявить его и продолжить чужую
+    # сессию. Подпись лаунчера (Ruling 59) отказывает такому запросу на запись, но журнал, который
+    # владелец отдаёт при разборе ошибок, идентификаторов живых сессий нести не должен вовсе.
+    "mcp.server.streamable_http_manager": (logging.WARNING, True),
+    "mcp.server.streamable_http": (logging.WARNING, True),  # «Terminating session: …»
     "httpx": (logging.WARNING, True),
     "httpcore": (logging.WARNING, True),
     "httpx2": (logging.WARNING, True),
