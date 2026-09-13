@@ -18,7 +18,8 @@ class WriteError(Exception):
     `code` — из перечня SPEC §5.2 (`base_read_only`, `permission_denied`, `entity_hidden`,
     `field_write_denied`, `params_invalid`, `token_ambiguous`, `pending_unknown`,
     `pending_expired`, `pending_stale`, `commit_limit`, `write_unsupported_client`,
-    `undo_unsupported`, `action_unknown`, `confirm_mechanism_mismatch`, `odata_error`,
+    `undo_unsupported`, `commit_unknown`, `action_unknown`, `confirm_mechanism_mismatch`,
+    `odata_error`,
     `internal` — и другие коды чтения,
     которые пишущий путь тоже может вернуть до отправки в 1С). `hint` — что сделать, чтобы отказ
     не повторился (какой ключ `bases.yaml` включить, каким тулом воспользоваться); может быть

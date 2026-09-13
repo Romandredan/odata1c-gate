@@ -292,6 +292,7 @@ class BaseGate:
         revealed: RevealedValues | None,
         shape: Shape,
         strict: bool = False,
+        persist: bool = True,
     ) -> MaskResult:
         """`resolve` — резолвер «сущность и ключ ответа → сущность вложенного объекта» (итоговое
         ревью M1d, C1). Аргумент обязателен, а не с умолчанием `None`: маскировка раскрытого
@@ -316,7 +317,10 @@ class BaseGate:
         `shape` — строение сущностей по индексу (`contact_info.EntityShape`, Ruling 33): по нему
         узнаётся строка контактной информации, в которой нет поля `Тип` (модель выбрала одно
         `Представление`). Обязателен по той же причине, что `resolve`: без него такая строка
-        тихо уходит по пути свободного текста, где адрес не ловит ни один детектор."""
+        тихо уходит по пути свободного текста, где адрес не ловит ни один детектор.
+
+        `persist=False` — маска без записи в словарь (Ruling 58): для данных, которые не ответ 1С
+        этого вызова, — журнал записи (`WriteService.journal`). См. `Masker.mask`."""
         return self._masker.mask(
             data,
             entity=entity,
@@ -325,6 +329,7 @@ class BaseGate:
             strict=strict,
             revealed=revealed,
             shape=shape,
+            persist=persist,
         )
 
     def scrub_revealed(self, text: str, revealed: RevealedValues | None) -> str:
@@ -447,13 +452,20 @@ class BaseGate:
         содержимое свободных полей 1С, — и точное вхождение адреса больше не совпадёт, а адресная
         часть выйдет открытой. Соглашение проекта «маскировка, затем страж» при этом не меняется:
         проход добавляется перед, а не переставляется существующий."""
-        message = self.scrub_revealed(message, revealed)
-        hint = self.scrub_revealed(hint, revealed) if hint else hint
-        сообщение = self._masker.mask_text(message, entity="", field="error")
-        подсказка = self._masker.mask_text(hint, entity="", field="error") if hint else hint
+        сообщение = self.mask_message(message, revealed)
+        подсказка = self.mask_message(hint, revealed) if hint else hint
         return self.finish(
             {"error": {"code": code, "message": сообщение, "hint": подсказка}}, revealed
         )
+
+    def mask_message(self, text: str, revealed: RevealedValues | None = None) -> str:
+        """Текст сообщения — ошибки 1С или отказа — так же, как его маскирует `error`: ранний
+        проход раскрытого по сырому тексту, затем `mask_text` без записи в словарь (Ruling 48).
+        Результат — ещё не ответ: его кладут в конверт, и конверт проходит `finish` со стражем.
+
+        Отдельно от `error` — для текста ошибки, который лежит не в отказе, а в данных ответа:
+        сохранённый журналом текст ошибки 1С (`WriteService.journal`, Ruling 58)."""
+        return self._masker.mask_text(self.scrub_revealed(text, revealed), entity="", field="error")
 
 
 def _есть_строка_раннего_прохода(значение) -> bool:

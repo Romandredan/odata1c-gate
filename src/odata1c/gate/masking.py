@@ -33,6 +33,13 @@ from odata1c.gate.tokens import (
 ДВОИЧНЫЕ_СУФФИКСЫ = ("_Base64Data", "ХранилищеЗначения")
 КЛАССЫ_НАЗВАНИЙ = ("org", "person")
 
+# Пометка значения, которому маска без записи в словарь (`persist=False`, Ruling 58) не может дать
+# токен: название или ФИО, которых словарь не знает, — номер у них выдаёт только запись. Формы
+# `[[класс]]` без двоеточия и хвоста `TOKEN_RE` не узнаёт: пометка не раскрывается, не годится в
+# отбор и не выдаёт себя за токен шлюза. Одна на все неизвестные значения класса — различать их
+# мог бы только номер, то есть запись.
+МЕТКА_БЕЗ_ЗАПИСИ = "[[{класс}]]"
+
 # Сущность и ключ ответа → сущность вложенного объекта (цель навигации или дочерняя сущность
 # табличной части), либо `None`, если ключ ведёт не к отдельной сущности. Реализация живёт в слое
 # тулов и строится по индексу метаданных — гейт про индекс не знает и знать не должен.
@@ -327,6 +334,7 @@ class Masker:
         strict: bool = False,
         revealed: RevealedValues | None = None,
         shape: Shape | None = None,
+        persist: bool = True,
     ) -> MaskResult:
         """`shape` — строение сущностей по индексу (`contact_info.EntityShape`, Ruling 33): по нему
         строка табличной части контактной информации узнаётся, даже когда в ответе нет поля
@@ -360,7 +368,15 @@ class Masker:
         инструменты): ранний проход (Ruling 25) уже заменил раскрытые значения в сыром теле
         токенами, и поле с классом маскировщик должен токенизировать по НАСТОЯЩЕМУ содержимому, а
         не по токену, стоящему на его месте, — см. `_обработать_строку`. `None` — вызов ничего не
-        раскрывал (или тест самого маскировщика)."""
+        раскрывал (или тест самого маскировщика).
+
+        `persist=False` — маска без записи в словарь (Ruling 58, тул `odata1c_journal`): данные
+        журнала — не ответ 1С этого вызова, а `request` неудачного `commit` несёт значения,
+        которых в 1С нет вовсе (Ruling 48: словарь пополняется только телом ответа 1С с
+        данными). Известное значение получает свой токен, новое — детерминированный токен без
+        вставки (`Dictionary.token_for(persist=False)`), неизвестное название или ФИО —
+        `МЕТКА_БЕЗ_ЗАПИСИ`. Остальное — как у обычной маски: классы, `lit` для токена шлюза в
+        строке данных (Б-2), слой известных названий, поиск реквизитов."""
         замаскированные = УчётПолей()
         предупреждения: list[str] = []
         if self._mode == "off":
@@ -380,6 +396,7 @@ class Masker:
             revealed=revealed,
             shape=shape,
             строгие_ки=строгие_ки,
+            persist=persist,
         )
         if изъятое:
             предупреждения.append(ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ)
@@ -450,6 +467,7 @@ class Masker:
         shape: Shape | None = None,
         строгие_ки: list[str] | None = None,
         вид_лица: tuple[str, str | None] | None = None,
+        persist: bool = True,
     ):
         """`вид_лица` — что известно о виде лица записи-владельца (Ruling 34, пункт 2): сущность
         записи и значение её поля `ЮрФизЛицо` (`None` — поля в записи нет). Адрес в табличной части
@@ -504,6 +522,7 @@ class Masker:
                     замаскированные=замаскированные,
                     strict=strict,
                     значение_поля=False,
+                    persist=persist,
                 )
                 if isinstance(вложенное, str):
                     извлечь = None
@@ -535,6 +554,7 @@ class Masker:
                         strict=strict,
                         revealed=revealed,
                         извлечь=извлечь,
+                        persist=persist,
                     )
                 else:
                     цель = resolve(entity, ключ) if resolve is not None else None
@@ -585,6 +605,7 @@ class Masker:
                         shape=shape,
                         строгие_ки=строгие_ки,
                         вид_лица=своё,
+                        persist=persist,
                     )
             return результат
         if isinstance(значение, list):
@@ -604,6 +625,7 @@ class Masker:
                     shape=shape,
                     строгие_ки=строгие_ки,
                     вид_лица=вид_лица,
+                    persist=persist,
                 )
                 for элемент in значение
             ]
@@ -631,6 +653,7 @@ class Masker:
                 strict=strict,
                 revealed=revealed,
                 извлечь=извлечь,
+                persist=persist,
             )
         return значение
 
@@ -837,6 +860,7 @@ class Masker:
         извлечь: Callable[[str], str] | None = None,
         значение_поля: bool = True,
         из_ответа: bool = True,
+        persist: bool = True,
     ) -> str:
         """`из_ответа=False` — строка не данные ответа 1С, а текст ошибки или подсказки
         (`mask_text`): токены в ней пишет сам шлюз, и в `lit` они не превращаются (Б-2).
@@ -875,7 +899,11 @@ class Masker:
                 замаскированные.append(field, целиком=bool(parse_token(текст)))
             if строка_данных:
                 return self._заменить_строки_с_токенами(
-                    текст, entity=entity, field=field, вставки=self._вставки(переписано, revealed)
+                    текст,
+                    entity=entity,
+                    field=field,
+                    вставки=self._вставки(переписано, revealed),
+                    persist=persist,
                 )
             return текст
         if класс and класс not in ("scan",) and (класс in CLASSES or класс.startswith("custom:")):
@@ -888,6 +916,7 @@ class Masker:
                 revealed=revealed,
                 переписано=переписано,
                 извлечь=извлечь,
+                persist=persist,
             )
 
         обработанное = текст
@@ -897,12 +926,17 @@ class Masker:
                 entity=entity,
                 field=field,
                 вставки=self._вставки(переписано, revealed),
+                persist=persist,
             )
         обработанное = self._заменить_известные_названия(обработанное, entity=entity, field=field)
         # Ruling 48: словарь пополняется только данными ответа 1С; текст ошибки (`mask_text`) —
         # токенами без записи.
         обработанное = self._заменить_найденные_реквизиты(
-            обработанное, entity=entity, field=field, force=force_scan or strict, persist=из_ответа
+            обработанное,
+            entity=entity,
+            field=field,
+            force=force_scan or strict,
+            persist=из_ответа and persist,
         )
         # Поле, где значение заменил только ранний проход, — тоже без реального значения в ответе
         # (находка M-2 ревью 6; Ruling 20, пункт 4: список говорит правду ПО ФАКТУ). Исходное здесь
@@ -924,6 +958,7 @@ class Masker:
         revealed: RevealedValues | None,
         переписано: ScrubbedText | None = None,
         извлечь: Callable[[str], str] | None = None,
+        persist: bool = True,
     ) -> str:
         """Поле с объявленным классом — целиком одним токеном (SPEC §6.4). Два случая, когда в
         строке УЖЕ стоит токен (находка П2 приёмки через настоящие инструменты, 2026-09-12):
@@ -975,13 +1010,17 @@ class Masker:
             исходное = revealed.original_of(переписано) if revealed is not None else None
             if исходное is None:
                 return текст
-            замена = self._токен_поля(класс, исходное, entity=entity, field=field, извлечь=извлечь)
+            замена = self._токен_поля(
+                класс, исходное, entity=entity, field=field, извлечь=извлечь, persist=persist
+            )
             if замена == исходное:
                 return текст
             if revealed is not None:
                 revealed.absorb(переписано.hits)
             return замена
-        замена = self._токен_поля(класс, текст, entity=entity, field=field, извлечь=извлечь)
+        замена = self._токен_поля(
+            класс, текст, entity=entity, field=field, извлечь=извлечь, persist=persist
+        )
         if замена != текст:
             замаскированные.append(field)
         return замена
@@ -994,23 +1033,48 @@ class Masker:
         entity: str,
         field: str,
         извлечь: Callable[[str], str] | None,
+        persist: bool = True,
     ) -> str:
-        """Токен значения поля с классом; строка с токеном шлюза внутри — токен `lit` (Б-2)."""
+        """Токен значения поля с классом; строка с токеном шлюза внутри — токен `lit` (Б-2).
+
+        `persist=False` — маска без записи в словарь (Ruling 58: тул `odata1c_journal`). Название
+        и ФИО, которых словарь не знает, номера без записи не получают (`Dictionary.token_for`
+        отказывает `ValueError`: следующий номер получило бы и другое значение), и значение
+        закрывается непрозрачной пометкой класса без хвоста (`МЕТКА_БЕЗ_ЗАПИСИ`). Она нарочно
+        не токен (`TOKEN_RE` её не узнаёт): раскрывать её нечем, и в отбор или тело записи она
+        не годится — это пометка «здесь было название», а не адрес значения."""
         if TOKEN_RE.search(значение):
             return self._dictionary.token_for(
-                КЛАСС_СТРОКИ_С_ТОКЕНОМ, значение, base=self._base, entity=entity, field=field
+                КЛАСС_СТРОКИ_С_ТОКЕНОМ,
+                значение,
+                base=self._base,
+                entity=entity,
+                field=field,
+                persist=persist,
             )
-        return self._dictionary.token_for(
-            класс,
-            значение,
-            base=self._base,
-            entity=entity,
-            field=field,
-            source=извлечь(значение) if извлечь is not None else None,
-        )
+        try:
+            return self._dictionary.token_for(
+                класс,
+                значение,
+                base=self._base,
+                entity=entity,
+                field=field,
+                source=извлечь(значение) if извлечь is not None else None,
+                persist=persist,
+            )
+        except ValueError:
+            if persist:
+                raise
+            return МЕТКА_БЕЗ_ЗАПИСИ.format(класс=класс)
 
     def _заменить_строки_с_токенами(
-        self, текст: str, *, entity: str, field: str, вставки: tuple[tuple[int, int], ...]
+        self,
+        текст: str,
+        *,
+        entity: str,
+        field: str,
+        вставки: tuple[tuple[int, int], ...],
+        persist: bool = True,
     ) -> str:
         """Токены шлюза внутри строки данных 1С — токенами `lit` (Б-2). Кроме тех, что поставил
         сам ранний проход этого вызова: они стоят в `вставки` (`RevealedValues.inserted_of`), и
@@ -1031,6 +1095,7 @@ class Masker:
                     base=self._base,
                     entity=entity,
                     field=field,
+                    persist=persist,
                 )
             )
             позиция = конец
