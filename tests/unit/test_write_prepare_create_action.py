@@ -26,6 +26,7 @@ from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
 from odata1c.registry.registry import SessionScope
 from odata1c.tools.service import ToolService
+from odata1c.write import permissions, service
 from odata1c.write.journal import Journal
 from odata1c.write.pending import CommitLimiter, PendingStore
 from odata1c.write.permissions import ДЕЙСТВИЯ_ПРОВЕДЕНИЯ
@@ -975,3 +976,5 @@ def test_проведение_и_флаг_post_documents_один_перечен
     """Перечень действий первой поставки и действия под флагом `post_documents` — одна
     константа: разойдись они, действие прошло бы `action_unknown` мимо флага."""
     assert ДЕЙСТВИЯ_ПРОВЕДЕНИЯ == ("Post", "Unpost")
+    # Тождество, а не равенство: перечень, заново вписанный в сервис, остался бы равным.
+    assert service.ДЕЙСТВИЯ_ПРОВЕДЕНИЯ is permissions.ДЕЙСТВИЯ_ПРОВЕДЕНИЯ
