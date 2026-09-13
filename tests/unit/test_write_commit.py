@@ -13,6 +13,7 @@
 import asyncio
 import base64
 import json
+import re
 import urllib.parse
 import uuid
 
@@ -517,7 +518,23 @@ async def test_параллельные_commit_одного_pending_id_один_
     assert одинс.patch.call_count == 1
 
 
-async def test_отмена_посреди_запроса_операция_больше_не_pending(среда, одинс):
+def _следить_за_стражем(среда: Среда, monkeypatch, base: str = "ut") -> list[str]:
+    """Подменяет `finish` гейта базы обёрткой, которая запоминает всё, что прошло стража: так
+    видно, что страховочный ответ отмены — выход стража, а не текст мимо него (инвариант 1)."""
+    гейт = среда.tools._gate_for(среда.tools._config.bases[base])
+    настоящий = гейт.finish
+    прошли: list[str] = []
+
+    def finish(конверт, revealed=None):
+        текст = настоящий(конверт, revealed)
+        прошли.append(текст)
+        return текст
+
+    monkeypatch.setattr(гейт, "finish", finish)
+    return прошли
+
+
+async def test_отмена_посреди_запроса_операция_больше_не_pending(среда, одинс, monkeypatch):
     """Клиент отключился, задача `commit` отменена, пока запрос в 1С в пути: `_run` отмену не
     ловит, и без `finally` операция осталась бы `pending` при отправленном запросе — повторный
     `commit` записал бы второй раз. Повтор отвечает «прерван, исход в журнале», журнал — `started`
@@ -534,6 +551,7 @@ async def test_отмена_посреди_запроса_операция_бо�
         await asyncio.Event().wait()
 
     клиент.patch = зависает
+    прошли_стража = _следить_за_стражем(среда, monkeypatch)
     # Ruling 40: commit пришёл под конец срока подготовки (599 из 600 с) — окно идемпотентности
     # обязано отсчитываться от выполнения, и на пути отмены тоже.
     среда.стор._clock.сейчас += 599
@@ -546,6 +564,7 @@ async def test_отмена_посреди_запроса_операция_бо�
     операция = await среда.стор.take(подготовка["pending_id"], "s1")
     assert операция.status == "failed"
     среда.стор._clock.сейчас += 300  # за исходным сроком, внутри продлённого
+    assert операция.result in прошли_стража
     повтор = ошибка(await выполнить(среда, подготовка["pending_id"]))
     assert повтор["code"] == "internal" and операция.commit_id in повтор["message"]
     assert len(вызовов) == 1
@@ -1344,7 +1363,8 @@ async def test_Т7_6_механизм_закрепляется_за_операц
 
         отказ = ошибка(await выполнить(среда, подготовка["pending_id"], mechanism="trust"))
 
-        assert отказ["code"] == "permission_denied" and одинс.записей == 0
+        # Свой код: «сменился механизм» — не «пользователь отклонил» (SPEC §5.2).
+        assert отказ["code"] == "confirm_mechanism_mismatch" and одинс.записей == 0
         текст = await выполнить(
             среда, подготовка["pending_id"], mechanism="elicitation", confirm=Подтверждение(True)
         )
@@ -1388,3 +1408,49 @@ async def test_Т7_3_чужая_сессия_не_ждёт_диалога_вла
     finally:
         отпустить.set()
         await владелец
+
+
+async def test_страховочный_ответ_отмены_через_стража_ключ_регистра_токеном(
+    среда_синт, одинс, monkeypatch
+):
+    """Отмена после ответа 1С на `create` записи регистра с ключом класса `inn`: страховочный
+    ответ повтору построен до GET «после», прошёл стража базы, и составной ключ в нём — токеном
+    (маской полей ключа из ответа POST), а не реальным ИНН и не `null`."""
+    среда = среда_синт
+    прошли_стража = _следить_за_стражем(среда, monkeypatch)
+    подготовка = json.loads(
+        await среда.запись.create(
+            SessionScope(),
+            "s1",
+            base="ut",
+            entity=РЕГИСТР_ИНН,
+            data={"ИНН": ИНН, "Комментарий": "odata1c-приёмка"},
+        )
+    )
+    assert "pending_id" in подготовка, подготовка
+    клиент = среда.tools._client_for(среда.tools._config.bases["ut"])
+    настоящий_get = клиент.get
+    в_пути = asyncio.Event()
+
+    async def get_зависает(path, params=None, **kw):
+        if path.startswith(f"{РЕГИСТР_ИНН}("):
+            в_пути.set()
+            await asyncio.Event().wait()
+        return await настоящий_get(path, params, **kw)
+
+    клиент.get = get_зависает
+    задача = asyncio.create_task(выполнить(среда, подготовка["pending_id"]))
+    await в_пути.wait()
+    задача.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await задача
+
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+    assert операция.status == "committed" and операция.result in прошли_стража
+    повтор = await выполнить(среда, подготовка["pending_id"])
+    ответ = json.loads(повтор)
+    assert ответ["commit_id"] == операция.commit_id and ответ["result"] is None
+    assert re.fullmatch(r"\[\[inn:[^\]]+\]\]", ответ["key"]["ИНН"])
+    assert ИНН not in повтор
+    assert среда.журнал(операция.commit_id).key == {"ИНН": ИНН}
+    assert одинс.post.call_count == 1
