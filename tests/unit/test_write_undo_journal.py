@@ -606,6 +606,9 @@ async def test_журнал_от_класса_данных_словарь_не_�
     сбой, успех = записи
     assert успех["commit_id"] == удачный["commit_id"] and успех["op"] == "update"
     assert успех["undone_by"] is None and успех["committed_at"]
+    # Механизм подтверждения виден в туле (решение владельца после ручной проверки M2).
+    assert успех["mechanism"] == среда.журнал(удачный["commit_id"]).client
+    assert успех["mechanism"] in {"claude_code", "elicitation", "trust"}
     assert успех["after"]["ИНН"] == к.токен(среда.tools, НОВЫЙ_ИНН)
     assert успех["before"]["ИНН"] == к.токен(среда.tools, ИНН)
     assert успех["request"] == {"method": "PATCH", "json": {"ИНН": успех["after"]["ИНН"]}}

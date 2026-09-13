@@ -2597,7 +2597,8 @@ commits(commit_id, base, entity, key, op, session_id, client, requested_at, comm
   читаются вовсе, `limit` (1–100) — на всё вместе, порядок — по `requested_at`, затем `commit_id`,
   по убыванию. Явная база вне видимости — `base_unknown`, как у тулов чтения;
 - каждая строка — `commit_id`, база, роль, сущность, операция, `status`, `requested_at`,
-  `committed_at`, `undone_by` (кем откачена), `undo_of` (откатом чего является — обратный запрос
+  `committed_at`, `mechanism` (механизм подтверждения: `claude_code` / `elicitation` / `trust` —
+  решение владельца после ручной проверки M2), `undone_by` (кем откачена), `undo_of` (откатом чего является — обратный запрос
   по `undone_by`, отдельно не хранится), `DataVersion` до и после; `key`, `before`, `after` и тело запроса
   (`request.json`, метод, у действия — его имя) — маской своей сущности гейтом своей базы **без
   записи в словарь** (§6.6, Ruling 58). Путь запроса не показывается: у записи регистра в нём

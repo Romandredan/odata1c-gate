@@ -1823,6 +1823,10 @@ class WriteService:
             "requested_at": строка.requested_at,
             "committed_at": строка.committed_at,
             "undone_by": строка.undone_by,
+            # Механизм подтверждения (`claude_code` / `elicitation` / `trust`) — имя механизма, не
+            # данные; по нему владелец видит, кто подтвердил запись (решение владельца 2026-09-13
+            # после ручной проверки M2: раньше это читалось только из файла журнала).
+            "mechanism": строка.client,
         }
         пусто = {"key": None, "before": None, "after": None, "request": None}
         if репозиторий is None:
