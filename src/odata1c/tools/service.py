@@ -1793,7 +1793,7 @@ class ToolService:
                     клиент,
                     self._config.home,
                     force=force,
-                    classifier=classifier_for(base_config),
+                    classifier=classifier_for(self._config.home, base_config),
                 )
             except PermissionError as ошибка:
                 # Windows: готовый индекс подменяется через `os.replace`, а файл, открытый

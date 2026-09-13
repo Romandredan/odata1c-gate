@@ -30,11 +30,10 @@ bases:
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
     #   commit_limit: 20             # коммитов за 10 минут на сессию; 0 = без лимита
 
-    # --- гейт (умолчание роли prod: identifiers+names) ---
+    # --- гейт: скрывать ли (умолчание роли prod: identifiers+names) ---
     # gate:
-    #   mode: identifiers+names      # off | identifiers | identifiers+names, см. §6.2
-    #   names_for: [...]             # сущности, чьи Description и поля ФИО заменяются; умолчание в §6.5
-    #   scan_free_text: true         # искать реквизиты и известные названия в любых строках ответа
+    #   mode: identifiers+names      # off | identifiers | identifiers+names, см. SPEC §6.2
+    #                                # что именно скрывать и что открыть: bases/ut/policy.yaml
 
     # --- рецепты ---
     # recipes: bases/ut/recipes.yaml # путь относительно домашнего каталога; создаётся из шаблона (base add --recipes ut)

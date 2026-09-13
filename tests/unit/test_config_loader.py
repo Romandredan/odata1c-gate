@@ -200,3 +200,34 @@ def test_пустая_запись_базы_даёт_предупреждени�
     config = load_config(записать(tmp_path, с_пустой_записью))
     assert set(config.bases) == {"ut"}
     assert any("пустая" in предупреждение for предупреждение in config.warnings)
+
+
+# --- ADR-0015: names_for и scan_free_text переехали в policy.yaml, в bases.yaml их нет ---------
+
+
+def test_gate_names_for_в_bases_отклоняется_с_подсказкой(tmp_path):
+    (tmp_path / "daemon.yaml").write_text("port: 7171\ngate_secret: 'AAAA'\n", encoding="utf-8")
+    (tmp_path / "bases.yaml").write_text(
+        "bases:\n  ut:\n    label: t\n    url: http://x/odata/standard.odata/\n"
+        "    user: u\n    role: dev\n    gate:\n      names_for: [Catalog_Контрагенты]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(tmp_path)
+    assert ошибка.value.code == "config_invalid"
+    assert "policy.yaml" in str(ошибка.value)
+    assert "names_for" in str(ошибка.value)
+
+
+def test_gate_scan_free_text_в_bases_отклоняется_с_подсказкой(tmp_path):
+    (tmp_path / "daemon.yaml").write_text("port: 7171\ngate_secret: 'AAAA'\n", encoding="utf-8")
+    (tmp_path / "bases.yaml").write_text(
+        "bases:\n  ut:\n    label: t\n    url: http://x/odata/standard.odata/\n"
+        "    user: u\n    role: dev\n    gate:\n      scan_free_text: false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(tmp_path)
+    assert ошибка.value.code == "config_invalid"
+    assert "policy.yaml" in str(ошибка.value)
+    assert "scan_free_text" in str(ошибка.value)

@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from odata1c.config.models import BaseConfig
-from odata1c.gate.service import classifier_for, policy_path, refresh_policy
+from odata1c.gate.service import classifier_for, owner_names_for, policy_path, refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
@@ -89,15 +89,32 @@ def test_ручные_разделы_не_затираются(дом_с_инд�
 
 
 def test_список_названий_базы_учитывается(дом_с_индексом):
-    настроенная = база(gate={"mode": "identifiers+names", "names_for": ["Catalog_БанковскиеСчета"]})
-    refresh_policy(дом_с_индексом, настроенная)
-    данные = yaml.safe_load(policy_path(дом_с_индексом, "ut").read_text(encoding="utf-8"))
+    """Список `names_for` — ручной раздел `policy.yaml` (ADR-0015), не поле `bases.yaml`:
+    `refresh_policy` подставляет его классификатору, не трогая сам раздел при перезаписи auto."""
+    путь = policy_path(дом_с_индексом, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nnames_for: [Catalog_БанковскиеСчета]\n", encoding="utf-8")
+
+    refresh_policy(дом_с_индексом, база())
+    данные = yaml.safe_load(путь.read_text(encoding="utf-8"))
 
     assert данные["auto"]["Catalog_БанковскиеСчета.Description"] == "org"
     assert "Catalog_Контрагенты.Description" not in данные["auto"]
 
 
-def test_классификатор_совместим_с_реиндексом():
-    классификатор = classifier_for(база())
+def test_классификатор_совместим_с_реиндексом(tmp_path):
+    классификатор = classifier_for(tmp_path, база())
     assert классификатор("Catalog_Контрагенты", "ИНН", "Edm.String") == ("inn", "auto")
     assert классификатор("Catalog_Контрагенты", "Code", "Edm.String") is None
+
+
+def test_owner_names_for_без_файла_политики_возвращает_none(tmp_path):
+    assert owner_names_for(tmp_path, "ut") is None
+
+
+def test_owner_names_for_читает_список_из_policy_yaml(tmp_path):
+    путь = policy_path(tmp_path, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nnames_for: [Catalog_Контрагенты]\n", encoding="utf-8")
+
+    assert owner_names_for(tmp_path, "ut") == {"Catalog_Контрагенты"}

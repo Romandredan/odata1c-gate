@@ -68,11 +68,10 @@ def ensure_templates(home: pathlib.Path) -> None:
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
     #   commit_limit: 20             # коммитов за 10 минут на сессию; 0 = без лимита
 
-    # --- гейт (умолчание роли {role}) ---
+    # --- гейт: скрывать ли (умолчание роли {role}) ---
     # gate:
     #   mode: identifiers+names      # off | identifiers | identifiers+names
-    #   names_for: [...]             # сущности, чьи Description и поля ФИО заменяются
-    #   scan_free_text: true         # искать реквизиты и известные названия в любых строках ответа
+    #                                # что именно скрывать и что открыть: bases/{name}/policy.yaml
 
     # --- рецепты ---
     # recipes: bases/{name}/recipes.yaml   # путь относительно домашнего каталога

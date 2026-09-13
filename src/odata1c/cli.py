@@ -286,7 +286,9 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
     # (тот же приём, что в cmd_base_test._проверить_соединение).
     client = Client1C(base)
     try:
-        результат = await reindex(base, client, home, force=force, classifier=classifier_for(base))
+        результат = await reindex(
+            base, client, home, force=force, classifier=classifier_for(home, base)
+        )
     finally:
         await client.close()
 

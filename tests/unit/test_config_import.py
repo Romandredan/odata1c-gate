@@ -105,14 +105,16 @@ def test_запись_добавляется_с_комментариями(tmp_p
     assert "# --- соединение" in текст
     assert "# concurrency:" in текст
     # Регресс: заготовка была беднее шаблона SPEC §3.1 — не хватало блока про рецепты,
-    # списка разрешённых сущностей и лимита операций в правах, списка сущностей для замены
-    # названий и признака поиска в свободном тексте в настройках гейта.
+    # списка разрешённых сущностей и лимита операций в правах, настроек гейта.
     assert "# --- рецепты ---" in текст
     assert "recipes: bases/ut/recipes.yaml" in текст
     assert "#   allow_entities:" in текст
     assert "#   commit_limit:" in текст
-    assert "#   names_for:" in текст
-    assert "#   scan_free_text:" in текст
+    assert "#   mode: identifiers+names" in текст
+    # ADR-0015: names_for и scan_free_text больше не в bases.yaml — только в policy.yaml базы.
+    assert "names_for" not in текст
+    assert "scan_free_text" not in текст
+    assert "bases/ut/policy.yaml" in текст
 
 
 def test_пароль_со_спецсимволами_переживает_запись_и_чтение(tmp_path):

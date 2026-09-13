@@ -6,7 +6,7 @@ import pathlib
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ИМЯ_БАЗЫ = re.compile(r"^[a-z0-9_]{1,32}$")
 ОКОНЧАНИЕ_URL = "/odata/standard.odata/"
@@ -29,11 +29,24 @@ class Permissions(BaseModel):
 
 
 class GateSettings(BaseModel):
+    """Гейт в записи базы: только уровень (SPEC §3.1, ADR-0015). Что именно скрывать и что
+    открыть — `bases/<база>/policy.yaml`; ключи `names_for` и `scan_free_text` переехали туда."""
+
     model_config = ConfigDict(extra="forbid")
 
     mode: GateMode = "identifiers+names"
-    names_for: list[str] | None = None
-    scan_free_text: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _переехавшие_ключи(cls, данные):
+        if isinstance(данные, dict):
+            лишние = [к for к in ("names_for", "scan_free_text") if к in данные]
+            if лишние:
+                raise ValueError(
+                    f"gate.{лишние[0]} больше не задаётся в bases.yaml — перенесите в "
+                    "bases/<база>/policy.yaml (раздел с тем же именем, SPEC §6.9)"
+                )
+        return данные
 
 
 class BaseConfig(BaseModel):

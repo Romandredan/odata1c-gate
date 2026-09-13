@@ -14,7 +14,7 @@ from odata1c.config.home import base_dir
 from odata1c.config.models import BaseConfig
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.field_rules import classify_field
-from odata1c.gate.policy import generate_policy, merge_auto
+from odata1c.gate.policy import generate_policy, load_policy, merge_auto
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
 
@@ -33,9 +33,16 @@ def open_dictionary(home: pathlib.Path, secret: str) -> Dictionary:
     return Dictionary(gate_db_path(home), base64.b64decode(secret))
 
 
-def classifier_for(base: BaseConfig):
+def owner_names_for(home: pathlib.Path, base_name: str) -> set[str] | None:
+    """Список `names_for` из файла владельца; нет файла или раздела — `None` (встроенный список,
+    `field_rules.DEFAULT_NAMES_FOR`, ADR-0015: список — ручной раздел `bases/<база>/policy.yaml`,
+    не поле `bases.yaml`)."""
+    return load_policy(policy_path(home, base_name)).names_for()
+
+
+def classifier_for(home: pathlib.Path, base: BaseConfig):
     """Функция-классификатор для reindex: подставляет список названий этой базы (SPEC §6.5)."""
-    список = set(base.gate.names_for) if base.gate.names_for else None
+    список = owner_names_for(home, base.name)
 
     def классификатор(entity: str, field: str, edm_type: str):
         return classify_field(entity, field, edm_type, names_for=список)
@@ -63,7 +70,7 @@ def refresh_policy(home: pathlib.Path, base: BaseConfig) -> list[dict]:
 
     хранилище = IndexRepository(index_path(home, base.name))
     try:
-        список = set(base.gate.names_for) if base.gate.names_for else None
+        список = owner_names_for(home, base.name)
         собранное = generate_policy(хранилище, names_for=список)
     finally:
         хранилище.close()
