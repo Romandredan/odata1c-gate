@@ -2452,6 +2452,40 @@ def test_индекс_отдаёт_изменяющие_действия_баз�
     assert not {"balance", "turnovers", "slicelast"} & изменяющие
 
 
+@pytest.mark.parametrize(
+    "параметр", ["$apply", "$search", "$compute", "Параметр", "$format2", "Period"]
+)
+async def test_raw_get_принимает_только_известные_параметры(сервис, любой_get, параметр):
+    """Н6-1 ревью Н-5/Н-6: неизвестный параметр строки запроса не уходит в 1С дословно — мимо
+    `inbound_filter` он был бы каналом отбора, как только платформа начнёт его исполнять. Имя
+    параметра — ввод модели, в текст отказа оно не попадает (Ruling 53)."""
+    маршрут = любой_get({"value": []})
+
+    текст = await сервис.raw_get(
+        SessionScope(), base="ut", path="Catalog_Контрагенты", query={параметр: "x eq 1"}
+    )
+
+    ошибка = json.loads(текст)["error"]
+    assert ошибка["code"] == "params_invalid"
+    assert параметр not in ошибка["message"]
+    assert маршрут.call_count == 0
+
+
+async def test_raw_get_пропускает_allowedonly_и_системные(сервис, любой_get):
+    """Обратная сторона белого списка: `allowedOnly` и системные параметры доходят до 1С."""
+    маршрут = любой_get({"value": []})
+
+    текст = await сервис.raw_get(
+        SessionScope(),
+        base="ut",
+        path="Catalog_Контрагенты",
+        query={"allowedOnly": "true", "$top": 1, "$select": "Ref_Key"},
+    )
+
+    assert "error" not in json.loads(текст)
+    assert маршрут.call_count == 1
+
+
 async def test_raw_get_виртуальные_таблицы_не_считаются_действием(сервис, любой_get):
     """Обратная сторона: `Balance`, `Turnovers`, `SliceLast` в `$metadata` — тоже действия
     (FunctionImport), но только читают (`side_effecting = 0`) — их запрет не касается."""
