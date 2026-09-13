@@ -491,7 +491,7 @@ async def test_журнал_started_записан_до_запроса(сред�
     assert строка_в_момент_запроса.status == "started"
     assert строка_в_момент_запроса.before["ИНН"] == ИНН
     отказ = ошибка(текст)
-    assert "неизвест" in отказ["message"]
+    assert отказ["code"] == "commit_outcome_unknown" and "неизвест" in отказ["message"]
     assert среда.журнал(операция.commit_id).status == "unknown"
     assert await выполнить(среда, подготовка["pending_id"]) == текст
     assert одинс.patch.call_count == 1
@@ -569,9 +569,37 @@ async def test_отмена_посреди_запроса_операция_бо�
     среда.стор._clock.сейчас += 300  # за исходным сроком, внутри продлённого
     assert операция.result in прошли_стража
     повтор = ошибка(await выполнить(среда, подготовка["pending_id"]))
-    assert повтор["code"] == "internal" and операция.commit_id in повтор["message"]
+    assert повтор["code"] == "commit_outcome_unknown"
+    assert операция.commit_id in повтор["message"] and "неизвест" in повтор["message"]
     assert len(вызовов) == 1
     assert среда.журнал(операция.commit_id).status == "started"
+
+
+async def test_И4_отмена_без_страховки_тот_же_код_неизвестного_исхода(среда, одинс, monkeypatch):
+    """И-4 итогового ревью M2: запасной ответ `finally` в `commit` (страховка не собралась —
+    упал страж) — тот же код неизвестного исхода, что у таймаута и отмены, а не `internal` с
+    нефиксированным текстом (SPEC §5.2: у `internal` сообщение фиксированное)."""
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
+    подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
+    клиент = среда.tools._client_for(среда.tools._config.bases["ut"])
+    в_пути = asyncio.Event()
+
+    async def зависает(path, json, *, scrub=None):
+        в_пути.set()
+        await asyncio.Event().wait()
+
+    клиент.patch = зависает
+    monkeypatch.setattr("odata1c.write.service._через_стража", lambda *_a, **_k: None)
+    задача = asyncio.create_task(выполнить(среда, подготовка["pending_id"]))
+    await в_пути.wait()
+    задача.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await задача
+
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+    повтор = ошибка(await выполнить(среда, подготовка["pending_id"]))
+    assert повтор["code"] == "commit_outcome_unknown"
+    assert операция.commit_id in повтор["message"] and "не повтор" in повтор["hint"]
 
 
 async def test_замок_не_держит_commit_другой_операции_во_время_подтверждения(среда, одинс):
@@ -1031,7 +1059,8 @@ async def test_таймаут_записи_исход_неизвестен_по�
     текст = await выполнить(среда, подготовка["pending_id"])
 
     отказ = ошибка(текст)
-    assert отказ["code"] == "timeout" and "неизвест" in отказ["message"]
+    assert отказ["code"] == "commit_outcome_unknown" and "неизвест" in отказ["message"]
+    assert "таймаут" in отказ["message"]
     операция = await среда.стор.take(подготовка["pending_id"], "s1")
     assert среда.журнал(операция.commit_id).status == "unknown"
     assert await выполнить(среда, подготовка["pending_id"]) == текст
@@ -1266,6 +1295,7 @@ async def test_Т7_1_ответ_записи_не_JSON_исход_неизвес
     текст = await выполнить(среда, подготовка["pending_id"])
 
     отказ = ошибка(текст)
+    assert отказ["code"] == "commit_outcome_unknown"
     assert "неизвест" in отказ["message"] and "не повтор" in отказ["hint"]
     assert "odata1c_get" in отказ["hint"]
     нет_реальных_значений(текст)
@@ -1364,7 +1394,8 @@ async def test_Т7_4_ответ_посредника_по_таймауту_ис�
 
     отказ = ошибка(await выполнить(среда, подготовка["pending_id"]))
 
-    assert "неизвест" in отказ["message"]
+    assert отказ["code"] == "commit_outcome_unknown" and "неизвест" in отказ["message"]
+    assert f"HTTP {статус}" in отказ["message"]
     операция = await среда.стор.take(подготовка["pending_id"], "s1")
     assert среда.журнал(операция.commit_id).status == "unknown"
 
@@ -1391,7 +1422,7 @@ async def test_Т7_5_неизвестный_исход_create_ведёт_к_по
 
     отказ = ошибка(await выполнить(среда, подготовка["pending_id"]))
 
-    assert "неизвест" in отказ["message"]
+    assert отказ["code"] == "commit_outcome_unknown" and "неизвест" in отказ["message"]
     assert "odata1c_query" in отказ["hint"] and "Description" in отказ["hint"]
     assert "odata1c_get" not in отказ["hint"]
 
@@ -1533,7 +1564,8 @@ async def test_Н2_1_сбой_сборки_ответа_после_записи_
 async def test_Н2_1_сбой_до_сборки_страховки_не_выдаёт_исход_неизвестен(среда, одинс, monkeypatch):
     """Сбой после ответа 1С успехом, но раньше, чем собрана страховка «запись выполнена» (здесь —
     неожиданное исключение журнала): страховка «исход неизвестен», собранная до запроса, уже
-    неверна и не отдаётся. Ответ — отказ без данных «запись выполнена, ответ не собран»."""
+    неверна и не отдаётся. Ответ — успешный конверт без данных (И-4 итогового ревью M2): запись
+    выполнена, и код ошибки толкал бы модель готовить её заново — у `create` это дубль."""
     одинс.положить(ПУТЬ_КОНТРАГЕНТА, контрагент())
     подготовка = await изменить(среда, {"ИНН": токен(среда.tools, НОВЫЙ_ИНН)})
     операция = await среда.стор.take(подготовка["pending_id"], "s1")
@@ -1543,11 +1575,15 @@ async def test_Н2_1_сбой_до_сборки_страховки_не_выда
 
     monkeypatch.setattr(Journal, "close_commit", сломан)
 
-    отказ = ошибка(await выполнить(среда, подготовка["pending_id"]))
+    текст = await выполнить(среда, подготовка["pending_id"])
 
-    assert "выполнена" in отказ["message"] and "неизвест" not in отказ["message"]
-    assert операция.commit_id in отказ["message"]
+    ответ = json.loads(текст)
+    assert "error" not in ответ, текст
+    assert ответ["commit_id"] == операция.commit_id and ответ["result"] is None
+    assert any("выполнена" in п and "не собран" in п for п in ответ["warnings"])
+    assert "неизвест" not in текст
     assert операция.status == "committed" and одинс.patch.call_count == 1
+    assert await выполнить(среда, подготовка["pending_id"]) == текст
 
 
 @pytest.mark.parametrize(
