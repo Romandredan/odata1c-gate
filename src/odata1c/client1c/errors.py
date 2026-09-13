@@ -6,11 +6,31 @@ import json
 
 
 class OdataError(Exception):
-    def __init__(self, code: str, message: str, hint: str = "") -> None:
+    """Ошибка обращения к 1С. `status` — HTTP-статус ответа 1С, `platform_code` — код
+    `odata.error.code` платформы; оба есть только у ошибки, которую вернула сама 1С (`map_error`),
+    у сетевой ошибки и таймаута клиента — `None`/пустая строка.
+
+    Зачем они отдельно от текста (Ruling 52, задача 7 плана M2): на записи при гейте
+    `identifiers+names` текст ошибки 1С модели не отдаётся вовсе — 1С называет в нём объекты и
+    пользователей, а новое название детекторы не узнают. Модель получает только статус, код
+    платформы и категорию, и их нельзя доставать разбором уже замаскированного текста. Отсутствие
+    статуса значит ещё и другое: 1С не ответила, и исход записи неизвестен."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        hint: str = "",
+        *,
+        status: int | None = None,
+        platform_code: str = "",
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
+        self.status = status
+        self.platform_code = platform_code
 
 
 # Код `odata.error.code`, которым платформа отвечает на объект по ключу, которого нет (живая
@@ -28,6 +48,13 @@ class OdataError(Exception):
 
 
 def map_error(status: int, body: str) -> OdataError:
+    ошибка = _map_error(status, body)
+    ошибка.status = status
+    ошибка.platform_code = _ошибка_платформы(body)[0]
+    return ошибка
+
+
+def _map_error(status: int, body: str) -> OdataError:
     код_платформы, текст_платформы = _ошибка_платформы(body)
     текст = текст_платформы or body.strip()[:500]
     if status in (401, 403):

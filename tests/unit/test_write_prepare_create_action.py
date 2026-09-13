@@ -10,6 +10,7 @@
 маршрутам, а не общим счётчиком роутера: перехват базового адреса держит завершение сеанса 1С.
 """
 
+import functools
 import json
 import pathlib
 
@@ -135,10 +136,10 @@ def дом(tmp_path, edmx_ut_real):
 async def среда(дом, tmp_path):
     tools = ToolService(load_config(дом))
     стор = PendingStore(600, clock=Часы(1000.0))
-    журнал = Journal(tmp_path / "journal.sqlite")
+    # Журнал — фабрикой: `commit` открывает его на вызов (задача 7); подготовка его не зовёт.
+    журнал = functools.partial(Journal, tmp_path / "journal.sqlite")
     запись = WriteService(tools, стор, журнал, CommitLimiter(), clock=Часы(1_757_000_000.0))
     yield запись, стор, tools
-    журнал.close()
     await tools.aclose()
 
 

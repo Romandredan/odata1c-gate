@@ -150,6 +150,23 @@ def test_close_commit_status_failed_с_ошибкой(open_journal):
     assert запись.after is None
 
 
+def test_close_commit_дописывает_ключ_create_которого_не_было_до_запроса(open_journal):
+    """Задача 7: у `create` ключ выдаёт 1С в ответе POST, а строка «до» пишется раньше запроса —
+    с `key_json` NULL. `close_commit(key=…)` дописывает его; без `key` прежний ключ не трогается."""
+    журнал = open_journal()
+    создание = операция(commit_id="c1", op="create")
+    создание.key = None
+    журнал.open_commit(создание, client="trust", before=None)
+    assert журнал.get("c1").key is None
+
+    журнал.close_commit("c1", after={"Ref_Key": "r"}, status="committed", key={"Ref_Key": "r"})
+    журнал.open_commit(операция(commit_id="c2"), client="trust", before=None)
+    журнал.close_commit("c2", after=None, status="committed")
+
+    assert журнал.get("c1").key == {"Ref_Key": "r"}
+    assert журнал.get("c2").key == {"Ref_Key": "11111111-1111-1111-1111-111111111111"}
+
+
 # --- mark_undone -----------------------------------------------------------------------------
 
 

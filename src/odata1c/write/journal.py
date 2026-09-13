@@ -278,9 +278,20 @@ class Journal:
             ) from ошибка
 
     def close_commit(
-        self, commit_id: str, *, after: dict | None, status: str, error: str | None = None
+        self,
+        commit_id: str,
+        *,
+        after: dict | None,
+        status: str,
+        error: str | None = None,
+        key: dict | None = None,
     ) -> None:
         """Запись «после» — запрос к 1С уже выполнен, отказ здесь его не отменяет.
+
+        `key` — ключ объекта, которого не было при `open_commit` (задача 7 плана M2): у `create`
+        ключ выдаёт 1С в ответе POST, а строка «до» пишется раньше запроса, с `key_json` NULL.
+        Без ключа в журнале откат `create` (пометка удаления, SPEC §7.6) не знал бы, какой объект
+        помечать. `None` — ключ не меняется: у прочих операций он записан уже в `open_commit`.
 
         В отличие от `open_commit`, отказ этой записи не должен блокировать ответ пользователю —
         решение, что делать с успешно выполненным, но не записанным в журнал `commit`
@@ -291,13 +302,14 @@ class Journal:
         try:
             with self._connection:
                 курсор = self._connection.execute(
-                    "UPDATE commits SET after_json = ?, status = ?, error = ?, committed_at = ?"
-                    " WHERE commit_id = ?",
+                    "UPDATE commits SET after_json = ?, status = ?, error = ?, committed_at = ?,"
+                    " key_json = COALESCE(?, key_json) WHERE commit_id = ?",
                     (
                         _dump(after),
                         status,
                         error,
                         self._clock().isoformat(timespec="microseconds"),
+                        _dump(key),
                         commit_id,
                     ),
                 )

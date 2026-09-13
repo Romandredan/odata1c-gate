@@ -19,8 +19,12 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from odata1c.write.errors import WriteError
+
+if TYPE_CHECKING:
+    from odata1c.gate.revealed import RevealedValues
 
 
 @dataclass
@@ -69,6 +73,12 @@ class PendingOp:
     undo_of: str | None = None
     status: str = "pending"
     result: str | None = None
+    # Написания, раскрытые гейтом при подготовке (`RevealedValues.carry`, задача 7): тело и ключ
+    # раскрыты в одном вызове тула, а в 1С уходят на `commit` — другом, со своим набором. Ранний
+    # проход `commit` берёт их отсюда, иначе эхо раскрытого значения в ошибке 1С и ответ записи
+    # шли бы мимо него. Внутри — свёрнутые написания реальных значений, поэтому скрыто так же,
+    # как `request`.
+    revealed: RevealedValues | None = field(default=None, repr=False, compare=False)
 
 
 def _pending_unknown() -> WriteError:

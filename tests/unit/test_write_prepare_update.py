@@ -10,6 +10,7 @@
 
 import contextlib
 import dataclasses
+import functools
 import json
 import re
 import urllib.parse
@@ -146,10 +147,10 @@ async def среда(дом, tmp_path):
     tools = ToolService(load_config(дом))
     часы_стора = Часы(1000.0)
     стор = PendingStore(600, clock=часы_стора)
-    журнал = Journal(tmp_path / "journal.sqlite")
+    # Журнал — фабрикой: `commit` открывает его на вызов (задача 7); подготовка его не зовёт.
+    журнал = functools.partial(Journal, tmp_path / "journal.sqlite")
     запись = WriteService(tools, стор, журнал, CommitLimiter(), clock=Часы(1_757_000_000.0))
     yield запись, стор, tools, часы_стора
-    журнал.close()
     await tools.aclose()
 
 
@@ -624,11 +625,12 @@ async def test_дата_токеном_проверяется_после_рас�
     assert len(стор._ops) == 1
 
 
-async def test_независимый_регистр_путь_по_составному_ключу_и_без_отпечатка(среда, одинс):
+async def test_независимый_регистр_путь_по_составному_ключу_и_отпечаток_полей(среда, одинс):
     """Запись независимого регистра сведений `check_write` пропускает при одном `write: true`.
     Для `commit` (задача 7) здесь две особенности, которые лучше видеть явно: PATCH пойдёт по
-    пути составного ключа, а отпечатка `DataVersion` у записи регистра нет вовсе — защиты от
-    чужой записи между превью и `commit` на нём не построить."""
+    пути составного ключа, а `DataVersion` у записи регистра нет вовсе — отпечаток для `commit`
+    строится хэшем полей записи (Ruling 55), поэтому запись читается всеми полями, а не только
+    полями тела: тот же набор `commit` перечитает и сравнит."""
     запись, стор, _, _ = среда
     курсы = "InformationRegister_КурсыВалют"
     ключ = {"Period": "2026-01-01T00:00:00", "Валюта_Key": ССЫЛКА}
@@ -648,14 +650,14 @@ async def test_независимый_регистр_путь_по_состав�
         "path": f"{курсы}(Period=datetime'2026-01-01T00:00:00',Валюта_Key=guid'{ССЫЛКА}')",
         "json": {"Курс": 91.25},
     }
-    assert операция.data_version is None
+    assert операция.data_version.startswith("sha256:")
     assert операция.key == ключ
     assert ответ["preview"] == [{"field": "Курс", "before": 90.5, "after": 91.25}]
     # Ruling 44: запись регистра называется полями ключа — маской того же вызова, что «было».
     assert ответ["key"] == ключ
     assert ответ["object"] == ключ
     выбор = одинс.get.calls.last.request.url.params["$select"].split(",")
-    assert sorted(выбор) == sorted(["Курс", "Period", "Валюта_Key"])
+    assert sorted(выбор) == sorted(["Курс", "Кратность", "Period", "Валюта_Key"])
 
 
 async def test_проведённый_и_уже_помеченный_документ_изменений_нет(среда, одинс):
@@ -1446,9 +1448,9 @@ async def среда_синт(tmp_path, edmx_ut_real):
     home = _дом(tmp_path, текст.encode("utf-8"))
     tools = ToolService(load_config(home))
     стор = PendingStore(600, clock=Часы(1000.0))
-    журнал = Journal(tmp_path / "journal.sqlite")
+    # Журнал — фабрикой: `commit` открывает его на вызов (задача 7); подготовка его не зовёт.
+    журнал = functools.partial(Journal, tmp_path / "journal.sqlite")
     yield WriteService(tools, стор, журнал, CommitLimiter(), clock=Часы(1.0)), стор, tools
-    журнал.close()
     await tools.aclose()
 
 
@@ -1494,7 +1496,9 @@ async def test_строка_раннего_прохода_в_current_разво�
     операция = await стор.take(ответ["pending_id"], "s")
     assert операция.request["path"] == f"{РЕГИСТР_ИНН}(ИНН='{ИНН}')"
     assert операция.request["json"] == {"Комментарий": "проверка снята"}
-    assert операция.data_version is None
+    # Ruling 55: отпечаток записи регистра — хэш её полей (реальных значений, не строк раннего
+    # прохода; сверка с `commit` — test_write_commit.py).
+    assert операция.data_version.startswith("sha256:")
 
 
 # Ruling 48 (Н-1 повторного ревью): словарь пополняется только из тела ответа 1С с данными.
