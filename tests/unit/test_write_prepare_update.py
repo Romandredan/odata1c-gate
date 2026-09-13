@@ -2490,14 +2490,21 @@ async def test_Н6_параметр_условия_виртуальной_таб
     assert not одинс.get.called
 
 
-async def test_Н5_успешный_raw_get_не_повторяет_путь(среда, одинс):
-    """Путь в ответе — эхо ввода модели: цифры, известные словарю, страж превращал в токен."""
+@pytest.mark.parametrize(
+    "тело",
+    [{"value": []}, {"value": "любой текст"}, {"value": 5}, {"value": [{"Номер": "1"}]}],
+    ids=["пусто", "строка", "число", "записи"],
+)
+async def test_Н5_успешный_raw_get_не_повторяет_путь(среда, одинс, тело):
+    """Путь в ответе — эхо ввода модели: цифры, известные словарю, страж превращал в токен. Хвост
+    пути приходил ещё и ИМЕНЕМ поля скалярного ответа (`{"Поле<цифры>": …}`)."""
     _, _, tools, _ = среда
     т = _метка_в_словаре(tools)
-    одинс.get.mock(return_value=httpx.Response(200, json={"value": []}))
+    одинс.get.mock(return_value=httpx.Response(200, json=тело))
 
     for путь in (
         f"Catalog_Новый{ЦИФРЫ_ТЕЛЕФОНА}",
+        f"Catalog_Новый{ЦИФРЫ_ТЕЛЕФОНА}(guid'{ССЫЛКА}')",
         f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/{ИМЯ_С_МЕТКОЙ}",
     ):
         текст = await tools.raw_get(SessionScope(), base="ut", path=путь)
@@ -2506,6 +2513,37 @@ async def test_Н5_успешный_raw_get_не_повторяет_путь(с�
         assert "path" not in ответ and "entity" not in ответ, ответ
         _без_метки(ответ, т)
         assert "guard_replaced" not in текст
+
+
+async def test_Н5_хвост_вне_индекса_не_становится_именем_поля(среда, одинс):
+    """Имя из хвоста пути нужно маскировщику — без него ИНН скалярного ответа на поле вне индекса
+    уходил числом (форма (в) ревью 2026-09-11). В ответ оно не выходит: ни ключом, ни в
+    `masked_fields`."""
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": ИНН}))
+
+    ответ = json.loads(
+        await tools.raw_get(
+            SessionScope(), base="ut", path=f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/ИННКонтрагента"
+        )
+    )
+
+    assert set(ответ["item"]) == {"value"}, ответ
+    assert ТОКЕН_ИНН.match(ответ["item"]["value"]), ответ
+    assert ответ["masked_fields"] == ["value"], ответ
+    нет_реальных_значений(json.dumps(ответ, ensure_ascii=False))
+
+
+async def test_Н5_хвост_из_индекса_остаётся_именем_поля(среда, одинс):
+    _, _, tools, _ = среда
+    одинс.get.mock(return_value=httpx.Response(200, json={"value": ИНН}))
+
+    ответ = json.loads(
+        await tools.raw_get(SessionScope(), base="ut", path=f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')/ИНН")
+    )
+
+    assert set(ответ["item"]) == {"ИНН"} and ТОКЕН_ИНН.match(ответ["item"]["ИНН"]), ответ
+    assert ответ["masked_fields"] == ["ИНН"], ответ
 
 
 async def test_Н5_entity_остаётся_на_пути_из_индекса(среда, одинс):

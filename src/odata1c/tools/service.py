@@ -375,6 +375,25 @@ def _восстановить_имя_поля(записи: list, хвост: st
     ]
 
 
+def _спрятать_имя_поля(маска, хвост: str) -> tuple[list, list[str], list[str]]:
+    """Обратно к `{"value": …}` то, что `_восстановить_имя_поля` назвал хвостом пути, — после
+    маски. Имя маскировщику нужно (классификация по имени поля), но хвост, которого индекс не
+    знает, — ввод модели, и ключом ответа или строкой `masked_fields` он стал бы тем же
+    эхо-оракулом, что и `path` (Н-5 ревью Ruling 54): известные словарю цифры в нём страж
+    превращал в токен."""
+    данные = [
+        {"value": запись[хвост]}
+        if isinstance(запись, dict)
+        and set(запись) == {хвост}
+        and not isinstance(запись[хвост], dict | list)
+        else запись
+        for запись in маска.data
+    ]
+    скрытые = ["value" if поле == хвост else поле for поле in маска.masked_fields]
+    частичные = ["value" if поле == хвост else поле for поле in маска.partially_masked_fields]
+    return данные, скрытые, частичные
+
+
 def _целое_или_ноль(значение: str | None) -> int:
     try:
         return max(int(значение), 0)
@@ -1985,7 +2004,16 @@ class ToolService:
                 revealed=раскрытое,
                 strict=not цель.resolved,
             )
-            усечённые, _ = truncate_strings(маска.data, self._config.daemon.limits.string_chars)
+            данные, скрытые, частичные = (
+                маска.data,
+                маска.masked_fields,
+                маска.partially_masked_fields,
+            )
+            if цель.field is not None and not self._поле_в_индексе(
+                репозиторий, цель.entity, цель.field
+            ):
+                данные, скрытые, частичные = _спрятать_имя_поля(маска, цель.field)
+            усечённые, _ = truncate_strings(данные, self._config.daemon.limits.string_chars)
 
             # Предупреждение о неразрешённом по индексу приходит с двух сторон: от пути (здесь) и
             # от неразрешённого ключа вложенного объекта (маскировщик, C3 раунда 2). Текст у них
@@ -2004,8 +2032,8 @@ class ToolService:
                 "base": base_config.name,
                 "role": base_config.role,
                 "gate": гейт.mode,
-                "masked_fields": маска.masked_fields,
-                "partially_masked_fields": маска.partially_masked_fields,
+                "masked_fields": скрытые,
+                "partially_masked_fields": частичные,
                 "warnings": предупреждения,
             }
             if список:
@@ -2115,6 +2143,13 @@ class ToolService:
         )
 
     # -- разбор аргументов raw_get ----------------------------------------------------------
+
+    @staticmethod
+    def _поле_в_индексе(repo: IndexRepository, entity: str, field: str) -> bool:
+        """Знает ли индекс поле `field` у сущности `entity` — тогда имя из пути можно повторить
+        в ответе (Ruling 53: имя, которое индекс знает, повторяется)."""
+        описание = repo.describe(entity)
+        return описание is not None and any(поле["name"] == field for поле in описание.fields)
 
     def _цель_пути(self, repo: IndexRepository, gate: BaseGate, path: str) -> _ЦельПути:
         """Сущность, по классам полей которой маскируется ответ `raw_get`, признак «путь разрешён
