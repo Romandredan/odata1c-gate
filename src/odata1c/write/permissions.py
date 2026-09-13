@@ -24,6 +24,19 @@ SPEC §7.1 («`register_direct_write` закрывает POST/PATCH ко все�
 «всегда, независимо от флага» верен только для виртуальных таблиц (`is_virtual`: `Balance`,
 `Turnovers`, `SliceLast` и подобные — вычисляемые выборки, в них не пишется ничего и никогда) —
 это шаг 4 ниже.
+
+Ruling 57 (2026-09-13, находка раунда 3 задачи 6) сужает Ruling 39, а не отменяет его. Шаг 3
+узнавал регистр по `is_records`, а индекс ставит этот признак только наборам `…_RecordType`
+(`odata1c.index.edmx`, `это_набор_записей`): основной набор `AccumulationRegister_X` (ключ
+`Recorder`) проходил мимо `register_direct_write`, и `create` готовил `POST AccumulationRegister_X`
+в базе без флага. Теперь регистр определяется по виду сущности (`kind` из `РЕГИСТР_ВИДЫ` —
+основной набор, `…_RecordType`, наборы записей; виртуальные таблицы — шаг 4). И в первой
+поставке запись (`create`/`update`/`mark_for_deletion`) в регистр, подчинённый регистратору,
+отклоняется при любом флаге: POST набора с `Recorder` может переписать движения документа, проба
+P8 этого не проверяла, а запись регистров в первую поставку владелец не заказывал. Движения
+формирует проведение документа. Независимый регистр сведений — как прежде: одного `write: true`.
+Флаг `register_direct_write` в настройках остаётся — для поставки, которая такую запись откроет;
+`check_write` первой поставки его не читает.
 """
 
 from __future__ import annotations
@@ -32,6 +45,7 @@ from collections.abc import Callable, Iterable
 from typing import Literal
 
 from odata1c.config.models import BaseConfig
+from odata1c.index.edmx import РЕГИСТР_ВИДЫ
 from odata1c.index.repository import EntityDescription
 from odata1c.write.errors import WriteError
 
@@ -85,9 +99,27 @@ def check_write(
             hint=f"включите запись: bases.yaml, раздел «{base.name}» → write: true",
         )
 
-    # Шаг 3: флаг конкретной операции. Три условия ниже взаимоисключающие по `op`/атрибутам
-    # сущности (для данного вызова сработает не больше одного), порядок между ними поэтому не
-    # наблюдаем — записан в порядке брифа для читаемости.
+    # Шаг 3: регистр, подчинённый регистратору (Ruling 57), затем флаг конкретной операции.
+    # Регистр — первым: его отказ окончательный в этой поставке, и подсказка «включите
+    # mark_deletion» перед ним вела бы к флагу, который запись всё равно не откроет. Регистр
+    # узнаётся по виду сущности, а не по `is_records`: основной набор (`AccumulationRegister_X`,
+    # ключ `Recorder`) — такой же вход в набор записей, как `…_RecordType`. Виртуальная таблица
+    # имеет вид своего регистра, но отказывает ей шаг 4 своим текстом.
+    if (
+        op in ("create", "update", "mark_for_deletion")
+        and entity.kind in РЕГИСТР_ВИДЫ
+        and not entity.is_virtual
+        and not entity.is_independent_register
+    ):
+        raise WriteError(
+            "permission_denied",
+            f"запись в регистр «{entity.name}», подчинённый регистратору, не поддерживается — "
+            "при любом значении permissions.register_direct_write",
+            hint="запись наборов регистров, подчинённых регистратору, в первой поставке не "
+            "поддерживается — движения формирует проведение документа (odata1c_action Post)",
+        )
+    # Флаги операций ниже взаимоисключающие по `op` (для данного вызова сработает не больше
+    # одного), порядок между ними поэтому не наблюдаем — записан в порядке брифа.
     if op == "action" and action in ДЕЙСТВИЯ_ПРОВЕДЕНИЯ and not base.permissions.post_documents:
         raise _отказ_флага(
             base,
@@ -98,29 +130,12 @@ def check_write(
         raise _отказ_флага(
             base, "mark_deletion", "пометка удаления запрещена: permissions.mark_deletion выключен"
         )
-    if (
-        op in ("create", "update")
-        and entity.is_records
-        and not entity.is_independent_register
-        and not base.permissions.register_direct_write
-    ):
-        raise WriteError(
-            "permission_denied",
-            f"прямая запись в регистр «{entity.name}» запрещена: "
-            "permissions.register_direct_write выключен",
-            hint=(
-                "регистр меняется через документ-регистратор; прямую запись открывает "
-                f"permissions.register_direct_write: true в bases.yaml, раздел «{base.name}»"
-            ),
-        )
 
-    # Шаг 4: виртуальная таблица — отказ безусловный, флаг шага 3 её не касается вовсе
-    # (у виртуальной таблицы `is_records` всегда `False` — условие шага 3 по регистрам с ней не
-    # совпадёт). Только этот случай безусловный (Ruling 39): виртуальные таблицы (`Balance`,
-    # `Turnovers`, `SliceLast`, …) — вычисляемые выборки, у них нет собственных записей и писать
-    # в них нельзя ни при каком разрешении. Набор записей самого регистра (независимого или
-    # зависимого) сюда не попадает: он либо прошёл шаг 3 (флаг включён/регистр независимый), либо
-    # уже отказан там.
+    # Шаг 4: виртуальная таблица — отказ безусловный: виртуальные таблицы (`Balance`,
+    # `Turnovers`, `SliceLast`, …) — вычисляемые выборки, у них нет собственных записей и писать в
+    # них нельзя ни при каком разрешении. Шаг 3 их пропускает явно (`not entity.is_virtual`),
+    # хотя вид у них — вид регистра. Набор записей самого регистра сюда не попадает: зависимый
+    # отказан на шаге 3, независимый регистр сведений пишется.
     if entity.is_virtual:
         raise WriteError(
             "permission_denied",

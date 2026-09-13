@@ -1,12 +1,16 @@
 """Разрешения записи: строгий порядок проверок SPEC §7.1 (инвариант 4 — до pending-операции).
 
 Порядок (первый отказ побеждает): 1) сущность скрыта гейтом → `entity_hidden`; 2) база только для
-чтения → `base_read_only`; 3) флаг операции (`post_documents`/`mark_deletion`/
-`register_direct_write` — единственный рубеж для прямой записи в набор записей любого регистра,
-независимого или зависимого) → `permission_denied`; 4) виртуальная таблица — отказ всегда, флаг
-не спасает → `permission_denied` (Ruling 39: это единственный безусловный случай — регистр таким
-не является, его открывает флаг шага 3); 5) `deny_entities`/`allow_entities` → `permission_denied`;
-6) поле из `deny_fields` → `field_write_denied`.
+чтения → `base_read_only`; 3) регистр, подчинённый регистратору, и флаги операций
+(`post_documents`/`mark_deletion`) → `permission_denied`; 4) виртуальная таблица — отказ всегда →
+`permission_denied`; 5) `deny_entities`/`allow_entities` → `permission_denied`; 6) поле из
+`deny_fields` → `field_write_denied`.
+
+Ruling 57 (2026-09-13, находка раунда 3 задачи 6) сузил Ruling 39: регистр шаг 3 узнаёт по виду
+сущности (`kind`), а не по `is_records` — основной набор `AccumulationRegister_X` (ключ
+`Recorder`) проходил мимо флага. Запись в зависимый регистр в первой поставке отклоняется при
+любом `register_direct_write`; независимый регистр сведений по-прежнему пишется по одному
+`write: true`.
 """
 
 from __future__ import annotations
@@ -124,41 +128,71 @@ def test_независимый_регистр_сведений_на_create_пр
     проверить(b, e, "create")
 
 
-def test_накопления_с_флагом_включён_разрешено():
-    """Ruling 39: `register_direct_write` — единственный рубеж прямой записи в набор записей
-    регистра, включая накопление (у него нет понятия «независимый/зависимый» вовсе — регистратор
-    обязателен всегда, CONTEXT.md «Независимый регистр»). Включённый флаг разрешает запись, шаг 4
-    («отказ всегда») его не касается — он только про виртуальные таблицы."""
-    b = база(permissions=Permissions(register_direct_write=True))
-    e = сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister", is_records=True)
-    проверить(b, e, "update")
-
-
-def test_зависимый_регистр_сведений_с_флагом_включён_разрешён():
-    """Тот же рубеж — для регистра сведений с регистратором («зависимого» в терминах CONTEXT.md):
-    включённый `register_direct_write` разрешает прямую запись, несмотря на регистратор."""
-    b = база(permissions=Permissions(register_direct_write=True))
+def test_независимый_регистр_сведений_при_register_direct_write_true_разрешено():
+    """Ruling 57 не трогает независимый регистр сведений: и при включённом флаге он пишется."""
     e = сущность(
-        "InformationRegister_СтоимостьТоваров",
+        "InformationRegister_КурсыВалют",
         "InformationRegister",
-        is_records=True,
-        is_independent_register=False,
+        is_independent_register=True,
     )
-    проверить(b, e, "update")
+    for op in ("create", "update"):
+        проверить(база(permissions=Permissions(register_direct_write=True)), e, op)
 
 
-def test_зависимый_регистр_сведений_с_флагом_выключен_permission_denied():
-    b = база(permissions=Permissions(register_direct_write=False))
-    e = сущность(
-        "InformationRegister_СтоимостьТоваров",
-        "InformationRegister",
-        is_records=True,
-        is_independent_register=False,
+ЗАВИСИМЫЕ_РЕГИСТРЫ = [
+    # Основной набор (ключ `Recorder`): у него `is_records=False` — прежний шаг 3 его не видел.
+    pytest.param(
+        сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister"),
+        id="накопления-основной-набор",
+    ),
+    pytest.param(
+        сущность(
+            "AccumulationRegister_ТоварыНаСкладах_RecordType",
+            "AccumulationRegister",
+            is_records=True,
+        ),
+        id="накопления-RecordType",
+    ),
+    pytest.param(
+        сущность("InformationRegister_СтоимостьТоваров", "InformationRegister"),
+        id="сведений-с-регистратором-основной-набор",
+    ),
+    pytest.param(
+        сущность(
+            "InformationRegister_СтоимостьТоваров_RecordType",
+            "InformationRegister",
+            is_records=True,
+        ),
+        id="сведений-с-регистратором-RecordType",
+    ),
+    pytest.param(
+        сущность("AccountingRegister_Хозрасчетный", "AccountingRegister"),
+        id="бухгалтерии",
+    ),
+    pytest.param(
+        сущность("CalculationRegister_Начисления", "CalculationRegister"),
+        id="расчёта",
+    ),
+]
+
+
+@pytest.mark.parametrize("флаг", [False, True], ids=["без-флага", "с-флагом"])
+@pytest.mark.parametrize("op", ["create", "update", "mark_for_deletion"])
+@pytest.mark.parametrize("e", ЗАВИСИМЫЕ_РЕГИСТРЫ)
+def test_Ruling_57_зависимый_регистр_отклоняется_при_любом_флаге(e, op, флаг):
+    """Ruling 57: регистр узнаётся по виду сущности; запись в регистр, подчинённый регистратору,
+    в первой поставке не поддерживается ни при каком `register_direct_write` — движения
+    формирует проведение документа. POST набора с `Recorder` мог бы переписать движения документа,
+    а проба P8 этого не проверяла."""
+    b = база(
+        permissions=Permissions(register_direct_write=флаг, mark_deletion=True, post_documents=True)
     )
     with pytest.raises(WriteError) as инфо:
-        проверить(b, e, "update")
+        проверить(b, e, op)
     assert инфо.value.code == "permission_denied"
-    assert "register_direct_write" in инфо.value.hint
+    assert e.name in инфо.value.message
+    assert "подчинённых регистратору" in инфо.value.hint
+    assert "odata1c_action" in инфо.value.hint and "Post" in инфо.value.hint
 
 
 # --- каждый код отказа -----------------------------------------------------------------------
@@ -198,16 +232,18 @@ def test_запрет_пометки_удаления_mark_deletion():
     assert "mark_deletion" in инфо.value.hint
 
 
-def test_запрет_прямой_записи_в_регистр_register_direct_write():
+def test_запрет_записи_в_зависимый_регистр_permission_denied():
     b = база(permissions=Permissions(register_direct_write=False))
     e = сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister", is_records=True)
     with pytest.raises(WriteError) as инфо:
         проверить(b, e, "create")
     assert инфо.value.code == "permission_denied"
-    assert "register_direct_write" in инфо.value.hint
+    assert "odata1c_action" in инфо.value.hint
 
 
 def test_виртуальная_таблица_отказ_всегда():
+    """Вид виртуальной таблицы — вид её регистра (`kind == "AccumulationRegister"`), но
+    отказывает ей шаг 4 своим текстом, а не правило зависимого регистра шага 3 (Ruling 57)."""
     b = база(permissions=Permissions(register_direct_write=True))
     e = сущность(
         "AccumulationRegister_ТоварыНаСкладах_Balance",
@@ -217,6 +253,8 @@ def test_виртуальная_таблица_отказ_всегда():
     with pytest.raises(WriteError) as инфо:
         проверить(b, e, "update")
     assert инфо.value.code == "permission_denied"
+    assert "виртуальная таблица" in инфо.value.message
+    assert "регистратору" not in инфо.value.hint
 
 
 def test_deny_entities_permission_denied():
@@ -286,7 +324,7 @@ def test_порядок_скрытая_и_в_deny_entities_побеждает_en
             "create",
             (),
             None,
-            id="шаг3-register_direct_write",
+            id="шаг3-зависимый-регистр",
         ),
         pytest.param(
             база(),
