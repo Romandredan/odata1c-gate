@@ -2136,3 +2136,135 @@ async def test_имя_поля_из_индекса_в_отказе_отбора_
     отказ = await _отказ_чтения(tools, КОНТРАГЕНТЫ, filter="ИНН gt 'x'")
 
     assert отказ["code"] == "filter_syntax" and "«ИНН»" in отказ["message"]
+
+
+# Ruling 54 (Н-4 ревью раунда 4): ни один отказ шлюза не повторяет ввод модели, в том числе токены.
+# Токен в тексте отказа проходил слой цифр стража: хвост из цифр, известных словарю, становился
+# токеном телефона, а неизвестные цифры возвращались как есть — разница подтверждала членство.
+# Отказ называет порядковый номер токена и поле, если индекс его знает.
+
+ХВОСТ_ИЗВЕСТНЫЙ = ЦИФРЫ_ТЕЛЕФОНА
+ХВОСТ_НЕИЗВЕСТНЫЙ = "99999999999"
+
+
+def _без_хвоста(текст: str, т: str) -> None:
+    """Ни хвоста, ни токена метки, ни токена телефона, ни `guard_replaced` — ответ не зависит от
+    того, известны ли словарю цифры хвоста."""
+    данные = json.loads(текст)
+    assert ХВОСТ_ИЗВЕСТНЫЙ not in текст and ХВОСТ_НЕИЗВЕСТНЫЙ not in текст, текст
+    assert т not in текст and "[[phone:" not in текст, текст
+    assert not any("guard_replaced" in п for п in данные.get("warnings", [])), текст
+
+
+async def _пара(вызов) -> tuple[str, str]:
+    """Один и тот же вызов с хвостом из известных словарю цифр и из неизвестных."""
+    return await вызов(ХВОСТ_ИЗВЕСТНЫЙ), await вызов(ХВОСТ_НЕИЗВЕСТНЫЙ)
+
+
+СЛУЧАИ_ТОКЕНА = [
+    pytest.param(
+        lambda tools, _: (
+            lambda хвост: tools.query(
+                SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, filter=f"ИНН eq '[[inn:{хвост}]]'"
+            )
+        ),
+        "token_unknown",
+        id="неизвестный-в-отборе",
+    ),
+    pytest.param(
+        lambda tools, _: (
+            lambda хвост: tools.query(
+                SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, filter=f"ИНН eq '[[phone:{хвост}]]'"
+            )
+        ),
+        "token_type_mismatch",
+        id="чужой-класс-в-отборе",
+    ),
+    pytest.param(
+        lambda tools, _: (
+            lambda хвост: tools.query(
+                SessionScope(), base="ut", entity=КОНТРАГЕНТЫ, filter=f"ИНН eq '[[a{хвост}:AB]]'"
+            )
+        ),
+        "token_type_mismatch",
+        id="цифры-в-классе",
+    ),
+    pytest.param(
+        lambda tools, _: (
+            lambda хвост: tools.get(
+                SessionScope(),
+                base="ut",
+                entity=КУРСЫ,
+                key={"Period": "2026-01-01T00:00:00", "Валюта_Key": f"[[inn:{хвост}]]"},
+            )
+        ),
+        "token_type_mismatch",
+        id="ключ",
+    ),
+    pytest.param(
+        lambda _, запись: (
+            lambda хвост: запись.update(
+                SessionScope(),
+                "s",
+                base="ut",
+                entity=КОНТРАГЕНТЫ,
+                key=ССЫЛКА,
+                data={"ИНН": f"[[inn:{хвост}]]"},
+            )
+        ),
+        "token_unknown",
+        id="тело-записи",
+    ),
+]
+
+
+@pytest.mark.parametrize(("вызов", "код"), СЛУЧАИ_ТОКЕНА)
+async def test_отказ_по_токену_не_зависит_от_цифр_хвоста(среда, одинс, вызов, код):
+    запись, _, tools, _ = среда
+    т = _метка_в_словаре(tools)
+    одинс.объект(контрагент())
+
+    известный, неизвестный = await _пара(вызов(tools, запись))
+
+    assert ошибка(известный)["code"] == код, известный
+    assert известный.replace(ХВОСТ_ИЗВЕСТНЫЙ, "") == неизвестный.replace(ХВОСТ_НЕИЗВЕСТНЫЙ, "")
+    assert известный == неизвестный
+    _без_хвоста(известный, т)
+    assert not одинс.писали
+
+
+async def test_неизвестный_токен_назван_порядковым_номером_и_полем(среда, одинс):
+    """Несколько токенов в отборе: отказ называет, какой по счёту неизвестен, и поле из индекса."""
+    _, _, tools, _ = среда
+    инн = токен(tools, ИНН)
+
+    отказ = ошибка(
+        await tools.query(
+            SessionScope(),
+            base="ut",
+            entity=КОНТРАГЕНТЫ,
+            filter=f"ИНН eq '{инн}' or ИНН eq '[[inn:{ХВОСТ_НЕИЗВЕСТНЫЙ}]]'",
+        )
+    )
+
+    assert отказ["code"] == "token_unknown"
+    assert "второй токен в отборе" in отказ["message"] and "«ИНН»" in отказ["message"]
+    assert инн not in json.dumps(отказ, ensure_ascii=False)
+    assert not одинс.обращались
+
+
+async def test_token_ambiguous_не_повторяет_токен(среда, одинс):
+    запись, _, tools, _ = среда
+    ток = токен(tools, ИНН)
+    assert токен(tools, ИНН_С_ПРОБЕЛОМ) == ток
+    одинс.объект(контрагент(ИНН=ЧУЖОЙ_ИНН))
+
+    отказ = ошибка(
+        await запись.update(
+            SessionScope(), "s", base="ut", entity=КОНТРАГЕНТЫ, key=ССЫЛКА, data={"ИНН": ток}
+        )
+    )
+
+    assert отказ["code"] == "token_ambiguous"
+    assert ток not in отказ["message"] and "[[" not in отказ["message"]
+    assert "первый токен в теле записи" in отказ["message"] and "«ИНН»" in отказ["message"]
