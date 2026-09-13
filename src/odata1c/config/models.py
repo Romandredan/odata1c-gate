@@ -94,6 +94,10 @@ class DaemonConfig(BaseModel):
     limits: Limits = Field(default_factory=Limits)
     write_confirm_fallback: Literal["deny", "trust_client"] = "deny"
     reindex_check_hours: int = 24
+    # Имена образов Claude Code — предков лаунчера, при которых имя клиента `claude-code`
+    # заверяется (Ruling 61). Дополняет встроенный перечень `launch_parent.ИМЕНА_CLAUDE_CODE`;
+    # читается лаунчером при старте. Пусто — только встроенный перечень.
+    claude_code_parents: list[str] = Field(default_factory=list)
 
 
 class AppConfig(BaseModel):

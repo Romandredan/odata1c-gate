@@ -64,7 +64,13 @@ def test_А3_механизм_закреплён_первым_вызовом_с�
     приходит в каждом запросе) — даже с подписью."""
     механизмы = SessionMechanisms("deny")
     elic = д.ClientIdentity(name="иной", version="1.0.0", elicitation=True)
-    cc = д.ClientIdentity(name="claude-code", version="2.1.267", elicitation=False, verified=True)
+    cc = д.ClientIdentity(
+        name="claude-code",
+        version="2.1.267",
+        elicitation=False,
+        verified=True,
+        parent_is_claude_code=True,
+    )
     assert механизмы.choose("s1", elic) == "elicitation"
     assert механизмы.choose("s1", cc) == "elicitation"  # не сменился
     # Обратный порядок — своя сессия: механизм сессии остаётся claude_code, но действует только на

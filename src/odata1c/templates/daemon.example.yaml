@@ -11,3 +11,7 @@ limits:
   pending_ttl_s: 600           # сколько живёт подготовленная операция записи
 write_confirm_fallback: deny   # deny | trust_client — как быть с клиентом без elicitation
 reindex_check_hours: 24        # как часто фоново сверять хэш $metadata
+# claude_code_parents: []      # имена образов Claude Code — предков лаунчера (Ruling 61), при
+                               # которых имя клиента claude-code заверяется. Дополняет встроенное
+                               # (claude.exe). Обычно не нужно; задать, если Claude Code запускает
+                               # лаунчер под другим именем исполняемого файла.

@@ -37,6 +37,7 @@ from odata1c.config.writer import (
 from odata1c.daemon import (
     CLIENT_ELICITATION_HEADER,
     CLIENT_NAME_HEADER,
+    CLIENT_PARENT_HEADER,
     CLIENT_SIG_HEADER,
     CLIENT_VERSION_HEADER,
     SESSION_ID_HEADER,
@@ -173,7 +174,7 @@ def test_mcp_без_ключа_печатает_причину_в_stderr(tmp_pat
 
 def test_подпись_привязана_к_сессии_и_каждому_полю():
     ключ = bytes(range(32))
-    поля = ("sid-1", "claude-code", "2.1.267", "1")
+    поля = ("sid-1", "claude-code", "2.1.267", "1", "1")  # sid, имя, версия, elicitation, родитель
     подпись = client_signature(ключ, *поля)
     assert подпись == client_signature(ключ, *поля)
     for номер in range(len(поля)):
@@ -181,7 +182,9 @@ def test_подпись_привязана_к_сессии_и_каждому_п�
         изменённые[номер] += "x"
         assert client_signature(ключ, *изменённые) != подпись, номер
     # Граница полей однозначна: перенос символа из одного поля в соседнее — другая подпись.
-    assert client_signature(ключ, "sid-1", "claude-cod", "e2.1.267", "1") != подпись
+    assert client_signature(ключ, "sid-1", "claude-cod", "e2.1.267", "1", "1") != подпись
+    # Признак родителя (Ruling 61) — часть подписи: «1» и «0» дают разные подписи.
+    assert client_signature(ключ, "sid-1", "claude-code", "2.1.267", "1", "0") != подпись
     assert client_signature(bytes(32), *поля) != подпись
     подпись.encode("ascii")
 
@@ -193,25 +196,42 @@ def _ctx(headers=None, *, params=None, caps=None):
     return pytypes.SimpleNamespace(headers=headers, session=сессия)
 
 
-def _заголовки(ключ, sid="s1", имя="claude-code", версия="2.1.267", elicitation="1", *, для=None):
+def _заголовки(
+    ключ, sid="s1", имя="claude-code", версия="2.1.267", elicitation="1", parent="1", *, для=None
+):
     """Заголовки клиента, как их ставит лаунчер; `для` — чьей сессией подписано (по умолчанию
-    своей), `ключ=None` — без подписи."""
+    своей), `ключ=None` — без подписи. `parent` — признак родителя (Ruling 61)."""
     заголовки = {
         SESSION_ID_HEADER: sid,
         CLIENT_NAME_HEADER: имя,
         CLIENT_VERSION_HEADER: версия,
         CLIENT_ELICITATION_HEADER: elicitation,
+        CLIENT_PARENT_HEADER: parent,
     }
     if ключ is not None:
-        заголовки[CLIENT_SIG_HEADER] = client_signature(ключ, для or sid, имя, версия, elicitation)
+        заголовки[CLIENT_SIG_HEADER] = client_signature(
+            ключ, для or sid, имя, версия, elicitation, parent
+        )
     return заголовки
 
 
 def test_верная_подпись_делает_клиента_проверенным():
     ключ = os.urandom(32)
     assert client_from_request(_ctx(_заголовки(ключ)), ключ) == ClientIdentity(
-        "claude-code", "2.1.267", True, verified=True
+        "claude-code", "2.1.267", True, verified=True, parent_is_claude_code=True
     )
+
+
+def test_признак_родителя_только_у_проверенного_клиента():
+    """Признак родителя (Ruling 61) доверенный, только если верна подпись: прямой клиент может
+    выставить `x-odata1c-client-parent: 1` сам, но без верной подписи `parent_is_claude_code`
+    остаётся False. Верная подпись с parent=0 — тоже False."""
+    ключ = os.urandom(32)
+    без_подписи = _заголовки(None, parent="1")  # заголовок «1», подписи нет
+    assert client_from_request(_ctx(без_подписи), ключ).parent_is_claude_code is False
+    подписан_без_родителя = _заголовки(ключ, parent="0")
+    клиент = client_from_request(_ctx(подписан_без_родителя), ключ)
+    assert клиент.verified is True and клиент.parent_is_claude_code is False
 
 
 def test_неверная_или_отсутствующая_подпись_клиент_не_проверен():
@@ -304,20 +324,26 @@ async def test_лаунчер_не_подписывает_без_сессии_к
 # ---------------------------------------------------------------------------------------------
 
 
-def test_claude_code_только_проверенному_клиенту():
+def _cc(имя="claude-code", версия="2.1.267", elicitation=False, *, verified=True, parent=True):
+    return ClientIdentity(имя, версия, elicitation, verified=verified, parent_is_claude_code=parent)
+
+
+def test_claude_code_только_проверенному_и_запущенному_claude_code():
     механизмы = SessionMechanisms("deny")
+    # Без подписи — не claude_code.
     assert механизмы.choose("a", ClientIdentity("claude-code", "2.1.267", False)) == "deny"
     assert механизмы.choose("b", ClientIdentity("claude-code", "2.1.267", True)) == "elicitation"
-    проверенный = ClientIdentity("claude-code", "2.1.267", False, verified=True)
-    assert механизмы.choose("c", проверенный) == "claude_code"
-    # Подпись не отменяет прежних правил: похожее имя и старая версия — обычный клиент.
-    похожий = ClientIdentity("Claude Code", "2.1.267", False, verified=True)
-    assert механизмы.choose("d", похожий) == "deny"
-    старый = ClientIdentity("claude-code", "2.1.245", True, verified=True)
-    assert механизмы.choose("e", старый) == "elicitation"
-    # `trust_client` — явная настройка владельца, от подписи не зависит.
+    # Подпись есть, но родитель лаунчера не Claude Code (Ruling 61) — тоже не claude_code.
+    assert механизмы.choose("c", _cc(parent=False)) == "deny"
+    assert механизмы.choose("c2", _cc(elicitation=True, parent=False)) == "elicitation"
+    # Подпись есть и родитель — Claude Code: claude_code.
+    assert механизмы.choose("d", _cc()) == "claude_code"
+    # Ни подпись, ни родитель не отменяют прежних правил: похожее имя и старая версия — обычный.
+    assert механизмы.choose("e", _cc(имя="Claude Code")) == "deny"
+    assert механизмы.choose("f", _cc(версия="2.1.245", elicitation=True)) == "elicitation"
+    # `trust_client` — явная настройка владельца, от подписи и родителя не зависит.
     доверие = SessionMechanisms("trust_client")
-    assert доверие.choose("f", ClientIdentity("claude-code", "2.1.267", False)) == "trust"
+    assert доверие.choose("g", ClientIdentity("claude-code", "2.1.267", False)) == "trust"
 
 
 def test_claude_code_сессии_только_на_подписанном_запросе():
@@ -327,7 +353,7 @@ def test_claude_code_сессии_только_на_подписанном_за�
     пишущий запрос обязан нести подпись лаунчера: без неё — `deny`, запомненный механизм сессии
     при этом не меняется."""
     механизмы = SessionMechanisms("deny")
-    подписанный = ClientIdentity("claude-code", "2.1.267", True, verified=True)
+    подписанный = _cc(elicitation=True)
     assert механизмы.choose("s", подписанный) == "claude_code"
     for чужой in (
         ClientIdentity("claude-code", "2.1.267", True),

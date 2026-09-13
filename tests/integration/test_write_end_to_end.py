@@ -48,6 +48,7 @@ from odata1c.config.writer import (
 from odata1c.daemon import (
     CLIENT_ELICITATION_HEADER,
     CLIENT_NAME_HEADER,
+    CLIENT_PARENT_HEADER,
     CLIENT_SIG_HEADER,
     CLIENT_VERSION_HEADER,
     SESSION_ID_HEADER,
@@ -59,6 +60,7 @@ from odata1c.gate.service import refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
+from odata1c.launch_parent import _предки_текущего, значимый_предок
 from odata1c.write.journal import Journal
 
 ПРЕДЕЛ_СЦЕНАРИЯ_С = 90
@@ -86,14 +88,32 @@ def _объекты() -> ОбъектыЗаписи:
     )
 
 
-def _дом(tmp_path, порт_1с: int, *, ключ: bool = True):
+def _значимый_предок_теста() -> str | None:
+    """Первый не-шим предок процесса pytest — он же значимый предок лаунчера, которого pytest
+    запустит: между ними только процессы-питоны (шимы). Тест кладёт его в `claude_code_parents`,
+    чтобы лаунчер, поднятый pytest, заверял имя `claude-code` по родителю (Ruling 61) — так
+    проверяется путь `claude_code`, не завися от того, чем именно запущен pytest."""
+    return значимый_предок(_предки_текущего() or [])
+
+
+def _дом(tmp_path, порт_1с: int, *, ключ: bool = True, заверить_родителя: bool = True):
     """Дом, как после `odata1c init`: с ключом лаунчера (`ключ=False` — дом, где init был до
-    Ruling 59: демон, поднятый на нём, ключа не находит)."""
+    Ruling 59: демон, поднятый на нём, ключа не находит). `заверить_родителя=True` добавляет
+    значимого предка pytest в `claude_code_parents`, чтобы лаунчер заверил `claude-code` по
+    родителю (Ruling 61); `False` — родитель лаунчера (pytest) не Claude Code, имя не заверено."""
     home = tmp_path / "home"
     ensure_home(home)
     ensure_gate_secret(home / "daemon.yaml")
     if ключ:
         ensure_launcher_key(home)
+    предок = _значимый_предок_теста() if заверить_родителя else None
+    if заверить_родителя:
+        assert предок, (
+            "значимый предок pytest не определён — путь claude_code сквозь лаунчер не проверить; "
+            "запустите тесты обычным образом (например, uv run pytest)"
+        )
+        with (home / "daemon.yaml").open("a", encoding="utf-8") as ф:
+            ф.write(f'claude_code_parents: ["{предок}"]\n')
     (home / "bases.yaml").write_text(
         "default: ut\n"
         "bases:\n"
@@ -292,10 +312,11 @@ async def _сценарий_отказов(home, порт: int, объекты: 
         assert "commit_id" in json.loads(свой), свой
         assert len(объекты.записи) == 1
 
-    # Claude Code: имя доходит до демона сквозь лаунчер, подписанное его ключом (Ruling 59), и
-    # демон не спрашивает сам — подтверждает диалог разрешения клиента по `_meta` тула (ADR-0012:
-    # без второго диалога), хотя elicitation клиент объявил. Возвращаем ИНН обратно, чтобы запись
-    # была видна в 1С.
+    # Claude Code: имя доходит до демона сквозь лаунчер, подписанное его ключом (Ruling 59) и
+    # заверенное по родителю (Ruling 61 — здесь дом добавил значимого предка pytest в
+    # claude_code_parents), и демон не спрашивает сам: подтверждает диалог разрешения клиента по
+    # `_meta` тула (ADR-0012: без второго диалога), хотя elicitation клиент объявил. Возвращаем ИНН
+    # обратно, чтобы запись была видна в 1С.
     async with через_лаунчер(home, порт, имя="claude-code", версия="2.1.267", ответ=ДА) as кл:
         ответ = await кл.json(
             "odata1c_update", {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}}
@@ -306,6 +327,29 @@ async def _сценарий_отказов(home, порт: int, объекты: 
         assert кл.вопросы == []
         assert объекты.записи[-1] == ("PATCH", ПУТЬ, {"ИНН": ИНН})
         assert _механизм_в_журнале(home, json.loads(текст)["commit_id"]) == "claude_code"
+
+
+async def test_лаунчер_с_чужим_родителем_не_заверяет_claude_code(tmp_path):
+    """И-2 / Ruling 61 сквозь настоящий лаунчер: имя `claude-code` заверяется по родителю
+    лаунчера, а не по имени в `initialize`. Дом без `claude_code_parents` — родитель лаунчера
+    (pytest/python) не Claude Code, — и клиент, назвавшийся `claude-code` без объявленной
+    elicitation (как `curl` ревьюера в И-2), получает отказ, а не запись без диалога. Подпись
+    лаунчера при этом верна: она доказывает «через лаунчер», но не «Claude Code»."""
+    объекты = _объекты()
+    async with запущенная(объекты=объекты) as порт_1с:
+        home = _дом(tmp_path, порт_1с, заверить_родителя=False)
+        async with _демон(home) as порт:
+
+            async def сценарий() -> None:
+                async with через_лаунчер(home, порт, имя="claude-code", версия="2.1.267") as кл:
+                    подготовка = await _подготовить(кл)
+                    отказ = _ошибка(
+                        await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]})
+                    )
+                assert отказ["code"] == "write_unsupported_client"
+                assert кл.вопросы == [] and объекты.записи == []
+
+            await asyncio.wait_for(сценарий(), ПРЕДЕЛ_СЦЕНАРИЯ_С)
 
 
 def _механизм_в_журнале(home, commit_id: str) -> str:
@@ -369,6 +413,9 @@ CLAUDE_CODE = {
     CLIENT_NAME_HEADER: "claude-code",
     CLIENT_VERSION_HEADER: "2.1.267",
     CLIENT_ELICITATION_HEADER: "0",
+    # Прямой клиент дерзко заявляет и «родитель — Claude Code» (Ruling 61): без верной подписи это
+    # значение недоверенно и claude_code не даёт.
+    CLIENT_PARENT_HEADER: "1",
 }
 
 
@@ -385,10 +432,10 @@ async def _сценарий_подделок(home, порт: int, объекты
     assert ключ is not None
 
     def верная(sid: str) -> str:
-        return client_signature(ключ, sid, "claude-code", "2.1.267", "0")
+        return client_signature(ключ, sid, "claude-code", "2.1.267", "0", "1")
 
     def чужим_ключом(sid: str) -> str:
-        return client_signature(os.urandom(32), sid, "claude-code", "2.1.267", "0")
+        return client_signature(os.urandom(32), sid, "claude-code", "2.1.267", "0", "1")
 
     # Подпись, подслушанная у настоящей сессии: клиент с верной подписью своей сессии делает один
     # запрос (подготовки не нужно) — его подпись и перехватывается.

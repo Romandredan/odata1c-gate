@@ -60,6 +60,7 @@ from odata1c.config.writer import ensure_gate_secret, ensure_launcher_key, ensur
 from odata1c.daemon import (
     CLIENT_ELICITATION_HEADER,
     CLIENT_NAME_HEADER,
+    CLIENT_PARENT_HEADER,
     CLIENT_SIG_HEADER,
     CLIENT_VERSION_HEADER,
     SCOPE_BASES_HEADER,
@@ -71,6 +72,7 @@ from odata1c.daemon import (
     is_listening,
     spawn_detached,
 )
+from odata1c.launch_parent import ИМЕНА_CLAUDE_CODE, родитель_заверён
 
 _log = logging.getLogger(__name__)
 
@@ -253,6 +255,10 @@ class ProxyHolder:
         # лаунчера один, и значения не меняются; `None` — тесты в памяти без HTTP.
         self.http = http
         self.клиент_передан = False
+        # Заверил ли лаунчер имя клиента по своему родителю (Ruling 61): выставляется в
+        # `run_launcher` при старте, до первого запроса. `False` — имя `claude-code` демону
+        # заверенным не пойдёт (механизм `claude_code` не выдаётся).
+        self.родитель_claude_code = False
         # Раунд правок 1, находка 1 (третья правка — «замок» на сессию): выставляется первым же
         # обработчиком, поймавшим `ОШИБКИ_АПСТРИМА`. Эмпирически (`probe_death2.py` на второй
         # версии правки — сторожок сам по себе): ПЕРВЫЙ вызов после смерти демона сторожок ловит
@@ -275,7 +281,9 @@ class ProxyHolder:
         self.session = ctx.session
         if self.клиент_передан or self.http is None:
             return
-        self.http.headers.update(client_headers(ctx.session))
+        self.http.headers.update(
+            client_headers(ctx.session, parent_is_claude_code=self.родитель_claude_code)
+        )
         self.клиент_передан = True
 
 
@@ -302,6 +310,7 @@ def client_signer(key: bytes | None):
             имя,
             заголовки.get(CLIENT_VERSION_HEADER, ""),
             заголовки.get(CLIENT_ELICITATION_HEADER, ""),
+            заголовки.get(CLIENT_PARENT_HEADER, ""),
         )
 
     return подписать
@@ -557,15 +566,26 @@ async def run_launcher(
     ensure_gate_secret(home / "daemon.yaml")
     ключ = ensure_launcher_key(home)
 
+    config = load_config(home)
     if url is not None:
         адрес = url
     else:
-        config = load_config(home)
         порт = config.daemon.port
         await _дождаться_демона(home, порт)
         адрес = daemon_url(порт)
 
+    # Ruling 61: заверить имя клиента `claude-code` только если лаунчер запущен исполняемым файлом
+    # Claude Code (по дереву процессов, мимо шимов запуска). Считается один раз при старте.
+    разрешённые = ИМЕНА_CLAUDE_CODE | {и.lower() for и in config.daemon.claude_code_parents}
+    родитель_ок, значимый = родитель_заверён(разрешённые)
+    _log.info(
+        "родитель лаунчера: %s → имя клиента %s",
+        значимый or "не определён",
+        "заверяется" if родитель_ок else "не заверяется",
+    )
+
     holder = ProxyHolder()
+    holder.родитель_claude_code = родитель_ок
     таймаут = httpx2.Timeout(10, read=None)
     заголовки = scope_headers(bases, default)
     host_port = _host_port_из_адреса(адрес)

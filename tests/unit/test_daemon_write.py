@@ -361,7 +361,9 @@ async def test_неподписанный_запрос_в_сессии_claude_co
     в сессии не остаётся чужих операций, на которые модель могла бы дать `commit` по подсказке из
     данных. `journal` — чтение, отвечает как обычно."""
     monkeypatch.setattr(демон.слой.keys, "key", lambda ctx: "сессия-cc")
-    подписанный = ClientIdentity("claude-code", "2.1.267", True, verified=True)
+    подписанный = ClientIdentity(
+        "claude-code", "2.1.267", True, verified=True, parent_is_claude_code=True
+    )
     assert демон.слой.mechanisms.choose("сессия-cc", подписанный) == "claude_code"
     одинс.положить(ПУТЬ_КОНТРАГЕНТА, к.контрагент())
     async with клиент(демон, имя="claude-code", версия="2.1.267", ответ=ДА) as кл:
@@ -476,7 +478,9 @@ def test_механизм_выбирается_первым_вызовом_и_з
     assert механизмы.choose("s", ClientIdentity("x", "1", True)) == "elicitation"
     # Та же сессия назвалась иначе (новый протокол шлёт клиента в каждом запросе) — механизм
     # прежний: сменить его посреди сессии нельзя.
-    claude_code = ClientIdentity("claude-code", "2.1.267", False, verified=True)
+    claude_code = ClientIdentity(
+        "claude-code", "2.1.267", False, verified=True, parent_is_claude_code=True
+    )
     assert механизмы.choose("s", claude_code) == "elicitation"
     assert механизмы.choose("t", claude_code) == "claude_code"
     часы.сейчас = 150

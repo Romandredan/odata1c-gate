@@ -158,11 +158,17 @@ SESSION_ID_HEADER = "mcp-session-id"
 CLIENT_NAME_HEADER = "x-odata1c-client-name"
 CLIENT_VERSION_HEADER = "x-odata1c-client-version"
 CLIENT_ELICITATION_HEADER = "x-odata1c-client-elicitation"
+# Заверил ли лаунчер имя клиента по своему родителю (Ruling 61): «1» — лаунчер запущен
+# исполняемым файлом Claude Code, имя `claude-code` заслуживает механизма `claude_code`; «0» —
+# нет (скрипт сам запустил `odata1c mcp`), имя не заверено. Значение входит в подпись, поэтому
+# прямой клиент его не подделает.
+CLIENT_PARENT_HEADER = "x-odata1c-client-parent"
 CLIENT_SIG_HEADER = "x-odata1c-client-sig"
 
 # Метка формата подписи: подпись этой версии не совпадёт ни с какой другой строкой под тем же
-# ключом, если формат канонического набора когда-нибудь поменяется.
-_МЕТКА_ПОДПИСИ = "odata1c-client-sig-v1"
+# ключом, если формат канонического набора когда-нибудь поменяется. v2 — добавлен признак родителя
+# (Ruling 61).
+_МЕТКА_ПОДПИСИ = "odata1c-client-sig-v2"
 
 # Длиннее — значение не передаётся вовсе (клиент «неизвестен»): имя в сотни килобайт превысило бы
 # предел заголовков сервера, и отказ 431 ложился бы на КАЖДЫЙ запрос сессии, включая чтение.
@@ -179,6 +185,10 @@ class ClientIdentity:
     version: str | None
     elicitation: bool
     verified: bool = False
+    # Заверил ли лаунчер имя по родителю (Ruling 61). Механизм `claude_code` — только когда
+    # `verified and parent_is_claude_code`: подпись доказывает «через лаунчер», родитель — «через
+    # Claude Code». Прямой клиент из `initialize` — всегда False.
+    parent_is_claude_code: bool = False
 
 
 def _elicitation_формы(возможности) -> bool:
@@ -214,27 +224,32 @@ def _в_заголовок(значение: str | None) -> str:
     return закодировано if len(закодировано) <= _ПРЕДЕЛ_ЗАГОЛОВКА else ""
 
 
-def client_headers(session) -> dict[str, str]:
+def client_headers(session, *, parent_is_claude_code: bool = False) -> dict[str, str]:
     """Заголовки клиента для HTTP-клиента лаунчера: `session` — downstream-сессия лаунчера
-    (настоящий клиент). Все три выставляются всегда, пустое имя — «клиент не назвался»: без
-    заголовков демон взял бы клиентом сам лаунчер (`mcp`, elicitation всегда)."""
+    (настоящий клиент). Все выставляются всегда, пустое имя — «клиент не назвался»: без
+    заголовков демон взял бы клиентом сам лаунчер (`mcp`, elicitation всегда).
+    `parent_is_claude_code` — заверил ли лаунчер имя по своему родителю (Ruling 61)."""
     клиент = client_of_session(session)
     return {
         CLIENT_NAME_HEADER: _в_заголовок(клиент.name),
         CLIENT_VERSION_HEADER: _в_заголовок(клиент.version),
         CLIENT_ELICITATION_HEADER: "1" if клиент.elicitation else "0",
+        CLIENT_PARENT_HEADER: "1" if parent_is_claude_code else "0",
     }
 
 
-def client_signature(key: bytes, session_id: str, name: str, version: str, elicitation: str) -> str:
-    """Подпись заголовков клиента (Ruling 59): HMAC-SHA256 ключом лаунчера, шестнадцатеричная.
+def client_signature(
+    key: bytes, session_id: str, name: str, version: str, elicitation: str, parent: str
+) -> str:
+    """Подпись заголовков клиента (Ruling 59, 61): HMAC-SHA256 ключом лаунчера, шестнадцатеричная.
 
     Подписываются значения в том виде, в каком идут по сети (процентная запись имени и версии,
     `1`/`0`): лаунчер и демон видят одни и те же байты, и раскодирование одной из сторон подпись
     не ломает. Набор — JSON-список с меткой формата: граница полей однозначна (`"ab","c"` и
-    `"a","bc"` — разные строки). `session_id` — чтобы подпись одной сессии не подошла другой."""
+    `"a","bc"` — разные строки). `session_id` — чтобы подпись одной сессии не подошла другой;
+    `parent` (признак родителя, Ruling 61) — в подписи, чтобы прямой клиент не выставил «1» сам."""
     набор = json.dumps(
-        [_МЕТКА_ПОДПИСИ, session_id, name, version, elicitation],
+        [_МЕТКА_ПОДПИСИ, session_id, name, version, elicitation, parent],
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -255,6 +270,7 @@ def _подпись_клиента_верна(заголовки: Mapping[str, s
         заголовки.get(CLIENT_NAME_HEADER, ""),
         заголовки.get(CLIENT_VERSION_HEADER, ""),
         заголовки.get(CLIENT_ELICITATION_HEADER, ""),
+        заголовки.get(CLIENT_PARENT_HEADER, ""),
     )
     return hmac.compare_digest(ожидаемая.encode("ascii"), присланная.encode("utf-8", "replace"))
 
@@ -266,15 +282,18 @@ def client_from_request(ctx, key: bytes | None) -> ClientIdentity:
     «нет» (механизм без вопроса сервера не выбирается, остаётся `deny`/`trust` по настройке).
 
     `key` — ключ лаунчера, прочитанный демоном при старте (`None` — ключа нет). Клиент проверен
-    (`verified`), только если заголовки подписаны этим ключом для этой сессии. Клиент из
+    (`verified`), только если заголовки подписаны этим ключом для этой сессии. Признак родителя
+    (Ruling 61) учитывается лишь у проверенного клиента: без верной подписи он недоверен. Клиент из
     `initialize` не проверен никогда: подписи там нет, и назваться может кто угодно."""
     заголовки = ctx.headers or {}
     if CLIENT_NAME_HEADER in заголовки:
+        проверен = _подпись_клиента_верна(заголовки, key)
         return ClientIdentity(
             name=urllib.parse.unquote(заголовки.get(CLIENT_NAME_HEADER, "")) or None,
             version=urllib.parse.unquote(заголовки.get(CLIENT_VERSION_HEADER, "")) or None,
             elicitation=заголовки.get(CLIENT_ELICITATION_HEADER) == "1",
-            verified=_подпись_клиента_верна(заголовки, key),
+            verified=проверен,
+            parent_is_claude_code=проверен and заголовки.get(CLIENT_PARENT_HEADER) == "1",
         )
     return client_of_session(ctx.session)
 
@@ -324,11 +343,13 @@ class SessionMechanisms:
     убирается (`purge`): вернувшаяся сессия выберет механизм заново — по тому же клиенту тот же.
 
     Механизм `claude_code` — только клиенту, заверенному подписью лаунчера (`verified`, Ruling
-    59). Имя непроверенного клиента в выбор не идёт вовсе: с объявленной elicitation демон
-    спрашивает сам, без неё — `deny` или `trust` по `write_confirm_fallback` (`trust_client` —
-    явная настройка владельца, подпись её не отменяет). И не только при выборе: в сессии, где
-    выбран `claude_code`, каждый запрос без подписи получает `deny` — идентификатор сессии не
-    секрет, и владение сессией доказывает подпись, а не он."""
+    59) И заверенному лаунчером по родителю (`parent_is_claude_code`, Ruling 61: лаунчер запущен
+    исполняемым файлом Claude Code, а не сторонним скриптом). Имя иначе не заверенного клиента в
+    выбор не идёт вовсе: с объявленной elicitation демон спрашивает сам, без неё — `deny` или
+    `trust` по `write_confirm_fallback` (`trust_client` — явная настройка владельца, ни подпись,
+    ни родитель её не отменяют). И не только при выборе: в сессии, где выбран `claude_code`, каждый
+    запрос без подписи получает `deny` — идентификатор сессии не секрет, и владение сессией
+    доказывает подпись, а не он."""
 
     def __init__(
         self,
@@ -346,7 +367,8 @@ class SessionMechanisms:
         сейчас = self._clock()
         запись = self._записи.get(session_key)
         if запись is None:
-            имя, версия = (client.name, client.version) if client.verified else (None, None)
+            заверен = client.verified and client.parent_is_claude_code
+            имя, версия = (client.name, client.version) if заверен else (None, None)
             механизм = choose_mechanism(имя, версия, client.elicitation, self._запасной)
             запись = self._записи[session_key] = [механизм, сейчас]
         запись[1] = сейчас
