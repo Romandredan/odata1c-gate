@@ -350,15 +350,22 @@ class SessionMechanisms:
             механизм = choose_mechanism(имя, версия, client.elicitation, self._запасной)
             запись = self._записи[session_key] = [механизм, сейчас]
         запись[1] = сейчас
-        if запись[0] == "claude_code" and not client.verified:
+        if self.foreign_in_claude_code(session_key, client):
             # Механизм Claude Code действует только на запросе, подписанном лаунчером этой сессии:
             # ключ сессии — `mcp-session-id`, а он не секрет (SDK пишет его в журнал демона на
             # INFO и принимает живую сессию от любого, кто его предъявит, — проверено
             # исполнением). Без этой проверки процесс, прочитавший идентификатор из журнала,
             # получал бы запомненный механизм сессии Claude Code без подписи. Механизм сессии не
-            # меняется — отказ получает только этот запрос.
+            # меняется — отказ получает только этот запрос. Пишущие тулы демона отказывают такому
+            # запросу раньше, до сервиса (Р59-А, `build_server`); здесь — второй рубеж `commit`.
             return "deny"
         return запись[0]
+
+    def foreign_in_claude_code(self, session_key: str, client: ClientIdentity) -> bool:
+        """Неподписанный запрос в сессии, где выбран механизм Claude Code (Ruling 59, Р59-А):
+        такой запрос не от лаунчера этой сессии, и ничего пишущего в ней ему не положено."""
+        запись = self._записи.get(session_key)
+        return запись is not None and запись[0] == "claude_code" and not client.verified
 
     def purge(self) -> int:
         граница = self._clock() - self._idle_s
@@ -795,14 +802,39 @@ def build_server(
     мета_commit = {**мета, "anthropic/requiresUserInteraction": True}
     запись = слой.write
 
-    def сессия_записи(ctx: Context) -> tuple[SessionScope, str, Механизм]:
-        """Область видимости, ключ сессии и её механизм подтверждения. Механизм выбирается
-        первым пишущим вызовом сессии (решение 6 плана) — подготовкой, откатом или `commit`.
-        К этому вызову `mcp-session-id` у лаунчера уже есть (его нет только у `initialize`), и
-        подпись клиента к нему привязана (Ruling 59)."""
+    def сессия_записи(ctx: Context) -> tuple[SessionScope, str, Механизм, str | None]:
+        """Область видимости, ключ сессии, её механизм подтверждения и отказ этому запросу
+        (`None` — отказа нет). Механизм выбирается первым пишущим вызовом сессии (решение 6
+        плана) — подготовкой, откатом или `commit`. К этому вызову `mcp-session-id` у лаунчера
+        уже есть (его нет только у `initialize`), и подпись клиента к нему привязана (Ruling 59).
+
+        Отказ — Р59-А (решение контролёра): в сессии с механизмом Claude Code всё пишущее —
+        только от её лаунчера. Неподписанный запрос к любому пишущему тулу (подготовка, откат,
+        `commit`) получает `write_unsupported_client` до сервиса: в сессии не остаётся чужих
+        операций, на которые модель могла бы дать `commit` по подсказке из данных 1С, а правило
+        «пишущее в сессии Claude Code — только от лаунчера» проверяется одной строкой. `journal` —
+        чтение, этот путь не проходит."""
         ключ = слой.keys.key(ctx)
-        механизм = слой.mechanisms.choose(ключ, client_from_request(ctx, слой.launcher_key))
-        return scope_from_headers(ctx.headers), ключ, механизм
+        клиент = client_from_request(ctx, слой.launcher_key)
+        механизм = слой.mechanisms.choose(ключ, клиент)
+        отказ = None
+        if слой.mechanisms.foreign_in_claude_code(ключ, клиент):
+            отказ = service._guard_error(
+                "write_unsupported_client",
+                "запрос без подписи лаунчера в сессии Claude Code: пишущие тулы этой сессии "
+                "принимают только запросы её лаунчера — ничего не подготовлено и не выполнено",
+                "запись из Claude Code идёт через лаунчер odata1c mcp",
+            )
+        return scope_from_headers(ctx.headers), ключ, механизм, отказ
+
+    async def подготовить(ctx: Context, действие) -> str:
+        """Общий вход тулов подготовки (`create`, `update`, `mark_for_deletion`, `action`,
+        `undo`): отказ неподписанному запросу в сессии Claude Code (Р59-А) — раньше сервиса;
+        иначе `действие(область, ключ_сессии)` — метод `WriteService`."""
+        область, ключ, _, отказ_подготовке = сессия_записи(ctx)
+        if отказ_подготовке is not None:
+            return отказ_подготовке
+        return await действие(область, ключ)
 
     @server.tool(
         name="odata1c_create",
@@ -818,8 +850,10 @@ def build_server(
         structured_output=False,
     )
     async def odata1c_create(ctx: Context, entity: str, data: dict, base: str | None = None) -> str:
-        область, ключ, _ = сессия_записи(ctx)
-        return await запись.create(область, ключ, base=base, entity=entity, data=data)
+        return await подготовить(
+            ctx,
+            lambda область, ключ: запись.create(область, ключ, base=base, entity=entity, data=data),
+        )
 
     @server.tool(
         name="odata1c_update",
@@ -837,8 +871,12 @@ def build_server(
     async def odata1c_update(
         ctx: Context, entity: str, key: str | dict, data: dict, base: str | None = None
     ) -> str:
-        область, ключ, _ = сессия_записи(ctx)
-        return await запись.update(область, ключ, base=base, entity=entity, key=key, data=data)
+        return await подготовить(
+            ctx,
+            lambda область, ключ: запись.update(
+                область, ключ, base=base, entity=entity, key=key, data=data
+            ),
+        )
 
     @server.tool(
         name="odata1c_mark_for_deletion",
@@ -855,9 +893,11 @@ def build_server(
     async def odata1c_mark_for_deletion(
         ctx: Context, entity: str, key: str | dict, mark: bool = True, base: str | None = None
     ) -> str:
-        область, ключ, _ = сессия_записи(ctx)
-        return await запись.mark_for_deletion(
-            область, ключ, base=base, entity=entity, key=key, mark=mark
+        return await подготовить(
+            ctx,
+            lambda область, ключ: запись.mark_for_deletion(
+                область, ключ, base=base, entity=entity, key=key, mark=mark
+            ),
         )
 
     @server.tool(
@@ -880,9 +920,11 @@ def build_server(
         params: dict | None = None,
         base: str | None = None,
     ) -> str:
-        область, ключ, _ = сессия_записи(ctx)
-        return await запись.action(
-            область, ключ, base=base, entity=entity, key=key, name=name, params=params
+        return await подготовить(
+            ctx,
+            lambda область, ключ: запись.action(
+                область, ключ, base=base, entity=entity, key=key, name=name, params=params
+            ),
         )
 
     @server.tool(
@@ -900,7 +942,9 @@ def build_server(
         structured_output=False,
     )
     async def odata1c_commit(ctx: Context, pending_id: str) -> str:
-        область, ключ, механизм = сессия_записи(ctx)
+        область, ключ, механизм, отказ_commit = сессия_записи(ctx)
+        if отказ_commit is not None:
+            return отказ_commit
         confirm = elicitation_confirmer(ctx) if механизм == "elicitation" else None
         return await запись.commit(область, ключ, pending_id, mechanism=механизм, confirm=confirm)
 
@@ -917,8 +961,9 @@ def build_server(
         structured_output=False,
     )
     async def odata1c_undo(ctx: Context, commit_id: str) -> str:
-        область, ключ, _ = сессия_записи(ctx)
-        return await запись.undo(область, ключ, commit_id=commit_id)
+        return await подготовить(
+            ctx, lambda область, ключ: запись.undo(область, ключ, commit_id=commit_id)
+        )
 
     @server.tool(
         name="odata1c_journal",

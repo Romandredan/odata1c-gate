@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import sys
@@ -427,13 +428,6 @@ async def _сценарий_подделок(home, порт: int, объекты
     assert объекты.записи == [("PATCH", ПУТЬ, {"ИНН": НОВЫЙ_ИНН})]
 
 
-def _сессии_из_журнала(home) -> list[str]:
-    """Идентификаторы сессий, которые SDK пишет в журнал демона на INFO («Created new transport
-    with session ID: …») — так их прочитает любой процесс того же пользователя."""
-    текст = (home / "logs" / "daemon.log").read_text(encoding="utf-8")
-    return re.findall(r"session ID: ([0-9a-f]{32})", текст)
-
-
 async def _сырой_вызов(порт: int, sid: str, номер: int, тул: str, аргументы: dict) -> str:
     """`tools/call` одним POST в чужую живую сессию — без SDK-клиента и без подписи, как `curl`."""
     async with httpx2.AsyncClient(timeout=httpx2.Timeout(30)) as http:
@@ -463,60 +457,97 @@ async def _сырой_вызов(порт: int, sid: str, номер: int, ту�
     raise AssertionError("ответа на вызов нет")
 
 
-async def test_идентификатор_сессии_из_журнала_не_даёт_записи_без_подписи(tmp_path):
-    """Обход подписи через идентификатор сессии: SDK пишет `mcp-session-id` в журнал демона и
-    принимает живую сессию от любого, кто его предъявит (проверено исполнением), а механизм
-    запоминается по сессии. Процесс модели читает идентификатор сессии Claude Code, которая уже
-    писала (механизм `claude_code`), и шлёт в неё `update` и `commit` без подписи — отказ, в 1С
-    ничего: механизм Claude Code действует только на подписанном лаунчером запросе."""
+@contextlib.contextmanager
+def _идентификаторы_сессий():
+    """Идентификаторы сессий, которые объявляет SDK демона («Created new transport with session
+    ID: …», логгер `mcp.server.streamable_http_manager`). До правки координатора (Р59-5) эта
+    строка шла в `daemon.log` на INFO — так идентификатор и читался бы процессом модели. Тест
+    берёт его своим обработчиком, подключённым уже после старта демона, чтобы не зависеть от
+    уровня этого логгера в журнале демона."""
+    найдено: list[str] = []
+
+    class Перехват(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            совпадение = re.search(r"session ID: ([0-9a-f]{32})", record.getMessage())
+            if совпадение:
+                найдено.append(совпадение.group(1))
+
+    логгер = logging.getLogger("mcp.server.streamable_http_manager")
+    прежний_уровень = логгер.level
+    обработчик = Перехват()
+    логгер.addHandler(обработчик)
+    логгер.setLevel(logging.INFO)
+    try:
+        yield найдено
+    finally:
+        логгер.removeHandler(обработчик)
+        логгер.setLevel(прежний_уровень)
+
+
+НЕПОДПИСАННЫЕ_ПОДГОТОВКИ = {
+    "odata1c_create": {"entity": КОНТРАГЕНТЫ, "data": {"Description": "x"}},
+    "odata1c_update": {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}},
+    "odata1c_mark_for_deletion": {"entity": КОНТРАГЕНТЫ, "key": REF_KEY},
+    "odata1c_action": {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "name": "Post"},
+}
+
+
+async def test_идентификатор_чужой_сессии_не_даёт_ни_записи_ни_подготовки(tmp_path):
+    """Обход подписи через идентификатор сессии: SDK принимает живую сессию от любого, кто
+    предъявит её `mcp-session-id` (проверено исполнением), а механизм запоминается по сессии.
+    Процесс модели знает идентификатор сессии Claude Code, которая уже писала (механизм
+    `claude_code`), и шлёт в неё запросы без подписи. Ruling 59 и Р59-А: в сессии Claude Code
+    неподписанный запрос к любому пишущему тулу — `write_unsupported_client`, до сервиса; своей
+    операции там не подготовить, операцию лаунчера не выполнить. Чтение (`journal`) отвечает."""
     объекты = _объекты()
     async with запущенная(объекты=объекты) as порт_1с:
         home = _дом(tmp_path, порт_1с)
         async with _демон(home) as порт:
 
             async def сценарий() -> None:
-                async with через_лаунчер(
-                    home, порт, имя="claude-code", версия="2.1.267", ответ=ДА
-                ) as кл:
-                    подготовка = await _подготовить(кл)
-                    текст = await кл.вызвать(
-                        "odata1c_commit", {"pending_id": подготовка["pending_id"]}
-                    )
-                    assert "commit_id" in json.loads(текст), текст
-                    assert len(объекты.записи) == 1 and кл.вопросы == []
-
-                    [sid] = _сессии_из_журнала(home)
-                    подготовлено = json.loads(
-                        await _сырой_вызов(
-                            порт,
-                            sid,
-                            101,
-                            "odata1c_update",
-                            {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}},
-                        )
-                    )
-                    assert "pending_id" in подготовлено, подготовлено
-                    отказ = _ошибка(
-                        await _сырой_вызов(
-                            порт,
-                            sid,
-                            102,
-                            "odata1c_commit",
-                            {"pending_id": подготовлено["pending_id"]},
-                        )
-                    )
-                    assert отказ["code"] == "write_unsupported_client"
-                    assert len(объекты.записи) == 1
-                    # Сессия осталась сессией Claude Code: подписанный запрос лаунчера пишет.
-                    своя = await кл.json(
-                        "odata1c_update",
-                        {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}},
-                    )
-                    итог = await кл.вызвать("odata1c_commit", {"pending_id": своя["pending_id"]})
-                    assert "commit_id" in json.loads(итог), итог
-                    assert len(объекты.записи) == 2 and кл.вопросы == []
+                with _идентификаторы_сессий() as сессии:
+                    async with через_лаунчер(
+                        home, порт, имя="claude-code", версия="2.1.267", ответ=ДА
+                    ) as кл:
+                        await _сценарий_чужой_сессии(кл, порт, сессии, объекты)
 
             await asyncio.wait_for(сценарий(), ПРЕДЕЛ_СЦЕНАРИЯ_С)
+
+
+async def _сценарий_чужой_сессии(кл: Клиент, порт: int, сессии: list[str], объекты) -> None:
+    подготовка = await _подготовить(кл)
+    текст = await кл.вызвать("odata1c_commit", {"pending_id": подготовка["pending_id"]})
+    выполнено = json.loads(текст)
+    assert "commit_id" in выполнено, текст
+    assert len(объекты.записи) == 1 and кл.вопросы == []
+    [sid] = сессии
+
+    номер = 100
+    вызовы = {
+        **НЕПОДПИСАННЫЕ_ПОДГОТОВКИ,
+        "odata1c_undo": {"commit_id": выполнено["commit_id"]},
+        "odata1c_commit": {"pending_id": "p0"},
+    }
+    for тул, аргументы in вызовы.items():
+        номер += 1
+        отказ = _ошибка(await _сырой_вызов(порт, sid, номер, тул, аргументы))
+        assert отказ["code"] == "write_unsupported_client", тул
+    # Операция, подготовленная лаунчером, чужим неподписанным `commit` не выполняется.
+    своя = await кл.json(
+        "odata1c_update", {"entity": КОНТРАГЕНТЫ, "key": REF_KEY, "data": {"ИНН": ИНН}}
+    )
+    отказ = _ошибка(
+        await _сырой_вызов(порт, sid, 200, "odata1c_commit", {"pending_id": своя["pending_id"]})
+    )
+    assert отказ["code"] == "write_unsupported_client"
+    assert len(объекты.записи) == 1
+    # Чтение в той же сессии — как у любого клиента.
+    журнал = json.loads(await _сырой_вызов(порт, sid, 201, "odata1c_journal", {"limit": 5}))
+    assert "error" not in журнал, журнал
+    # Сессия осталась сессией Claude Code: подписанный запрос лаунчера пишет без вопроса.
+    итог = await кл.вызвать("odata1c_commit", {"pending_id": своя["pending_id"]})
+    assert "commit_id" in json.loads(итог), итог
+    assert len(объекты.записи) == 2 and кл.вопросы == []
 
 
 async def test_демон_без_ключа_не_выдаёт_claude_code_и_предупреждает(tmp_path):

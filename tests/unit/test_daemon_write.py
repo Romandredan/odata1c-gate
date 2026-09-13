@@ -342,6 +342,37 @@ async def test_claude_code_без_подписи_с_elicitation_демон_сп�
     assert одинс.patch.call_count == 1
 
 
+ПИШУЩИЕ_ВЫЗОВЫ = {
+    "odata1c_create": {"entity": КОНТРАГЕНТЫ, "data": {"Description": "x"}},
+    "odata1c_update": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА, "data": {"Description": "x"}},
+    "odata1c_mark_for_deletion": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА},
+    "odata1c_action": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА, "name": "Post"},
+    "odata1c_undo": {"commit_id": "c0"},
+    "odata1c_commit": {"pending_id": "p0"},
+}
+
+
+@pytest.mark.parametrize("тул", sorted(ПИШУЩИЕ_ВЫЗОВЫ))
+async def test_неподписанный_запрос_в_сессии_claude_code_отказ_на_любом_пишущем_туле(
+    демон, одинс, monkeypatch, тул
+):
+    """Р59-А (решение контролёра): в сессии с механизмом `claude_code` всё пишущее — только от
+    лаунчера. Неподписанный запрос к любому пишущему тулу — `write_unsupported_client` до сервиса:
+    в сессии не остаётся чужих операций, на которые модель могла бы дать `commit` по подсказке из
+    данных. `journal` — чтение, отвечает как обычно."""
+    monkeypatch.setattr(демон.слой.keys, "key", lambda ctx: "сессия-cc")
+    подписанный = ClientIdentity("claude-code", "2.1.267", True, verified=True)
+    assert демон.слой.mechanisms.choose("сессия-cc", подписанный) == "claude_code"
+    одинс.положить(ПУТЬ_КОНТРАГЕНТА, к.контрагент())
+    async with клиент(демон, имя="claude-code", версия="2.1.267", ответ=ДА) as кл:
+        текст = await кл.вызвать(тул, ПИШУЩИЕ_ВЫЗОВЫ[тул])
+        журнал = await кл.json("odata1c_journal", {})
+    assert ошибка(текст)["code"] == "write_unsupported_client"
+    assert демон.слой.store._ops == {}
+    assert кл.вопросы == [] and одинс.записей == 0
+    assert "error" not in журнал, журнал
+
+
 async def test_claude_code_без_подписи_и_без_elicitation_при_deny_отказ(демон, одинс):
     """Обратная форма `test_А1` ревьюера задачи 9: `curl` называет себя `claude-code` и
     elicitation не объявляет — при `deny` запись недоступна, в 1С ни одного запроса записи."""

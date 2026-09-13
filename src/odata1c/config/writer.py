@@ -452,23 +452,47 @@ def ensure_launcher_key(home: pathlib.Path) -> bytes:
     if текущий is not None:
         return текущий
     путь = home / LAUNCHER_KEY_FILE
-    with _межпроцессный_замок(путь.with_name(путь.name + ".lock")):
-        текущий = read_launcher_key(home)
-        if текущий is not None:
-            return текущий
-        временный = путь.with_name(путь.name + f".tmp-{os.getpid()}")
-        временный.write_bytes(secrets.token_bytes(_ДЛИНА_КЛЮЧА_ЛАУНЧЕРА))
-        if os.name != "nt":
-            временный.chmod(0o600)
-        os.replace(временный, путь)
+    try:
+        with _межпроцессный_замок(путь.with_name(путь.name + ".lock")):
+            текущий = read_launcher_key(home)
+            if текущий is not None:
+                return текущий
+            временный = путь.with_name(путь.name + f".tmp-{os.getpid()}")
+            временный.write_bytes(secrets.token_bytes(_ДЛИНА_КЛЮЧА_ЛАУНЧЕРА))
+            if os.name != "nt":
+                временный.chmod(0o600)
+            os.replace(временный, путь)
+    except OSError as ошибка:
+        raise _ключ_не_создан(
+            home, f"нет прав на запись или диск недоступен ({type(ошибка).__name__})"
+        ) from None
+    except ConfigError:
+        # Замок создания занят живым процессом дольше таймаута (`_замок_занят`): его текст
+        # называет файл замка и говорит о `gate_secret` — здесь это не та подсказка.
+        raise _ключ_не_создан(
+            home,
+            "замок создания ключа занят другим процессом шлюза; если ни один процесс шлюза не "
+            "запущен, удалите в этом каталоге файл замка ключа лаунчера (оканчивается на .lock)",
+        ) from None
     ключ = read_launcher_key(home)
     if ключ is None:  # файл заменили между записью и чтением — не молчать, это не штатно
-        raise ConfigError(
-            "ключ лаунчера не удалось прочитать после создания",
-            code="config_invalid",
-            hint="проверьте домашний каталог и повторите запуск",
-        )
+        raise _ключ_не_создан(home, "ключ не читается сразу после создания")
     return ключ
+
+
+def _ключ_не_создан(home: pathlib.Path, причина: str) -> ConfigError:
+    """Отказ создать ключ лаунчера (вопрос 6 ревью Ruling 59). Лаунчер без ключа не стартует, и в
+    Claude Code это видно как «сломался MCP-сервер» — поэтому текст называет причину, каталог и
+    починку. Путь домашнего каталога — не данные 1С, его называть можно; имени файла ключа и
+    ключа в тексте нет (Ruling 59, п. 5), текст исходного `OSError` с путём файла не цепляется."""
+    return ConfigError(
+        f"не удалось создать ключ лаунчера в домашнем каталоге {home}: {причина}",
+        code="config_invalid",
+        hint=(
+            f"проверьте, что текущий пользователь может писать в {home} (права на каталог), и "
+            f"выполните `odata1c init --home {home}`; без ключа лаунчер не запускается"
+        ),
+    )
 
 
 def read_launcher_key(home: pathlib.Path) -> bytes | None:

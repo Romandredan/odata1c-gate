@@ -15,6 +15,7 @@
 import base64
 import inspect
 import os
+import pathlib
 import types as pytypes
 
 import httpx2
@@ -23,8 +24,10 @@ import pytest
 import yaml
 
 from odata1c import daemon
-from odata1c.cli import cmd_init
+from odata1c.cli import cmd_init, cmd_mcp
+from odata1c.config import writer
 from odata1c.config.home import ensure_home
+from odata1c.config.loader import ConfigError
 from odata1c.config.writer import (
     LAUNCHER_KEY_FILE,
     ensure_gate_secret,
@@ -102,6 +105,65 @@ def test_init_создаёт_ключ_лаунчера(tmp_path, capsys):
     # Ни имя файла ключа, ни ключ в выводе команды не нужны.
     вывод = capsys.readouterr().out
     assert ключ.hex() not in вывод
+
+
+def _запретить_запись_ключа(monkeypatch) -> None:
+    """Запись файла ключа (и его временного файла) падает `PermissionError`, как на домашнем
+    каталоге без прав на запись; прочие файлы пишутся как обычно."""
+    исходный = pathlib.Path.write_bytes
+
+    def запрет(self, данные):
+        if self.name.startswith(LAUNCHER_KEY_FILE):
+            raise PermissionError(13, "Отказано в доступе", str(self))
+        return исходный(self, данные)
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", запрет)
+
+
+def _текст_отказа(отказ: ConfigError) -> str:
+    return f"{отказ} {отказ.hint}"
+
+
+def test_ключ_не_создан_без_прав_отказ_называет_каталог_и_починку(tmp_path, monkeypatch):
+    """Вопрос 6 ревью Ruling 59: лаунчер без ключа не стартует (как без `gate_secret`), и в
+    Claude Code это видно как «сломался MCP-сервер». Текст отказа обязан назвать причину и
+    починку — права на домашний каталог, его путь, `odata1c init`. Имени файла ключа и ключа в
+    нём нет."""
+    ensure_home(tmp_path)
+    _запретить_запись_ключа(monkeypatch)
+    with pytest.raises(ConfigError) as отказ:
+        ensure_launcher_key(tmp_path)
+    текст = _текст_отказа(отказ.value)
+    assert отказ.value.code == "config_invalid"
+    assert str(tmp_path) in текст
+    assert "прав" in текст and "odata1c init" in текст
+    assert LAUNCHER_KEY_FILE not in текст
+    assert отказ.value.__suppress_context__  # текст исходного OSError с путём файла не цепляется
+
+
+def test_ключ_не_создан_замок_занят_отказ_называет_каталог_и_починку(tmp_path, monkeypatch):
+    ensure_home(tmp_path)
+    monkeypatch.setattr(writer, "ТАЙМАУТ_ЗАМКА_С", 0.2)
+    # Замок держит живой процесс (этот) — брошенным он не считается, ожидание кончается отказом.
+    (tmp_path / (LAUNCHER_KEY_FILE + ".lock")).write_text(str(os.getpid()), encoding="ascii")
+    with pytest.raises(ConfigError) as отказ:
+        ensure_launcher_key(tmp_path)
+    текст = _текст_отказа(отказ.value)
+    assert str(tmp_path) in текст and "odata1c init" in текст
+    assert LAUNCHER_KEY_FILE not in текст and "gate_secret" not in текст
+
+
+def test_mcp_без_ключа_печатает_причину_в_stderr(tmp_path, monkeypatch, capsys):
+    """Как это увидит владелец: `odata1c mcp` завершается кодом 1, в stderr — код, причина с
+    путём каталога и подсказка; stdout (канал протокола MCP) пуст."""
+    дом = tmp_path / "дом"
+    _запретить_запись_ключа(monkeypatch)
+    assert cmd_mcp(дом, None, None, "http://127.0.0.1:9/mcp") == 1
+    вывод = capsys.readouterr()
+    assert вывод.out == ""
+    assert "[config_invalid]" in вывод.err and str(дом) in вывод.err
+    assert "odata1c init" in вывод.err
+    assert LAUNCHER_KEY_FILE not in вывод.err
 
 
 # ---------------------------------------------------------------------------------------------
