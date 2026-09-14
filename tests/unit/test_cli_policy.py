@@ -20,6 +20,7 @@ import pathlib
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
+from odata1c.gate.policy import load_policy
 from odata1c.gate.service import auto_policy_path, gate_db_path, open_dictionary, policy_path
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
@@ -430,6 +431,38 @@ def test_policy_set_без_индекса_пишет_и_предупреждае
     assert код == 0
     assert "warning: index: индекса нет" in вывод
     assert "fields:\n  Catalog_Любая.ЧтоУгодно: keep" in путь.read_text(encoding="utf-8")
+
+
+def test_policy_hide_канонизирует_регистр_сущности_перед_записью(tmp_path, capsys, edmx_ut_real):
+    """`resolve_name` нарочно нечувствителен к регистру (docstring `IndexRepository.resolve_name`:
+    «запрет… обходился бы одной сменой регистра буквы») — конструктор обязан писать в файл
+    КАНОНИЧЕСКОЕ имя, а не то, что набрал владелец, иначе `Policy.is_hidden` (точное сравнение)
+    правило не увидит."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+
+    код = main(["policy", "hide", "ut", "catalog_контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "скрыто: Catalog_Контрагенты" in вывод
+    политика = load_policy(путь)
+    assert политика.is_hidden("Catalog_Контрагенты")
+
+
+def test_policy_set_канонизирует_регистр_сущности_перед_записью(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+
+    код = main(["policy", "set", "ut", "catalog_контрагенты.ИНН", "keep", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "класс поля Catalog_Контрагенты.ИНН: keep" in вывод
+    политика = load_policy(путь)
+    assert политика.sensitivity_of("Catalog_Контрагенты", "ИНН") == "keep"
 
 
 def test_policy_hide_без_файла_политики(tmp_path, capsys):

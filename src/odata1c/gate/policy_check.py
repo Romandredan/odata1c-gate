@@ -27,7 +27,10 @@ from odata1c.index.repository import IndexRepository
 # `CLASSES` (gate/tokens.py) уже включает `keep`; `scan` — класс «только сканировать значение»,
 # в грамматике токенов не участвует и в CLASSES не входит. custom:* добавляются по разделу custom
 # конкретного файла — собираются в `допустимые_классы` внутри `check_policy`, не здесь.
-_БАЗОВЫЕ_КЛАССЫ = CLASSES | {"scan"}
+# Без подчёркивания — конструктор `policy set` (`cli.py`, задача 5 плана M2b) проверяет класс тем
+# же набором: два отдельных объявления одного и того же множества разошлись бы однажды, и
+# `policy set` начал бы принимать то, что `policy check` отвергает.
+БАЗОВЫЕ_КЛАССЫ = CLASSES | {"scan"}
 
 ЗАГОЛОВОК_БЛОКА = "# --- действующая политика (владелец поверх авторазметки) ---"
 _ПОМЕТКА_ВСТРОЕННЫЙ_СПИСОК = " (встроенный список)"
@@ -90,7 +93,7 @@ def check_policy(owner_path: pathlib.Path, repo: IndexRepository | None) -> list
         for имя, настройки in (owner_data.get("entities") or {}).items()
         if isinstance(настройки, dict) and настройки.get("hide")
     }
-    допустимые_классы = _БАЗОВЫЕ_КЛАССЫ | {
+    допустимые_классы = БАЗОВЫЕ_КЛАССЫ | {
         f"custom:{имя}" for имя in (owner_data.get("custom") or {})
     }
 
@@ -157,7 +160,7 @@ def check_policy(owner_path: pathlib.Path, repo: IndexRepository | None) -> list
                     where=f"fields.{ключ}",
                     message=(
                         f"класс «{класс}» неизвестен; допустимые: "
-                        f"{', '.join(sorted(_БАЗОВЫЕ_КЛАССЫ))}"
+                        f"{', '.join(sorted(БАЗОВЫЕ_КЛАССЫ))}"
                     ),
                 )
             )

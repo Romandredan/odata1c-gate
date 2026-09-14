@@ -36,7 +36,13 @@ from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_d
 from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy, parse_owner_file
-from odata1c.gate.policy_check import Finding, check_policy, render_effective, suggest_names
+from odata1c.gate.policy_check import (
+    БАЗОВЫЕ_КЛАССЫ,
+    Finding,
+    check_policy,
+    render_effective,
+    suggest_names,
+)
 from odata1c.gate.policy_edit import hide_entity, set_field_class
 from odata1c.gate.service import (
     auto_policy_path,
@@ -45,7 +51,6 @@ from odata1c.gate.service import (
     policy_path,
     refresh_policy,
 )
-from odata1c.gate.tokens import CLASSES
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path, reindex
 from odata1c.index.repository import IndexCorruptError, IndexRepository
@@ -480,9 +485,6 @@ def _напечатать_находки(находки: list[Finding]) -> None:
 # --- policy hide | open | set (задача 5 плана M2b, ADR-0015) --------------------------------
 
 
-_БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ = CLASSES | {"scan"}
-
-
 def _похожие_сущности(repo: IndexRepository, query: str) -> str:
     похожие = suggest_names(repo, query)
     return f" (похожие имена: {', '.join(похожие)})" if похожие else ""
@@ -497,37 +499,59 @@ def _разобрать_ключ_поля(ключ: str) -> tuple[str, str] | No
     return сущность, поле
 
 
-def _проверить_поле_по_индексу(repo: IndexRepository | None, ключ: str) -> str | None:
-    """Сообщение отказа, если `ключ` (`Сущность.Поле`) не проходит проверку по индексу; `None` —
-    поле годится (или индекса нет вовсе — задача 5 плана M2b, «класс без индекса: имена не
-    проверяются», диагностику в этом случае даёт одна `warning` из `check_policy`, уже после
-    записи)."""
+def _канонизировать_сущность(repo: IndexRepository | None, entity: str) -> tuple[str | None, str]:
+    """Сообщение отказа и каноническое имя сущности по индексу — `(None, entity)`, если индекса
+    нет вовсе (запись остаётся дословной, как набрал владелец) или сущность нашлась.
+
+    `IndexRepository.resolve_name` нарочно нечувствителен к регистру («имя набора в чужом
+    регистре… публикация 1С такой путь, по всей видимости, принимает», докстринг
+    `resolve_name`): без канонизации перед записью правило, набранное `catalog_контрагенты`, легло
+    бы в `policy.yaml` этим написанием, а `Policy.is_hidden`/`sensitivity_of` сравнивают ключ
+    ТОЧНО — запрет молча не действовал бы, при этом `resolve_name` из `check_policy` его бы
+    принял и находок не нашёл (находка ревью задачи 5: тот самый обход, о котором предупреждает
+    докстринг `resolve_name`, конструктор мог бы сам и порождать)."""
     if repo is None:
-        return None
+        return None, entity
+    каноническое = repo.resolve_name(entity)
+    if каноническое is None:
+        return (
+            f"сущность «{entity}» не найдена в индексе базы{_похожие_сущности(repo, entity)}",
+            entity,
+        )
+    return None, каноническое
+
+
+def _канонизировать_поле(repo: IndexRepository | None, ключ: str) -> tuple[str | None, str]:
+    """Сообщение отказа и канонический ключ `Сущность.Поле` по индексу — `(None, ключ)`, если
+    индекса нет вовсе (запись остаётся дословной) или и сущность, и поле нашлись. Имя поля
+    сравнивается с индексом уже точно (`field_names`) — канонизации в отличие от сущности не
+    требует, но входит в возвращаемый ключ, чтобы `set_field_class` получила ровно
+    `<каноническая сущность>.<поле>`, а не смесь регистров."""
+    if repo is None:
+        return None, ключ
     разбор = _разобрать_ключ_поля(ключ)
     if разбор is None:
-        return f"«{ключ}» не похоже на «Сущность.Поле»"
+        return f"«{ключ}» не похоже на «Сущность.Поле»", ключ
     сущность, поле = разбор
-    каноническое = repo.resolve_name(сущность)
-    if каноническое is None:
-        return f"сущность «{сущность}» не найдена в индексе базы{_похожие_сущности(repo, сущность)}"
+    ошибка, каноническое = _канонизировать_сущность(repo, сущность)
+    if ошибка:
+        return ошибка, ключ
     if поле not in repo.field_names(каноническое):
         похожие = difflib.get_close_matches(поле, repo.field_names(каноническое), n=3)
         подсказка = f" (похожие поля: {', '.join(похожие)})" if похожие else ""
-        return f"поле «{поле}» не найдено у сущности «{сущность}»{подсказка}"
-    return None
+        return f"поле «{поле}» не найдено у сущности «{сущность}»{подсказка}", ключ
+    return None, f"{каноническое}.{поле}"
 
 
 def _проверить_класс(cls: str, owner_data: dict) -> str | None:
-    """Сообщение отказа, если `cls` недопустим для `policy set`/`policy open`: не из `CLASSES`
-    (`gate/tokens.py`), не `scan` и не объявленный `custom:<имя>` (раздел `custom` файла
+    """Сообщение отказа, если `cls` недопустим для `policy set`/`policy open`: не из
+    `БАЗОВЫЕ_КЛАССЫ` (`gate/policy_check.py` — `CLASSES` из `gate/tokens.py` плюс `scan`, тот же
+    набор, что и `policy check`, задача 4) и не объявленный `custom:<имя>` (раздел `custom` файла
     владельца, `parse_owner_file(path)["custom"]`) — `None`, если класс годится."""
-    допустимые = _БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ | {
-        f"custom:{имя}" for имя in (owner_data.get("custom") or {})
-    }
+    допустимые = БАЗОВЫЕ_КЛАССЫ | {f"custom:{имя}" for имя in (owner_data.get("custom") or {})}
     if cls in допустимые:
         return None
-    перечень = ", ".join(sorted(_БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ))
+    перечень = ", ".join(sorted(БАЗОВЫЕ_КЛАССЫ))
     if cls.startswith("custom:"):
         return (
             f"класс «{cls}» не объявлен: нет раздела custom.{cls.split(':', 1)[1]} в файле "
@@ -548,12 +572,17 @@ def cmd_policy_hide(home: pathlib.Path, name: str, entity: str, yes: bool) -> in
     """`odata1c policy hide <база> <сущность> [--yes]` (задача 5 плана M2b, ADR-0015): закрыть
     сущность целиком — конструктор поверх `hide_entity` (`gate/policy_edit.py`).
 
-    Порядок: имя сущности проверяется по индексу (если он есть), при промахе — отказ с
-    подсказкой похожих имён и код 1, файл не трогается; иначе печатается число и первые 10
-    дочерних (`IndexRepository.descendants`, Ruling 30 — сам запрет распространяется на них при
-    чтении политики, не здесь) и, без `--yes`, спрашивается подтверждение (`input()`; любой
+    Порядок: имя сущности проверяется по индексу (если он есть) и приводится к каноническому
+    написанию (`_канонизировать_сущность` — иначе `catalog_контрагенты` легло бы в файл этим
+    написанием и не совпало бы точным сравнением `Policy.is_hidden`, находка ревью); при промахе
+    — отказ с подсказкой похожих имён и код 1, файл не трогается. Иначе печатается число и первые
+    10 дочерних (`IndexRepository.descendants`, Ruling 30 — сам запрет распространяется на них
+    при чтении политики, не здесь) и, без `--yes`, спрашивается подтверждение (`input()`; любой
     ответ, кроме `y`/`д`, — отказ без записи). После записи — находки `check_policy` (тем же
-    форматом, что `policy check`) и строка итога."""
+    форматом, что `policy check`) и строка итога.
+
+    Без индекса число дочерних неизвестно (не 0 — 0 было бы ложным утверждением, что их точно
+    нет): и вопрос подтверждения, и строка итога называют это прямо."""
     config = load_config(home)
     base = Registry(config).get(name, SessionScope())
     путь = _путь_политики_или_отказ(home, base.name)
@@ -562,34 +591,38 @@ def cmd_policy_hide(home: pathlib.Path, name: str, entity: str, yes: bool) -> in
 
     репозиторий = _открыть_индекс_для_политики(home, base.name)
     try:
-        if репозиторий is not None and репозиторий.resolve_name(entity) is None:
-            подсказка = _похожие_сущности(репозиторий, entity)
-            print(f"сущность «{entity}» не найдена в индексе базы{подсказка}")
+        ошибка, каноническое = _канонизировать_сущность(репозиторий, entity)
+        if ошибка:
+            print(ошибка)
             return 1
 
-        дочерние = репозиторий.descendants({entity}) if репозиторий is not None else set()
         if репозиторий is not None:
+            дочерние = репозиторий.descendants({каноническое})
             перечень = ", ".join(sorted(дочерние)[:10])
             хвост = f" и ещё {len(дочерние) - 10}" if len(дочерние) > 10 else ""
             if дочерние:
                 print(f"дочерних сущностей: {len(дочерние)} ({перечень}{хвост})")
             else:
                 print("дочерних сущностей: 0")
+            число_дочерних = str(len(дочерние))
+        else:
+            дочерние = set()
+            число_дочерних = "неизвестно сколько (нет индекса)"
 
         if not yes:
-            ответ = input(f"скрыть {entity} и {len(дочерние)} дочерних? [y/N] ").strip().lower()
-            if ответ not in ("y", "д"):
+            ответ = input(f"скрыть {каноническое} и {число_дочерних} дочерних? [y/N] ")
+            if ответ.strip().lower() not in ("y", "д"):
                 print("отменено")
                 return 1
 
-        изменено = hide_entity(путь, entity)
+        изменено = hide_entity(путь, каноническое)
         if not изменено:
-            print(f"сущность «{entity}» уже скрыта")
+            print(f"сущность «{каноническое}» уже скрыта")
             return 0
 
         находки = check_policy(путь, репозиторий)
         _напечатать_находки(находки)
-        print(f"скрыто: {entity} и {len(дочерние)} дочерних")
+        print(f"скрыто: {каноническое} и {число_дочерних} дочерних")
         return 0
     finally:
         if репозиторий is not None:
@@ -600,9 +633,12 @@ def _cmd_policy_записать_класс(
     home: pathlib.Path, name: str, field: str, cls: str, *, открытие: bool
 ) -> int:
     """Общая часть `policy open` (частный случай — класс всегда `keep`) и `policy set`
-    (произвольный класс): проверка класса, проверка поля по индексу, запись `set_field_class`,
-    находки `check_policy`, строка итога. `открытие` меняет только последнюю строку —
-    `открыто: <поле>` вместо `класс поля <поле>: <класс> (было: …)`."""
+    (произвольный класс): проверка класса, проверка и канонизация поля по индексу
+    (`_канонизировать_поле` — та же находка, что и у `cmd_policy_hide`: без приведения к
+    каноническому написанию правило `Catalog_x.ИНН` не совпало бы с точным сравнением
+    `Policy.sensitivity_of`), запись `set_field_class`, находки `check_policy`, строка итога.
+    `открытие` меняет только последнюю строку — `открыто: <поле>` вместо
+    `класс поля <поле>: <класс> (было: …)`."""
     config = load_config(home)
     base = Registry(config).get(name, SessionScope())
     путь = _путь_политики_или_отказ(home, base.name)
@@ -617,19 +653,19 @@ def _cmd_policy_записать_класс(
 
     репозиторий = _открыть_индекс_для_политики(home, base.name)
     try:
-        ошибка_поля = _проверить_поле_по_индексу(репозиторий, field)
+        ошибка_поля, каноническое_поле = _канонизировать_поле(репозиторий, field)
         if ошибка_поля:
             print(ошибка_поля)
             return 1
 
-        прежнее = set_field_class(путь, field, cls)
+        прежнее = set_field_class(путь, каноническое_поле, cls)
         находки = check_policy(путь, репозиторий)
         _напечатать_находки(находки)
         if открытие:
-            print(f"открыто: {field}")
+            print(f"открыто: {каноническое_поле}")
         else:
             было = прежнее if прежнее is not None else "авторазметка"
-            print(f"класс поля {field}: {cls} (было: {было})")
+            print(f"класс поля {каноническое_поле}: {cls} (было: {было})")
         return 0
     finally:
         if репозиторий is not None:
