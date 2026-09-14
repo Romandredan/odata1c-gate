@@ -14,6 +14,7 @@ from odata1c.gate.guard import Guard, GuardResult
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.tokens import TOKEN_RE
+from odata1c.tools.response import items_of
 
 СЕКРЕТ = "секрет-для-тестов-ровно-32-байта".encode()
 
@@ -444,3 +445,25 @@ def test_m5_находка_название_с_реквизитом_на_пут�
     ответ = _сквозь_гейт(врата_prod, данные["value"], набор)
 
     assert "Ромашка" not in ответ["items"][0]["Комментарий"]
+
+
+# --- M-7 (хвост M1d): служебный счётчик `odata.count` мимо раннего прохода ---------------------
+
+
+def test_m7_счётчик_inlinecount_не_подменяется_коротким_раскрытым(врата_prod):
+    """M-7 (хвост M1d). Раскрытое короткое значение (`КПП` из мусорных данных базы — «1») ищется
+    ранним проходом по границам, а кавычки JSON — граница: `"odata.count": "1"` подменялся токеном
+    ещё до `json.loads`, `int()` падал, тул отвечал `internal`.
+
+    Счётчик — служебное поле шлюза, а не данные 1С (SPEC §5.1: `odata.count` вырезается из
+    ответа), поэтому ранний проход его не касается. То же значение в ДАННЫХ строки по-прежнему
+    закрывается."""
+    набор = RevealedValues()
+    набор.add("1", token="[[kpp:AAAABBBBCC]]")
+    тело = '{"odata.metadata":"…","odata.count":"1","value":[{"КПП":"1","Код":"1"}]}'
+
+    разобрано = врата_prod.scrub_revealed_json(тело, набор)
+
+    записи, всего = items_of(разобрано)
+    assert всего == 1
+    assert записи[0]["КПП"] != "1"
