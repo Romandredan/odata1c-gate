@@ -114,8 +114,10 @@ _ИМЕНА_ФАЙЛОВ_ДОМА = [
     "launcher.key",
     "gate.sqlite",
     "gate.sqlite-wal",
+    "gate.sqlite-shm",  # находка M-1 (Ruling 68): -shm — часть той же базы SQLite в режиме WAL.
     "journal.sqlite",
     "journal.sqlite-wal",
+    "journal.sqlite-shm",  # находка M-1.
 ]
 
 _ТУЛЫ_И_ПОЛЯ = [
@@ -153,6 +155,31 @@ def test_multiedit_дома_deny(tmp_path):
 
     результат = _запустить(
         {"tool_name": "MultiEdit", "tool_input": {"file_path": str(путь)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    "написание",
+    [
+        "BASES.YAML",  # регистр (находка M-2, Ruling 68: сравнение без учёта регистра).
+        "bases.yaml.",  # хвостовая точка — NTFS открывает тот же файл, что и без неё.
+        "bases.yaml ",  # хвостовой пробел — то же самое.
+        "bases.yaml::$DATA",  # неименованный поток NTFS (Alternate Data Stream) того же файла.
+    ],
+)
+def test_иное_написание_имени_файла_deny(написание, tmp_path):
+    """Находка M-2: все четыре написания на NTFS открывают тот же файл `bases.yaml` (проверено
+    ревью экспериментально), а сравнение по точному совпадению строки их пропускало."""
+    дом = tmp_path / "odata1c"
+    путь = дом / написание
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь)}},
         env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
     )
 
@@ -207,19 +234,18 @@ def test_policy_и_recipes_разрешены(tmp_path):
         assert результат.stdout.strip() == "", путь
 
 
-def test_путь_posix_без_буквы_диска_deny_через_части_пути(tmp_path):
-    """Путь в стиле Git Bash (`/c/Users/...`, без буквы диска) — на Windows `abspath` разворачивает
-    его от текущего диска буквально (`/c` становится обычным каталогом `c`, а не буквой диска), так
-    что сравнение «путь начинается с дома» не совпадёт ни при каком `ODATA1C_HOME`. `ODATA1C_HOME`
-    здесь указывает на заведомо другой каталог (`_окружение`) — deny обязан держаться на запасном
-    случае `_внутри_дома_шлюза` (совпадение `odata1c` и `.claude` среди частей пути), а не на
-    первом. Без этого теста эта ветка кода ничем не подтверждена."""
+def test_grep_по_дому_с_pattern_и_output_mode_deny(tmp_path):
+    """Находка M-3, точная форма входа из текста ревью: `Grep` с `pattern="password"`,
+    `output_mode="content"` и `path` на весь дом — чтение содержимого `bases.yaml` с паролем
+    одним вызовом."""
+    дом = tmp_path / "odata1c"
+
     результат = _запустить(
         {
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/c/Users/u/.claude/odata1c/bases.yaml"},
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "password", "path": str(дом), "output_mode": "content"},
         },
-        env=_окружение(tmp_path),
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
     )
 
     решение = _решение(результат)
@@ -227,9 +253,224 @@ def test_путь_posix_без_буквы_диска_deny_через_части_
     assert решение["permissionDecision"] == "deny"
 
 
-# --- Правило 3: Bash --------------------------------------------------------------------
+def test_glob_по_дому_с_pattern_deny(tmp_path):
+    """Находка M-3, точная форма из ревью: `Glob` с `path` на весь дом и `pattern="**/*"` —
+    перечисление состава дома целиком, включая `launcher.key`. Остальные тесты этого раздела не
+    передают `pattern` вовсе — этот проверяет, что `deny` не зависит от его отсутствия."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Glob", "tool_input": {"path": str(дом), "pattern": "**/*"}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
 
 
+@pytest.mark.parametrize("тул", ["Grep", "Glob"])
+def test_grep_glob_по_дому_целиком_deny(тул, tmp_path):
+    """Находка M-3 (Ruling 72): один вызов `Grep`/`Glob` с путём на весь дом рекурсивно вычитывает
+    все защищённые файлы разом — дешевле, чем допущенный спецификацией `python -c`. `path` = сам
+    дом (без указания конкретного файла — базовое имя `odata1c` не входит в список защищённых
+    файлов, старое правило 2 такой путь пропускало)."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"path": str(дом)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", ["Grep", "Glob"])
+@pytest.mark.parametrize("предок", ["сам_дом", ".claude", "домашний_каталог_пользователя"])
+def test_grep_glob_по_предку_дома_deny(тул, предок, tmp_path):
+    """Находка M-3 (Ruling 72): предки дома (`~`, `~/.claude`, сам дом) — тоже `deny`, поскольку
+    поиск по ним рекурсивно заходит и в сам дом. Дом здесь не задан через `ODATA1C_HOME` — берётся
+    дефолт `~/.claude/odata1c` от управляемых `HOME`/`USERPROFILE`, чтобы получить все три уровня
+    предков одним и тем же способом."""
+    окружение = dict(os.environ)
+    for имя in _ПЕРЕМЕННЫЕ_КОДИРОВКИ:
+        окружение.pop(имя, None)
+    окружение.pop("ODATA1C_HOME", None)
+    окружение["HOME"] = str(tmp_path)
+    окружение["USERPROFILE"] = str(tmp_path)
+
+    путь_по_уровню = {
+        "сам_дом": tmp_path / ".claude" / "odata1c",
+        ".claude": tmp_path / ".claude",
+        "домашний_каталог_пользователя": tmp_path,
+    }[предок]
+
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"path": str(путь_по_уровню)}},
+        env=окружение,
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", ["Grep", "Glob"])
+@pytest.mark.parametrize("подкаталог", ["bases", "recipes", "logs"])
+def test_grep_glob_по_разрешённому_подкаталогу_разрешён(тул, подкаталог, tmp_path):
+    """Находка M-3, обратная сторона (Ruling 72): подкаталоги `bases/`, `recipes/`, `logs/`
+    разрешены явно — искать и обходить их можно, деньга не по всему дому, а по документированному
+    списку безопасных подкаталогов."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"path": str(дом / подкаталог)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_read_по_дому_целиком_не_денится_новым_правилом(tmp_path):
+    """Ruling 72 ограничивает новую директорийную проверку `Grep`/`Glob` — `Read` в матчере тоже
+    есть, но принимает путь к ОДНОМУ файлу, а не к каталогу; путь на весь дом ему не запрещён этим
+    новым правилом (базовое имя `odata1c` не входит в список защищённых файлов — и не должно,
+    иначе `Read` пришлось бы разбирать как каталог, а не как файл)."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(дом)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def _как_git_bash(путь: pathlib.Path) -> str:
+    """Тот же путь, что и `путь`, но записанный так, как его отдаёт Git Bash на Windows —
+    `/c/Users/...`, без буквы диска: `C:\\foo\\bar` → `/c/foo/bar`."""
+    текст = str(путь)
+    if len(текст) >= 2 and текст[1] == ":":
+        буква = текст[0].lower()
+        остаток = текст[2:].replace("\\", "/")
+        return f"/{буква}{остаток}"
+    return текст.replace("\\", "/")
+
+
+def test_путь_posix_без_буквы_диска_совпадает_с_домом_deny(tmp_path):
+    """Находка м-2 (ревью раунда 0 признано ненадёжным): прежняя защита этого случая держалась на
+    признаке «`odata1c` и `.claude` среди частей пути» — эвристике, которую ревью раунда 1
+    забраковало (она же и пропускала обходы, и ложно срабатывала). Замена — переписывание
+    Git Bash-пути в путь с буквой диска (`_переписать_posix_диск`) ещё до сравнения с домом:
+    здесь домашний каталог задан явно (`ODATA1C_HOME` = `дом`), а путь к тому же файлу написан в
+    POSIX-стиле Git Bash, без буквы диска — deny обязан сработать через переписывание, а не через
+    эвристику по частям пути, которой в коде раунда 1 больше нет."""
+    дом = tmp_path / "odata1c"
+    путь_windows = дом / "bases.yaml"
+    путь_posix = _как_git_bash(путь_windows)
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": путь_posix}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_дефолтный_дом_защищён_даже_при_другом_odata1c_home_deny(tmp_path):
+    """Находка м-2, защита «в оба конца» (Ruling: явный перечень домов = `ODATA1C_HOME` этой сессии
+    И, отдельно, документированный дефолт `~/.claude/odata1c`): сессия настроена на посторонний
+    `ODATA1C_HOME` (например, временный дом тестового прогона), но путь к НАСТОЯЩЕМУ дому владельца
+    по умолчанию обязан остаться закрытым независимо от того, на какую базу сконфигурирована именно
+    эта сессия хука."""
+    окружение = dict(os.environ)
+    for имя in _ПЕРЕМЕННЫЕ_КОДИРОВКИ:
+        окружение.pop(имя, None)
+    окружение["HOME"] = str(tmp_path)
+    окружение["USERPROFILE"] = str(tmp_path)
+    окружение["ODATA1C_HOME"] = str(tmp_path / "другой_настроенный_дом" / "odata1c")
+
+    путь_к_дефолтному_дому = tmp_path / ".claude" / "odata1c" / "bases.yaml"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь_к_дефолтному_дому)}},
+        env=окружение,
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_путь_репозитория_src_odata1c_больше_не_ложное_срабатывание(tmp_path):
+    """Находка м-2 (ложное срабатывание раунда 0): в этом же репозитории worktree-каталоги живут
+    в `.claude/worktrees/...`, а пакет — в `src/odata1c/`, поэтому старый признак «`odata1c` и
+    `.claude` среди частей пути» запрещал такой путь (`.../.claude/worktrees/<агент>/src/odata1c/
+    bases.yaml`), хотя к дому шлюза это отношения не имеет. Ни настроенный `ODATA1C_HOME`, ни
+    дефолт под этим путём не лежат — раунд 1 обязан отвечать молчанием, а не `deny`."""
+    окружение = dict(os.environ)
+    for имя in _ПЕРЕМЕННЫЕ_КОДИРОВКИ:
+        окружение.pop(имя, None)
+    окружение["HOME"] = str(tmp_path / "чужой_дефолтный_дом")
+    окружение["USERPROFILE"] = str(tmp_path / "чужой_дефолтный_дом")
+    окружение["ODATA1C_HOME"] = str(tmp_path / "рабочий_дом" / "odata1c")
+
+    путь_репозитория = (
+        tmp_path
+        / "репозиторий"
+        / ".claude"
+        / "worktrees"
+        / "агент"
+        / "src"
+        / "odata1c"
+        / "bases.yaml"
+    )
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь_репозитория)}},
+        env=окружение,
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_временный_дом_приёмки_вне_claude_не_защищён_известное_ограничение(tmp_path):
+    """Находка м-2, принятый остаточный пробел (задокументирован в design-doc §5): скрипты приёмки
+    (`m2_live_check.py`, `contact_info_live_check.py`) поднимают временный дом шлюза вне `.claude`
+    (например, `C:\\Temp\\...\\odata1c\\`), на который сессия хука не настроена через
+    `ODATA1C_HOME` — хуку неоткуда узнать об этом доме. Тест фиксирует текущее (ограниченное)
+    поведение, а не требует его починки: молчание здесь ожидаемо и осознанно, не регрессия."""
+    окружение = dict(os.environ)
+    for имя in _ПЕРЕМЕННЫЕ_КОДИРОВКИ:
+        окружение.pop(имя, None)
+    окружение["HOME"] = str(tmp_path / "рабочий_дефолтный_дом")
+    окружение["USERPROFILE"] = str(tmp_path / "рабочий_дефолтный_дом")
+    окружение["ODATA1C_HOME"] = str(tmp_path / "рабочий_дом" / "odata1c")
+
+    путь_временного_дома_приёмки = tmp_path / "temp_приёмки" / "odata1c" / "bases.yaml"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь_временного_дома_приёмки)}},
+        env=окружение,
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+# --- Правило 3: Bash / PowerShell ---------------------------------------------------------
+
+_КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ = ["Bash", "PowerShell"]  # находка м-3 (Ruling 68): оба — поле command.
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
 @pytest.mark.parametrize(
     "cmd",
     [
@@ -238,14 +479,14 @@ def test_путь_posix_без_буквы_диска_deny_через_части_
         "uv run odata1c reveal x",
         "sqlite3 /home/u/.claude/odata1c/gate.sqlite .dump",
         "type C:\\Users\\u\\.claude\\odata1c\\daemon.yaml",
-        # Имя переменной окружения в непроинтерполированной команде пишут заглавными буквами
-        # (`$ODATA1C_HOME`) — проверка «odata1c в команде» не должна требовать точного регистра.
+        # Раунд 1 больше не требует подстроки odata1c рядом с именем файла (Ruling 73) — имя
+        # переменной окружения регистром или её наличием вообще ни на что не влияет.
         "cat $ODATA1C_HOME/bases.yaml",
     ],
 )
-def test_bash_deny(cmd, tmp_path):
+def test_bash_deny(тул, cmd, tmp_path):
     результат = _запустить(
-        {"tool_name": "Bash", "tool_input": {"command": cmd}},
+        {"tool_name": тул, "tool_input": {"command": cmd}},
         env=_окружение(tmp_path),
     )
 
@@ -254,6 +495,51 @@ def test_bash_deny(cmd, tmp_path):
     assert решение["permissionDecision"] == "deny"
 
 
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.claude/odata1c/BASES.YAML",  # находка M-4: регистр имени файла (Ruling 73).
+        'odata1c.exe reveal "[[inn:1]]"',  # находка M-4: суффикс .exe (Windows).
+        "ODATA1C reveal x",  # находка M-4: регистр слова odata1c рядом с reveal.
+        "python -m odata1c reveal x",  # находка M-4: запуск модулем, не консольным скриптом.
+        # находка м-1: относительный путь после смены рабочего каталога.
+        "cd ~/.claude/odata1c && cat bases.yaml",
+        "cat gate.sqlite",  # находка м-1: имя без пути и без слова odata1c рядом вообще.
+        "cat launcher.key",  # находка м-1, то же для launcher.key.
+        # Ruling 73: принятое ложное срабатывание — grep ищет строку "bases.yaml" в чужом каталоге,
+        # но deny всё равно срабатывает, поскольку правило больше не проверяет соседство с odata1c.
+        "grep bases.yaml docs/",
+    ],
+)
+def test_bash_deny_раунд_1(тул, cmd, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_sqlite3_многострочный_deny(тул, tmp_path):
+    """Находка м-4: `sqlite3` и имя файла на разных строках одной команды — `.` в исходном
+    регулярном выражении не проходил через перевод строки без `re.DOTALL`."""
+    cmd = "sqlite3 \\\n  gate.sqlite .dump"
+
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
 @pytest.mark.parametrize(
     "cmd",
     [
@@ -263,9 +549,32 @@ def test_bash_deny(cmd, tmp_path):
         "grep gate_secret docs/",
     ],
 )
-def test_bash_разрешён(cmd, tmp_path):
+def test_bash_разрешён(тул, cmd, tmp_path):
     результат = _запустить(
-        {"tool_name": "Bash", "tool_input": {"command": cmd}},
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.claude/odata1c/bases.y*",
+        "cat ~/.claude/odata1c/*",
+        "powershell -c 'gc $env:ODATA1C_HOME\\*'",
+    ],
+)
+def test_bash_шаблон_оболочки_не_ловится_известное_ограничение(тул, cmd, tmp_path):
+    """Находка M-4 (Ruling 73 ограничивает правило тремя условиями осознанно, design-doc §5,
+    «Не покрыто намеренно»): команды с шаблонами оболочки, не называющие защищённый файл буквально
+    (`bases.y*`, голый `*`), ни одно из трёх условий не ловит. Тест фиксирует текущее (ограниченное)
+    поведение как осознанно принятое, а не как регрессию."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
         env=_окружение(tmp_path),
     )
 

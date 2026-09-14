@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__plugin_odata1c_gate__odata1c_commit|mcp__odata1c__odata1c_commit|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob|Bash",
+        "matcher": "mcp__plugin_odata1c_gate__odata1c_commit|mcp__odata1c__odata1c_commit|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob|Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
