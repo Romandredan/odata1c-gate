@@ -222,18 +222,13 @@ Environment `pypi` должен существовать и в настройк�
 рецепты и одно дело на сохранение рецепта. Они ходят в живую базу 1С, поэтому в CI не входят —
 прогон делается в приёмке и перед выпуском:
 
-```text
-uv run python tools/plugin_dev_copy.py
-claude plugin eval build/plugin-dev --mocks off --trust-plugin --runs 1 --ablation none \
-  --allow-tools Skill "mcp__plugin_odata1c_gate__odata1c_bases" "mcp__plugin_odata1c_gate__odata1c_find_entity" \
-  "mcp__plugin_odata1c_gate__odata1c_describe_entity" "mcp__plugin_odata1c_gate__odata1c_query" \
-  "mcp__plugin_odata1c_gate__odata1c_get" "mcp__plugin_odata1c_gate__odata1c_info" \
-  "mcp__plugin_odata1c_gate__odata1c_recipe" Write "Bash(odata1c recipe check *)" "Bash(uv run odata1c recipe check *)" \
-  --json build/evals.json
-```
+Точная команда прогона — в `plugin/evals/README.md` (единственный источник: флаги меняются вместе
+с делами). Два флага обязательны всегда: `--no-publish` (иначе отчёт с ответами модели, включая
+подписи баз из `bases.yaml`, публикуется на claude.ai) и `--mocks off` с перечнем разрешённых тулов
+чтения в `--allow-tools`; команда доступна за флагом окружения `CLAUDE_CODE_WALNUT_SPIRE=1`.
 
-`tools/plugin_dev_copy.py` делает копию плагина в `build/plugin-dev`, указывающую на локально
-собранное колесо, — так evals проверяют ещё не опубликованную версию. Порог: пройдены все дела и
+`tools/plugin_dev_copy.py` делает копию плагина в `build/plugin-dev`, указывающую на рабочую
+копию репозитория (`uv run --directory …`), — так evals проверяют ещё не опубликованную версию. Порог: пройдены все дела и
 ни одного реального значения защищаемых классов в ответах. Дело сохранения рецепта пишет один файл
 в библиотеку рецептов домашнего каталога — после прогона его удаляют.
 

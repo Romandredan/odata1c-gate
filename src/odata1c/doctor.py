@@ -394,7 +394,7 @@ def _check_daemon(port: int, connect: Callable[[int], str | None]) -> Check:
         return Check(
             "демон",
             "FAIL",
-            f"версия демона {версия} не совпадает с версией пакета {__version__}; "
+            f"версия демона {версия or 'неизвестна'} не совпадает с версией пакета {__version__}; "
             "после обновления выполните odata1c daemon stop",
         )
     return Check("демон", "OK", f"порт {port}, версия {версия}")

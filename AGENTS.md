@@ -140,7 +140,7 @@ SPEC §13. Пока этап не закрыт, часть описанного 
 - `.claude-plugin/marketplace.json` — маркетплейс с одним плагином `odata1c`, источник `./plugin`;
   по нему работает `claude plugin marketplace add`.
 - `tools/` — `bump_version.py` (переписать версию во всех четырёх местах поставки),
-  `plugin_dev_copy.py` (дев-копия плагина на локально собранное колесо, для evals),
+  `plugin_dev_copy.py` (дев-копия плагина на рабочую копию репозитория, `uv run --directory …`, для evals),
   `probes/` (скрипты технических проверок и приёмок на живой базе).
 - `.github/workflows/` — `ci.yml` (Windows и Ubuntu, Python 3.12 и 3.13) и `publish.yml`
   (выпуск на PyPI по тегу `v<версия>` через trusted publishing).

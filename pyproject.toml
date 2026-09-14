@@ -55,7 +55,10 @@ path = "src/odata1c/__about__.py"
 packages = ["src/odata1c"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["tools/probes", "docs/probes", "tests/fixtures/edmx/*.full.edmx"]
+# Только исходники и документы поставки: рабочие копии агентов (.claude/worktrees), журналы SDD,
+# полные дампы $metadata и результаты evals в архив не попадают (итоговое ревью M3, M-2).
+only-include = ["src", "tests", "README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
+exclude = ["tests/fixtures/edmx/*.full.edmx", "**/__pycache__"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

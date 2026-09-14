@@ -17,7 +17,8 @@ import shutil
 
 def dev_copy(plugin_dir: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
     """Скопировать `plugin_dir` в `out` и заменить в копии `.mcp.json` на локальный запуск."""
-    shutil.copytree(plugin_dir, out, dirs_exist_ok=True)
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.copytree(plugin_dir, out, ignore=shutil.ignore_patterns("results"))
 
     корень_репозитория = plugin_dir.resolve().parent
     mcp_json = {
