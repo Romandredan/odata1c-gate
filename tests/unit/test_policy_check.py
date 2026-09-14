@@ -245,6 +245,69 @@ def test_нестроковый_элемент_mask_for_даёт_policyerror(tmp
         parse_owner_file(путь)
 
 
+# --- ревью задачи 4, повторный проход (Important) ------------------------------------------
+
+
+def test_mask_for_не_список_даёт_policyerror_у_parse_owner_file(tmp_path):
+    """Находка 3 повторного ревью задачи 4 (Important): в отличие от `names_for`
+    (`isinstance(..., list)` проверялся до итерации), у `defaults.addr.mask_for` проверки типа
+    контейнера не было вовсе — `mask_for: 5` итерировался бы как число, `TypeError: 'int' object
+    is not iterable` вместо честной `PolicyError`."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\ndefaults:\n  addr:\n    mask_for: 5\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError) as ошибка:
+        parse_owner_file(путь)
+
+    assert ошибка.value.code == "policy_invalid"
+    assert "mask_for" in str(ошибка.value)
+
+
+def test_mask_for_не_список_даёт_policyerror_у_check_policy(tmp_path, индекс_ut):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\ndefaults:\n  addr:\n    mask_for: 5\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError):
+        check_policy(путь, индекс_ut)
+
+
+def test_нестроковый_ключ_сообщение_не_цитирует_значение(tmp_path):
+    """Находка 4 повторного ревью задачи 4 (Important): сообщение называет тип и порядковый
+    номер записи в разделе, а не буквальное значение ключа/элемента — тот же принцип, что у
+    `_разобрать_yaml` (файл не цитируется) и у соседней `_проверить_тип_раздела` (печатает
+    только тип)."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        "version: 2\nfields:\n  Catalog_Контрагенты.ИНН: inn\n  123: keep\n", encoding="utf-8"
+    )
+
+    with pytest.raises(PolicyError) as ошибка:
+        parse_owner_file(путь)
+
+    сообщение = str(ошибка.value)
+    assert "123" not in сообщение  # само значение ключа не процитировано
+    assert "fields" in сообщение
+    assert "2-й записи" in сообщение  # позиция по порядку в разделе
+    assert "int" in сообщение  # тип вместо значения
+
+
+def test_нестроковый_элемент_списка_сообщение_не_цитирует_значение(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        "version: 2\nnames_for: [Catalog_Контрагенты, 42]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PolicyError) as ошибка:
+        parse_owner_file(путь)
+
+    сообщение = str(ошибка.value)
+    assert "42" not in сообщение
+    assert "names_for" in сообщение
+    assert "2-й записи" in сообщение
+    assert "int" in сообщение
+
+
 def test_render_effective_скрывает_строку_потомка_независимо_от_names_visible(tmp_path):
     """Находка 1 ревью задачи 4 (Important): `render_effective` больше не пересчитывает набор
     скрытых сама (из `policy.hidden_entities()` и необязательного `repo`) — полный набор
