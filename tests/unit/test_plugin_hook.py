@@ -188,6 +188,107 @@ def test_иное_написание_имени_файла_deny(написани
     assert решение["permissionDecision"] == "deny"
 
 
+@pytest.mark.parametrize(
+    "написание",
+    [
+        "bases.yaml.bak-adr15",
+        "daemon.yaml.bak-before-ttl-1800",
+        "gate.sqlite.bak-20260913-final.sqlite",
+        "journal.sqlite-wal",
+        "bases.yaml.bak",
+        "bases.yaml.orig",
+        "launcher.key.bak",
+    ],
+)
+def test_резервная_копия_защищённого_файла_deny(написание, tmp_path):
+    """Ruling 85 (раунд 3, повторное ревью, находка M2-1): защищённое имя сравнивается как
+    ПРЕФИКС, без учёта регистра — резервные копии, которые владелец и скрипты этапов M2/ADR-0015
+    реально оставляют рядом с рабочим файлом (`bases.yaml.bak-adr15` в доме владельца — ревьюер
+    проверил не гипотетически, файл там лежит), больше не проходят молчанием. Явные `-wal`/`-shm`
+    в списке защищённых имён стали не нужны — тот же префикс их уже покрывает без отдельной
+    записи (`journal.sqlite-wal` в списке выше — тому доказательство)."""
+    дом = tmp_path / "odata1c"
+    путь = дом / написание
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_резервная_копия_через_grep_deny(tmp_path):
+    """Ruling 85: та же префиксная проверка действует в общей ветке правила 2 — не только у
+    `Read`, но и у `Grep`/`Glob` через поле `path`."""
+    дом = tmp_path / "odata1c"
+    путь = дом / "daemon.yaml.bak-before-ttl-1800"
+
+    результат = _запустить(
+        {"tool_name": "Grep", "tool_input": {"path": str(путь)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_bases_example_yaml_не_защищённое_имя_разрешён(tmp_path):
+    """Ruling 85, регрессия: префиксная проверка не должна расшириться на `bases.example.yaml`
+    (документированный шаблон поставки, не рабочий файл владельца) — имя расходится с
+    `bases.yaml` уже на седьмом символе (`e` вместо `y`), а не продолжает его точкой/дефисом."""
+    дом = tmp_path / "odata1c"
+    путь = дом / "bases.example.yaml"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": str(путь)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("префикс", ["\\\\?\\", "\\\\.\\"])
+def test_unc_префикс_снимается_deny(префикс, tmp_path):
+    """Minor (раунд 3, повторное ревью, находка м2-1): докстрока `_нормализовать_путь` с раунда 1
+    обещала независимость от UNC-формы (`\\\\?\\...`), но фактически ничего с ней не делала —
+    `os.path.realpath` такую строку не разбирает как букву диска, и сравнение с домом не совпадало
+    ни при каком `ODATA1C_HOME`. Правило 3 (Bash) ту же строку ловит по имени файла — асимметрия,
+    как и в M2-1."""
+    дом = tmp_path / "odata1c"
+    путь = дом / "bases.yaml"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": префикс + str(путь)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_unc_расширенный_сетевой_путь_разворачивается_deny(tmp_path):
+    """Minor: `\\\\?\\UNC\\сервер\\ресурс\\...` — расширенная форма сетевого пути, должна
+    развернуться в обычные `\\\\сервер\\ресурс\\...`, а не остаться нераспознанной строкой,
+    которая никогда не совпадёт с домом."""
+    дом_unc = "\\\\?\\UNC\\server\\share\\odata1c"
+    обычный_дом = "\\\\server\\share\\odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Read", "tool_input": {"file_path": дом_unc + "\\bases.yaml"}},
+        env=_окружение(tmp_path, ODATA1C_HOME=обычный_дом),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
 def test_путь_с_тильдой_и_обратными_косыми_deny(tmp_path):
     """`ODATA1C_HOME` не задан вовсе — дом берётся по умолчанию (`~/.claude/odata1c`), а путь из
     события написан в стиле Windows-команды (`~\\...`), а не как отдаёт его сам Claude Code
@@ -343,6 +444,110 @@ def test_read_по_дому_целиком_не_денится_новым_пра
 
     результат = _запустить(
         {"tool_name": "Read", "tool_input": {"file_path": str(дом)}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+# --- Ruling 86 (раунд 3, находка M2-2): Glob — поле pattern наравне с path --------------------
+
+
+def test_glob_pattern_абсолютный_на_дом_deny(tmp_path):
+    """Ruling 86: `pattern` — обязательный аргумент `Glob`, `path` — нет; абсолютный шаблон,
+    указывающий в дом целиком, обходил правило 2/Ruling 72 полностью, потому что проверялся
+    только `path` (проверено настоящим инструментом `Glob` в повторном ревью — 11 путей, включая
+    `bases.yaml.bak-adr15`)."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Glob", "tool_input": {"pattern": str(дом).replace("\\", "/") + "/*"}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("хвост", ["**/*", "*.yaml*"])
+def test_glob_pattern_абсолютный_рекурсивный_deny(хвост, tmp_path):
+    """Ruling 86: та же проверка для `**/*` (рекурсивный обход всего дома) и `*.yaml*` (маска, с
+    которой повторное ревью проверило настоящий инструмент)."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Glob", "tool_input": {"pattern": str(дом).replace("\\", "/") + "/" + хвост}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_glob_pattern_защищённое_имя_deny(tmp_path):
+    """Ruling 86: шаблон, называющий защищённое имя напрямую (`<дом>/bases.yaml`, без единого
+    символа шаблона) — тоже `deny`, тем же правилом, что и у Bash/PowerShell."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {"tool_name": "Glob", "tool_input": {"pattern": str(дом / "bases.yaml")}},
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+def test_glob_pattern_абсолютный_разрешённый_подкаталог_разрешён(tmp_path):
+    """Ruling 86, обратная сторона: абсолютный шаблон в разрешённый подкаталог (`recipes/`) без
+    защищённого имени — каталог шаблона не совпадает ни с домом, ни с его предком."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {
+            "tool_name": "Glob",
+            "tool_input": {"pattern": str(дом / "recipes").replace("\\", "/") + "/*.yaml"},
+        },
+        env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_glob_pattern_относительный_вне_дома_разрешён(tmp_path):
+    """Ruling 86, буквальный текст решения контроллера: «относительный шаблон при `path` вне
+    дома — разрешён»."""
+    результат = _запустить(
+        {
+            "tool_name": "Glob",
+            "tool_input": {"pattern": "*.yaml", "path": str(tmp_path / "проект")},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_glob_pattern_относительный_с_выходом_из_подкаталога_известное_ограничение(tmp_path):
+    """Известное ограничение (раздел «Обходы...» докстроки скрипта и отчёт задачи, раунд 3):
+    относительный шаблон (`../*.yaml`) при `path` = разрешённый подкаталог (`recipes`) заходит
+    обратно в дом через `..`, не называя защищённое имя явно и не будучи абсолютным сам по себе —
+    буквальный текст Ruling 86 эту комбинацию не покрывает (находка M2-2 повторного ревью,
+    «попроще форма»). Тест фиксирует границу как утверждение о поведении, а не как случайно
+    прошедшее молчание."""
+    дом = tmp_path / "odata1c"
+
+    результат = _запустить(
+        {
+            "tool_name": "Glob",
+            "tool_input": {"pattern": "../*.yaml", "path": str(дом / "recipes")},
+        },
         env=_окружение(tmp_path, ODATA1C_HOME=str(дом)),
     )
 
@@ -543,6 +748,31 @@ def test_bash_sqlite3_многострочный_deny(тул, tmp_path):
 @pytest.mark.parametrize(
     "cmd",
     [
+        "cat ~/.claude/odata1c/bases.yaml.bak-adr15",
+        "type daemon.yaml.bak-before-ttl-1800",
+        "cp gate.sqlite.bak-20260913-final.sqlite /tmp/x",
+    ],
+)
+def test_bash_резервная_копия_deny(тул, cmd, tmp_path):
+    """Ruling 85 (раунд 3): правило 3 уже ловило резервные копии защищённых файлов до этого
+    раунда — граница слова (`\\b`) сразу после базового имени срабатывает на точке или дефисе
+    хвоста (находка M2-1 повторного ревью проверила это экспериментально: «правило 3 эти же имена
+    ловит»). Тест фиксирует поведение явно, отдельной проверкой, а не оставляет его непроверенным
+    побочным эффектом общего списка."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+@pytest.mark.parametrize(
+    "cmd",
+    [
         "odata1c policy show trade_dev",
         "odata1c recipe check ut",
         "cat README.md",
@@ -633,6 +863,174 @@ def test_bash_шаблон_без_упоминания_дома_разрешён
     срабатывает, само по себе наличие `*`/`?` в команде ничего не значит."""
     результат = _запустить(
         {"tool_name": тул, "tool_input": {"command": "ls /some/other/dir/*"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+# --- Ruling 87 (раунд 3, находка M2-3): фигурные/квадратные скобки как символ шаблона ---------
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_раскрытие_фигурных_скобок_в_доме_deny(тул, tmp_path):
+    """Ruling 87: `{bases,daemon}.yaml` — раскрытие скобок оболочки, тот же приём обхода, что и
+    `bases.y*`, но Ruling 77 (раунд 2) проверяла только `*`/`?` и его не ловила."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "cat ~/.claude/odata1c/{bases,daemon}.yaml"}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+    assert решение["permissionDecisionReason"] == (
+        "шаблон в каталоге шлюза может задеть файлы с паролями"
+    )
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_квадратный_набор_символов_в_доме_deny(тул, tmp_path):
+    """Ruling 87: `[bd]ases.yaml` — набор символов оболочки/глоба, тот же приём обхода."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "cat ~/.claude/odata1c/[bd]ases.yaml"}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_фигурные_скобки_подстановки_переменной_разрешён(тул, tmp_path):
+    """Ruling 87, ловушка наивной правки — находка M2-3, которую нашло повторное ревью:
+    `${ODATA1C_HOME}` содержит `{`/`}` из-за самой подстановки переменной, без запятой внутри —
+    ЭТО НЕ раскрытие скобок и должно остаться разрешено. Проверяет, что признак — запятая внутри
+    скобок, а не одно присутствие `{`/`}`."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "cat ${ODATA1C_HOME}/recipes/ut.yaml"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+# --- Ruling 88 (раунд 3, находка M2-4): массовое чтение дома без символа шаблона ---------------
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "Get-ChildItem $env:ODATA1C_HOME | Get-Content",
+        "Get-ChildItem ~\\.claude\\odata1c -Recurse | Get-Content",
+        "cat ~/.claude/odata1c",
+        "ls ~/.claude/odata1c",
+        "ls ~/.claude/odata1c/",
+        "ls $ODATA1C_HOME",
+        "tar czf x.tgz ~/.claude/odata1c",
+        "cp -r ~/.claude/odata1c /tmp/x",
+    ],
+)
+def test_bash_массовое_чтение_дома_deny(тул, cmd, tmp_path):
+    """Ruling 88 (раунд 3, находка M2-4): путь дома шлюза упомянут КАК КОРЕНЬ (не разрешённый
+    подкаталог) вместе с глаголом чтения/перечисления/копирования/архивации — дешевле даже
+    символа шаблона (Ruling 77/87). Часть форм здесь (`ls ~/.claude/odata1c/` без хвоста, `cp -r`,
+    `tar czf`) раньше была принятым молчанием (её же З-1 повторного ревью прямо называет
+    задокументированной границей, а не находкой) — Ruling 88 намеренно закрывает и её, не только
+    PowerShell-конвейер из исходного текста находки M2-4: список глаголов, который дал контроллер,
+    прямо включает копирование и архивацию."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+    assert решение["permissionDecisionReason"] == (
+        "чтение каталога шлюза целиком может задеть файлы с паролями"
+    )
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ls ~/.claude/odata1c/recipes/ut",
+        "cat ${ODATA1C_HOME}/recipes/ut.yaml",
+        "Get-ChildItem $env:ODATA1C_HOME/bases",
+        "cat ~/.claude/odata1c/logs/daemon.log",
+    ],
+)
+def test_bash_массовое_чтение_разрешённого_подкаталога_разрешён(тул, cmd, tmp_path):
+    """Ruling 88, обратная сторона: разрешённые подкаталоги (`recipes`, `bases`, `logs`) остаются
+    разрешены даже с глаголом чтения/перечисления — правило денит только КОРЕНЬ дома, не сами эти
+    подкаталоги."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": cmd}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_массовое_чтение_дефолтного_дома_deny_и_подкаталог_разрешён(тул, tmp_path):
+    """Ruling 88, дефолтный дом (`ODATA1C_HOME` не задан вовсе): все остальные тесты этого раздела
+    задают `ODATA1C_HOME` явно (через `_окружение`), поэтому `_домашние_формы` всегда добавляет
+    ФАКТИЧЕСКОЕ значение переменной как отдельную альтернативу регулярного выражения — с
+    дефолтным домом это не проверено ни разу, а `str(home)` в этом случае — путь через `~`,
+    другая ветка сборки альтернатив. Проверяет обе стороны разом: подкаталог `recipes` остаётся
+    разрешён, бare-каталог — `deny`."""
+    окружение = dict(os.environ)
+    for имя in _ПЕРЕМЕННЫЕ_КОДИРОВКИ:
+        окружение.pop(имя, None)
+    окружение.pop("ODATA1C_HOME", None)
+    окружение["HOME"] = str(tmp_path)
+    окружение["USERPROFILE"] = str(tmp_path)
+
+    разрешено = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "ls ~/.claude/odata1c/recipes/ut"}},
+        env=окружение,
+    )
+    assert разрешено.returncode == 0
+    assert разрешено.stdout.strip() == ""
+
+    denied = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "ls ~/.claude/odata1c/"}},
+        env=окружение,
+    )
+    решение = _решение(denied)
+    assert решение is not None
+    assert решение["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_odata1c_doctor_разрешён(тул, tmp_path):
+    """Ruling 88, пример из текста решения контроллера: `odata1c doctor` не упоминает путь дома
+    ни в одной форме (это имя CLI-команды, а не `.claude/odata1c`/`ODATA1C_HOME`) — остаётся
+    разрешён."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "odata1c doctor"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("тул", _КОМАНДНЫЕ_ТУЛЫ_ДЛЯ_ТЕСТОВ)
+def test_bash_echo_дома_без_глагола_разрешён(тул, tmp_path):
+    """Ruling 88: `echo $ODATA1C_HOME` упоминает дом как корень, но `echo` не входит в список
+    глаголов чтения/перечисления/копирования/архивации — печать самого пути, не его содержимого,
+    остаётся разрешена."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "echo $ODATA1C_HOME"}},
         env=_окружение(tmp_path),
     )
 
