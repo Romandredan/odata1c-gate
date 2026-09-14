@@ -1,0 +1,17 @@
+{
+  "description": "odata1c: подтверждение записи в 1С и запрет чтения файлов шлюза с паролями и реальными значениями",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_odata1c_gate__odata1c_commit|mcp__odata1c__odata1c_commit|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
