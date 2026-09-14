@@ -1635,6 +1635,22 @@ def _интерпретатор_без_консоли() -> str:
     return sys.executable
 
 
+# Процессы, отделённые запасным путём Windows (`CreateProcess`). Ждать их нельзя и не нужно —
+# демон переживает лаунчер намеренно, — но `Popen` без выставленного кода возврата при сборке
+# мусора сообщает `ResourceWarning: subprocess … is still running`. В работе это мусор в журнале
+# запуска; в прогоне тестов при `filterwarnings = ["error"]` — ошибка ПОСТОРОННЕГО теста, к
+# которому подошла сборка мусора, и понять по ней причину невозможно. Поэтому ссылка живёт,
+# пока жив сам процесс: финализатору не на чем сработать.
+_ОТДЕЛЁННЫЕ: list[subprocess.Popen] = []
+
+
+def _не_терять_ссылку(процесс: subprocess.Popen) -> None:
+    """Запомнить отделённый процесс, отсеяв те, что уже завершились (их `poll` выставил код
+    возврата — финализатору такого `Popen` сообщать не о чем)."""
+    _ОТДЕЛЁННЫЕ[:] = [п for п in _ОТДЕЛЁННЫЕ if п.poll() is None]
+    _ОТДЕЛЁННЫЕ.append(процесс)
+
+
 def spawn_detached(home: pathlib.Path, port: int) -> None:
     """Запустить `pythonw -X utf8 -m odata1c daemon --foreground --home …` отдельным процессом, не
     привязанным к текущей консоли/сессии — переживает завершение лаунчера, который его породил.
@@ -1695,14 +1711,16 @@ def spawn_detached(home: pathlib.Path, port: int) -> None:
         # документирован как игнорируемый вместе с `DETACHED_PROCESS` и только для консольных
         # приложений.
         with open(журнал, "ab") as поток:
-            subprocess.Popen(
-                аргументы,
-                stdout=поток,
-                stderr=поток,
-                stdin=subprocess.DEVNULL,
-                env=окружение,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
+            _не_терять_ссылку(
+                subprocess.Popen(
+                    аргументы,
+                    stdout=поток,
+                    stderr=поток,
+                    stdin=subprocess.DEVNULL,
+                    env=окружение,
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                )
             )
         return
 

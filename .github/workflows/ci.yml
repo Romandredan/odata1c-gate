@@ -25,7 +25,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Windows-исполнитель втрое медленнее машины владельца: полный набор занимает там 20–23 мин
+    # против 7 (замер прогона 34836145166). Запас — чтобы прогон падал на тестах, а не по времени.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

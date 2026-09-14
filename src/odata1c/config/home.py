@@ -17,6 +17,15 @@ import sys
 
 SUBDIRS = ("bases", "logs")
 
+# `icacls` — консольная утилита, и у консольного процесса, запущенного из процесса БЕЗ консоли,
+# Windows заводит свою: вместе с ней на экране владельца появляется окно. Демон поднимается
+# оконным интерпретатором (`pythonw.exe`, см. `daemon._интерпретатор_без_консоли`) и при старте
+# закрывает права домашнего каталога — то есть зовёт `icacls`. Найдено прогоном ci на
+# windows-latest: сторож окон консоли (`tests/integration/test_no_console_window.py`) увидел
+# окно `CASCADIA_HOSTING_WINDOW_CLASS: …\icacls.exe`. `CREATE_NO_WINDOW` — как раз для
+# консольного дочернего процесса, которому консоль не нужна.
+_БЕЗ_ОКНА = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 @dataclasses.dataclass(slots=True)
 class HomeStatus:
@@ -71,6 +80,7 @@ def _narrow_permissions(path: pathlib.Path) -> tuple[bool, str | None]:
                 check=True,
                 capture_output=True,
                 text=False,
+                creationflags=_БЕЗ_ОКНА,
             )
         except subprocess.CalledProcessError as exc:
             сырой_вывод = exc.stderr or exc.stdout or b""
@@ -108,7 +118,11 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
     if sys.platform == "win32":
         try:
             raw = subprocess.run(
-                ["icacls", str(path)], check=True, capture_output=True, text=False
+                ["icacls", str(path)],
+                check=True,
+                capture_output=True,
+                text=False,
+                creationflags=_БЕЗ_ОКНА,
             ).stdout
         except (OSError, subprocess.CalledProcessError) as exc:
             return f"не удалось проверить права на {path}: {exc}"
@@ -126,9 +140,13 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
             line = line.strip()
             if not line or "Successfully processed" in line or "Failed processing" in line:
                 continue
-            # Первая непустая строка может содержать путь и запись
-            if i == 0 and line.startswith(path_str):
-                remainder = line[len(path_str) :].strip()
+            # Первая непустая строка может содержать путь и запись. Путь с неё снимается
+            # ОБЯЗАТЕЛЬНО и без учёта регистра: в нём почти всегда стоит имя пользователя
+            # (`C:\Users\<имя>\…`), а имя пользователя ниже — признак «запись своя». Оставленный
+            # путь делал бы своей ЛЮБУЮ запись с первой строки, включая настоящий широкий доступ.
+            if i == 0:
+                начало = line.lower().find(path_str.lower())
+                remainder = line[начало + len(path_str) :].strip() if начало != -1 else line
                 if remainder and ":" in remainder:
                     acl_entries.append(remainder)
             elif ":" in line:
@@ -143,6 +161,14 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
             and "NT AUTHORITY\\СИСТЕМА" not in entry  # SYSTEM на локализованной (ru-RU) Windows
             and "BUILTIN\\Администраторы" not in entry
             and "BUILTIN\\Administrators" not in entry
+            # `OWNER RIGHTS` (S-1-3-4) — не учётная запись, а права ВЛАДЕЛЬЦА объекта, то есть
+            # текущего пользователя; отдельным ACE их обычно наоборот ограничивают. Встречается
+            # во временных каталогах исполнителей GitHub Actions (найдено прогоном ci на
+            # windows-latest: там эта запись есть у каждого каталога под TEMP). Оба написания
+            # проверены `icacls` вживую: английское — на исполнителе, русское — на машине
+            # владельца (`ПРАВА ВЛАДЕЛЬЦА`).
+            and "OWNER RIGHTS" not in entry
+            and "ПРАВА ВЛАДЕЛЬЦА" not in entry
         ]
         if others:
             return f"{path} доступен другим учётным записям: {'; '.join(others)}"

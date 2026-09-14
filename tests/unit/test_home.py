@@ -7,7 +7,13 @@ import sys
 
 import pytest
 
-from odata1c.config.home import base_dir, check_file_permissions, ensure_home, resolve_home
+from odata1c.config.home import (
+    _консольная_кодировка,
+    base_dir,
+    check_file_permissions,
+    ensure_home,
+    resolve_home,
+)
 
 
 def test_явный_путь_главнее_переменной_окружения(tmp_path, monkeypatch):
@@ -103,6 +109,15 @@ def test_check_file_permissions_кодировка_читаема_и_систе�
         check=True,
         capture_output=True,
     )
+    # Предмет проверки — русские имена групп в выводе icacls: на Windows с другим языком
+    # интерфейса (исполнитель GitHub Actions — английский) их там нет вовсе, портиться нечему, и
+    # утверждения ниже проверяли бы не тот механизм, а раскладку чужой системы. Условие берётся с
+    # самого вывода, а не с кодовой страницы: страница — лишь косвенный признак языка имён.
+    сырой = subprocess.run(
+        ["icacls", str(test_dir)], check=True, capture_output=True
+    ).stdout.decode(_консольная_кодировка(), errors="replace")
+    if not any("А" <= символ <= "я" for символ in сырой):
+        pytest.skip("имена групп в выводе icacls не русские — проверять кодировку не на чем")
 
     warning = check_file_permissions(test_dir)
 
