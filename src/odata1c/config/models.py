@@ -68,12 +68,19 @@ class BaseConfig(BaseModel):
     gate: GateSettings = Field(default_factory=GateSettings)
     recipes: str | None = None
 
+    # Оба валидатора называют поле и правило, но НЕ повторяют полученное значение (находка 3
+    # ревью задачи 6 плана M2b). Текст `ValidationError` доходит до модели: `bases.yaml`
+    # перечитывается на ходу (SPEC §3.1, поправка 2026-09-14), и файл, не прошедший проверку,
+    # закрывает тулы отказом `config_invalid` с этим текстом внутри. Значение из файла в таком
+    # отказе — содержимое файла настроек в ответе MCP; правило же владельцу и объясняет, что
+    # чинить, а своё написание он видит в самом файле (и в терминале, если ошибся в `base add`).
+
     @field_validator("name")
     @classmethod
     def _проверить_имя(cls, value: str) -> str:
         if not ИМЯ_БАЗЫ.match(value):
             raise ValueError(
-                f"имя базы «{value}» не подходит: допустимы строчные латинские буквы, "
+                "имя базы не подходит: допустимы строчные латинские буквы, "
                 "цифры и подчёркивание, до 32 символов"
             )
         return value
@@ -82,9 +89,7 @@ class BaseConfig(BaseModel):
     @classmethod
     def _проверить_url(cls, value: str) -> str:
         if not value.endswith(ОКОНЧАНИЕ_URL):
-            raise ValueError(
-                f"адрес базы должен оканчиваться на {ОКОНЧАНИЕ_URL}, получено «{value}»"
-            )
+            raise ValueError(f"адрес базы должен оканчиваться на {ОКОНЧАНИЕ_URL}")
         return value
 
 

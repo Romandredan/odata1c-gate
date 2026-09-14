@@ -96,6 +96,32 @@ def apply_role(role: str, raw: dict) -> dict:
 
 
 def load_config(home: pathlib.Path) -> AppConfig:
+    _проверить_дом(home)
+    warnings: list[str] = []
+    daemon = _load_daemon(home, warnings)
+    return _собрать(home, daemon, warnings)
+
+
+def reload_bases(home: pathlib.Path, daemon: DaemonConfig) -> AppConfig:
+    """Перечитать ТОЛЬКО `bases.yaml`, оставив уже прочитанный раздел `daemon` (SPEC §3.1,
+    поправка 2026-09-14, ADR-0015): без перезапуска демона действует один этот файл.
+
+    `daemon.yaml` здесь не открывается вовсе — и это не экономия, а правило (находка 1 ревью
+    задачи 6). `load_config` читает его первым и падает на его ошибке; демон, который зовёт
+    `load_config` по отметке `bases.yaml`, дал бы испорченному `daemon.yaml` право вето: первая же
+    правка `bases.yaml` закрыла бы все тулы `config_invalid`, а починка `daemon.yaml` отметку
+    `bases.yaml` не меняет — шлюз залип бы до перезапуска. Настройки демона за его жизнь не
+    меняются по определению, перечитывать их незачем и вредно.
+
+    `warnings` начинается пустым: предупреждение о правах `daemon.yaml` выдано при старте, а
+    предупреждения `bases.yaml` собираются заново — они относятся к тому файлу, что сейчас на
+    диске.
+    """
+    _проверить_дом(home)
+    return _собрать(home, daemon, [])
+
+
+def _проверить_дом(home: pathlib.Path) -> None:
     if not home.is_dir():
         # is_dir(), не exists(): путь может существовать как обычный файл (опечатка в --home),
         # и тогда попытка создать home/daemon.yaml упадёт NotADirectoryError чуть ниже —
@@ -104,8 +130,10 @@ def load_config(home: pathlib.Path) -> AppConfig:
             f"домашний каталог не найден: {home}",
             hint=f"выполните: odata1c init --home {home}",
         )
-    warnings: list[str] = []
-    daemon = _load_daemon(home, warnings)
+
+
+def _собрать(home: pathlib.Path, daemon: DaemonConfig, warnings: list[str]) -> AppConfig:
+    """Общий хвост `load_config` и `reload_bases`: `bases.yaml` поверх готового раздела `daemon`."""
     default, bases = _load_bases(home, warnings)
     if default is not None and default not in bases:
         raise ConfigError(
@@ -154,7 +182,14 @@ def _load_bases(
             bases[name] = BaseConfig(name=name, **resolved)
         except pydantic.ValidationError as exc:
             текст_ошибки = format_validation_error(exc)
-            raise ConfigError(f"база «{name}» описана неверно: {текст_ошибки}") from exc
+            # Файл называется в сообщении, а путь — в подсказке (находка 3 ревью задачи 6 плана
+            # M2b): отказ по не прошедшему проверку файлу доходит до модели тем же кодом
+            # `config_invalid`, что и битый YAML, а тот файл и место называет. Без имени файла
+            # отказ не отличить от ошибки в `daemon.yaml` или в политике.
+            raise ConfigError(
+                f"bases.yaml: база «{name}» описана неверно: {текст_ошибки}",
+                hint=f"проверьте запись базы в файле {path}",
+            ) from exc
         if bases[name].password == "keyring":
             bases[name] = bases[name].model_copy(update={"password": _из_keyring(name)})
 

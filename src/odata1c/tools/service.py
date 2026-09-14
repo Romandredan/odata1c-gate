@@ -30,7 +30,7 @@ import traceback
 
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import ПОДСКАЗКА_НЕТ_ОБЪЕКТА, OdataError
-from odata1c.config.loader import ConfigError, load_config
+from odata1c.config.loader import ConfigError, reload_bases
 from odata1c.config.models import AppConfig, BaseConfig
 from odata1c.config.writer import ensure_policy_template
 from odata1c.gate.contact_info import КЛАСС_НА_ВХОДЕ, EntityShape, Shape, select_with_type
@@ -558,6 +558,12 @@ class ToolService:
         НЕ используется — закрыть базу владелец мог как раз этой правкой, и работать по
         предыдущей версии файла значило бы отменить его решение (`_ошибка_настроек` читает `_run`).
 
+        Читается РОВНО `bases.yaml` (`reload_bases`, а не `load_config`) — находка 1 ревью задачи
+        6: `load_config` открывает первым `daemon.yaml` и падает на его ошибке, а отметка у нас на
+        `bases.yaml`. Испорченный `daemon.yaml` получил бы право вето — тулы закрылись бы с первой
+        правкой `bases.yaml` и не открылись бы обратно от починки `daemon.yaml`, потому что она
+        отметку не меняет.
+
         Метод синхронный намеренно: внутри нет ни одного `await`, поэтому для asyncio он
         неделим — два одновременных вызова тулов не увидят полуприменённых настроек. Закрытие
         вытесненных клиентов асинхронно и вынесено в `_закрыть_вытесненные`.
@@ -567,7 +573,7 @@ class ToolService:
             return
         self._отметка_настроек = отметка
         try:
-            новая = load_config(self._config.home)
+            новая = reload_bases(self._config.home, self._config.daemon)
         except ConfigError as ошибка:
             self._ошибка_настроек = ошибка
             return
@@ -585,14 +591,14 @@ class ToolService:
         на уровне при построении, и новый уровень — это новый гейт. Правку самих файлов политики
         гейт замечает сам (`refresh`), пересобирать его для этого не нужно.
 
-        Раздел `daemon` берётся СТАРТОВЫЙ, хотя `load_config` перечитывает и `daemon.yaml`:
-        «`daemon.yaml` по-прежнему читается только при старте» (SPEC §3.1, поправка 2026-09-14).
-        Иначе его правка вступала бы в силу тайком — от того, что владелец тронул соседний файл,
-        — и вступала бы наполовину: лимиты в описании тулов, порт, секрет гейта и запасной
-        механизм подтверждения демон и слой записи взяли при старте и второй раз не смотрят.
+        Раздел `daemon` в `новая` уже стартовый — его передала `reload_bases`, а `daemon.yaml`
+        при перечитывании не открывается вовсе: «`daemon.yaml` по-прежнему читается только при
+        старте» (SPEC §3.1, поправка 2026-09-14). Иначе его правка вступала бы в силу тайком — от
+        того, что владелец тронул соседний файл, — и вступала бы наполовину: лимиты в описании
+        тулов, порт, секрет гейта и запасной механизм подтверждения демон и слой записи взяли при
+        старте и второй раз не смотрят.
         """
         старая = self._config
-        новая = новая.model_copy(update={"daemon": старая.daemon})
         for имя in set(старая.bases) - set(новая.bases):
             self._gates.pop(имя, None)
             self._смена_уровня.discard(имя)
@@ -648,7 +654,25 @@ class ToolService:
         if isinstance(предупреждения, list):
             предупреждения.append(ПРЕДУПРЕЖДЕНИЕ_СМЕНЫ_ПОЛИТИКИ)
 
+    def _запись_базы(self, base: BaseConfig) -> BaseConfig:
+        """Запись базы, по которой строить общий на процесс объект, — ТЕКУЩАЯ, а не снимок
+        вызывающего (находка 2 ревью задачи 6 плана M2b).
+
+        Вызов может уснуть на `await` между разрешением базы в `_run` и построением гейта или
+        клиента: `WriteService._выполнить` берёт клиента уже после диалога подтверждения. Успей за
+        это время чужой вызов перечитать `bases.yaml` — построенный из снимка объект лёг бы в общий
+        кэш под именем базы и обслуживал бы ВСЕ сессии по прежнему адресу и прежней учётке до
+        следующей правки полей соединения. Кэш общий, значит и ключ, и содержимое берутся из
+        текущих настроек.
+
+        Базы уже нет в файле (её убрали тем же перечитыванием) — остаётся снимок вызывающего:
+        начатый вызов доводится до конца по тем настройкам, по которым начинался, а нового вызова
+        к этой базе не будет — `Registry.get` ответит `base_unknown`.
+        """
+        return self._config.bases.get(base.name, base)
+
     def _gate_for(self, base: BaseConfig) -> BaseGate:
+        base = self._запись_базы(base)
         гейт = self._gates.get(base.name)
         if гейт is None:
             гейт = BaseGate(
@@ -662,6 +686,7 @@ class ToolService:
         return гейт
 
     def _client_for(self, base: BaseConfig) -> Client1C:
+        base = self._запись_базы(base)
         клиент = self._clients.get(base.name)
         if клиент is None:
             клиент = self._client_factory(base)

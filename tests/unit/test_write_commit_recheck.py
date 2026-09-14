@@ -36,6 +36,7 @@ from odata1c.write.pending import CommitLimiter, PendingStore
 from odata1c.write.service import WriteService
 
 URL_UT = "http://localhost/ut/odata/standard.odata/"
+НОВЫЙ_URL = "http://localhost/ut_moved/odata/standard.odata/"
 КОНТРАГЕНТЫ = "Catalog_Контрагенты"
 ССЫЛКА = "a103cb54-42ee-11ec-a7a0-f10ab59a067e"
 НОВАЯ_ССЫЛКА = "0c4320aa-624f-11f0-a7a0-fa78dd2b3d42"
@@ -47,13 +48,13 @@ URL_UT = "http://localhost/ut/odata/standard.odata/"
 ТЕЛЕФОН = "+7 495 000-00-00"
 
 
-def настройки(*, write: bool = True, ещё: str = "") -> str:
+def настройки(*, write: bool = True, ещё: str = "", url: str = URL_UT) -> str:
     return (
         "default: ut\n"
         "bases:\n"
         "  ut:\n"
         "    label: УТ, запись разрешена\n"
-        f"    url: {URL_UT}\n"
+        f"    url: {url}\n"
         "    user: u\n"
         "    password: p\n"
         "    role: prod\n"
@@ -121,6 +122,9 @@ class Одинс:
                 "ИНН": ИНН,
             }
         }
+        # Полные адреса пишущих запросов: по ним видно, к какой публикации ушла запись, —
+        # обработчики общие на оба адреса базы (прежний и новый).
+        self.адреса_записи: list[str] = []
         self.get = router.get(url__regex=r".*standard\.odata/[^?]+").mock(side_effect=self._get)
         self.patch = router.patch(url__regex=r".*").mock(side_effect=self._patch)
         self.post = router.post(url__regex=r".*").mock(side_effect=self._post)
@@ -137,12 +141,14 @@ class Одинс:
         return httpx.Response(200, json={к: з for к, з in объект.items() if к in поля})
 
     def _patch(self, request: httpx.Request) -> httpx.Response:
+        self.адреса_записи.append(str(request.url))
         путь = _путь(request)
         self.объекты[путь].update(json.loads(request.content))
         self.объекты[путь]["DataVersion"] = "AAAAAAAAAAI="
         return httpx.Response(200, json=self.объекты[путь])
 
     def _post(self, request: httpx.Request) -> httpx.Response:
+        self.адреса_записи.append(str(request.url))
         тело = {
             "Ref_Key": НОВАЯ_ССЫЛКА,
             "DataVersion": "AAAAAAAAAAE=",
@@ -161,7 +167,10 @@ class Одинс:
 @pytest.fixture
 def одинс():
     with respx.mock(assert_all_called=False) as router:
-        router.get(URL_UT).mock(return_value=httpx.Response(200, json={"value": []}))
+        # Завершение сеанса 1С идёт на базовый адрес без хвоста пути — по маршруту на каждый
+        # адрес, который база может иметь за время теста.
+        for адрес in (URL_UT, НОВЫЙ_URL):
+            router.get(адрес).mock(return_value=httpx.Response(200, json={"value": []}))
         yield Одинс(router)
 
 
@@ -209,10 +218,12 @@ async def подготовить_create(среда: Среда) -> dict:
     return ответ
 
 
-async def выполнить(среда: Среда, pending_id: str) -> dict:
+async def выполнить(
+    среда: Среда, pending_id: str, *, mechanism: str = "claude_code", confirm=None
+) -> dict:
     return json.loads(
         await среда.запись.commit(
-            SessionScope(), "s1", pending_id, mechanism="claude_code", confirm=None
+            SessionScope(), "s1", pending_id, mechanism=mechanism, confirm=confirm
         )
     )
 
@@ -301,6 +312,30 @@ async def test_create_с_табличной_частью_проходит_ког
     ответ = await выполнить(среда, подготовка["pending_id"])
     assert "error" not in ответ, ответ
     assert одинс.post.call_count == 1
+
+
+async def test_адрес_сменился_пока_ждали_подтверждения_запись_уходит_по_новому(среда, одинс, дом):
+    """Находка 2 ревью задачи 6: `commit` берёт клиента ПОСЛЕ диалога подтверждения, а `base_config`
+    разрешил при входе в тул. Чужая сессия за это время перечитала `bases.yaml` — и клиент,
+    построенный из снимка вызывающего, ушёл бы по прежнему адресу и лёг бы в общий кэш под именем
+    базы на все сессии до следующей правки полей соединения."""
+    подготовка = await подготовить(среда)
+
+    async def подтвердить(_текст: str) -> bool:
+        переписать(дом / "bases.yaml", настройки(url=НОВЫЙ_URL))
+        # Чужой вызов тула: он и применяет перечитанные настройки к общему сервису.
+        await среда.tools.bases(SessionScope())
+        return True
+
+    ответ = await выполнить(
+        среда, подготовка["pending_id"], mechanism="elicitation", confirm=подтвердить
+    )
+
+    assert "error" not in ответ, ответ
+    assert одинс.patch.call_count == 1
+    [адрес] = одинс.адреса_записи
+    assert адрес.startswith(НОВЫЙ_URL), адрес
+    assert not адрес.startswith(URL_UT)
 
 
 async def test_правка_не_про_разрешения_записи_не_мешает(среда, одинс, дом):

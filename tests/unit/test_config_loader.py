@@ -4,7 +4,8 @@ import concurrent.futures
 
 import pytest
 
-from odata1c.config.loader import ConfigError, load_config
+from odata1c.config.loader import ConfigError, load_config, reload_bases
+from odata1c.config.models import DaemonConfig
 
 BASES = """
 default: ut
@@ -231,3 +232,54 @@ def test_gate_scan_free_text_в_bases_отклоняется_с_подсказк
     assert ошибка.value.code == "config_invalid"
     assert "policy.yaml" in str(ошибка.value)
     assert "scan_free_text" in str(ошибка.value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Перечитывание bases.yaml на ходу (SPEC §3.1, поправка 2026-09-14, ADR-0015)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_отказ_проверки_называет_файл_и_поле_но_не_значение_из_файла(tmp_path):
+    """Находка 3 ревью задачи 6: `bases.yaml` перечитывается на ходу, и его отказ доходит до
+    модели ответом тула. Значение из файла в таком ответе — содержимое файла настроек; правило и
+    поле объясняют владельцу, что чинить, не вынося наружу ни адрес, ни пароль."""
+    адрес = "https://1c.corp.local/ut/odata/"
+    плохой = BASES.replace("https://1c.corp.local/ut/odata/standard.odata/", адрес)
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(записать(tmp_path, плохой))
+
+    текст = f"{ошибка.value} {ошибка.value.hint}"
+    assert "bases.yaml" in текст and "url" in текст
+    assert "odata/standard.odata" in текст, "правило названо"
+    assert адрес not in текст and "1c.corp.local" not in текст
+    assert "секрет" not in текст
+
+
+def test_reload_bases_не_открывает_daemon_yaml(tmp_path):
+    """Находка 1 ревью задачи 6: демон следит за отметкой `bases.yaml`, а `load_config` падает на
+    ошибке `daemon.yaml`. Испорченный `daemon.yaml` получил бы право вето — тулы закрылись бы с
+    первой правкой `bases.yaml` и не открылись бы от его починки, потому что она отметку
+    `bases.yaml` не меняет."""
+    дом = записать(tmp_path, daemon="port: [не закрытая скобка\n")
+    настройки_демона = DaemonConfig(gate_secret=СЕКРЕТ)
+
+    config = reload_bases(дом, настройки_демона)
+
+    assert set(config.bases) == {"ut"}
+    assert config.daemon is настройки_демона
+    # Контроль: тот же дом целиком не читается — виноват именно daemon.yaml.
+    with pytest.raises(ConfigError):
+        load_config(дом)
+
+
+def test_reload_bases_видит_новый_состав_баз(tmp_path):
+    дом = записать(tmp_path)
+    первая = load_config(дом)
+
+    (дом / "bases.yaml").write_text(
+        BASES.replace("  ut:", "  buh:").replace("default: ut", "default: buh"), encoding="utf-8"
+    )
+    вторая = reload_bases(дом, первая.daemon)
+
+    assert set(вторая.bases) == {"buh"}
+    assert вторая.daemon is первая.daemon
