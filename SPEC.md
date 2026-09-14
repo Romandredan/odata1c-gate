@@ -3045,10 +3045,12 @@ plugin/
 в `docs/install.md`.
 
 **Хук `PreToolUse`.** Правила по порядку: `odata1c_commit` (в обеих формах имени) → `ask` с
-`pending_id` в тексте вопроса; `Read`/`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Grep`/`Glob` по
-пути внутри домашнего каталога шлюза, ведущему к `bases.yaml`, `daemon.yaml`, `launcher.key`,
-`gate.sqlite`, `journal.sqlite` (включая `-wal` и `-shm`), → `deny`; `Bash` и `PowerShell` с теми
-же путями, с `odata1c reveal` или с `sqlite3` рядом со словарём и журналом → `deny`; иначе
+`pending_id` в тексте вопроса; `Read`/`Edit`/`Write`/`MultiEdit`/`NotebookEdit` по пути внутри
+домашнего каталога шлюза, ведущему к `bases.yaml`, `daemon.yaml`, `launcher.key`, `gate.sqlite`,
+`journal.sqlite` (включая `-wal` и `-shm`; имя файла сравнивается без учёта регистра, Ruling 68),
+→ `deny`; `Grep` и `Glob` — по самому домашнему каталогу и его предкам (Ruling 72): обходить
+запрет обзором каталога целиком нельзя; `Bash` и `PowerShell` одинаково (Ruling 73) — с теми же
+путями, с `odata1c reveal` или с `sqlite3` рядом со словарём и журналом → `deny`; иначе
 молчание. Правило `ask` на `commit` — страховка диалога разрешения по `_meta` (§7.2), а не его
 замена; если у настоящего Claude Code от этого выходят два вопроса подряд, правило снимается,
 запреты остаются.
