@@ -2368,6 +2368,26 @@ async def test_info_тема_записи_описывает_протокол(с
     assert текст in await сервис.info("all")
 
 
+async def test_info_тема_политики_описывает_файлы_и_приоритет(сервис):
+    """Задача 7 плана M2b: тема `policy` — теми же словами, что шапка `policy.example.yaml`, и
+    без единого значения данных 1С (Инвариант 1)."""
+    from odata1c.tools.info import TOPICS
+
+    assert "policy" in TOPICS
+
+    текст = await сервис.info("policy")
+    for обязательное in (
+        "policy.yaml",
+        "policy.auto.yaml",
+        "keep",
+        "scan",
+        "odata1c policy check",
+    ):
+        assert обязательное in текст, обязательное
+    assert ИНН not in текст
+    assert текст in await сервис.info("all")
+
+
 async def test_info_неизвестная_тема(сервис):
     ошибка = json.loads(await сервис.info("что_нибудь"))["error"]
 

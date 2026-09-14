@@ -425,6 +425,9 @@ odata1c service install | remove             необязательно: дем�
 `base import` читает ключи `ODATA_DB_<NAME>_BASE_URL|_USERNAME|_PASSWORD|_LABEL|_WRITABLE` и
 `ODATA_DEFAULT_DB`, `READ_ONLY`; `_WRITABLE=true` даёт `write: true`, роль по умолчанию `prod`.
 
+`policy hide` на уже скрытой сущности идемпотентен: файл не меняется, `check_policy` повторно не
+запускается, код возврата 0 (зафиксированное отступление ревью задачи 5 плана M2b).
+
 ---
 
 ## 4. Индекс метаданных
