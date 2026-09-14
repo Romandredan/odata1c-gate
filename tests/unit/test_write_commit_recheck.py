@@ -11,6 +11,7 @@
 import json
 import os
 import pathlib
+import urllib.parse
 
 import httpx
 import pytest
@@ -24,7 +25,7 @@ from conftest import (
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
-from odata1c.gate.service import refresh_policy
+from odata1c.gate.service import policy_path, refresh_policy
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
@@ -37,9 +38,13 @@ from odata1c.write.service import WriteService
 URL_UT = "http://localhost/ut/odata/standard.odata/"
 КОНТРАГЕНТЫ = "Catalog_Контрагенты"
 ССЫЛКА = "a103cb54-42ee-11ec-a7a0-f10ab59a067e"
+НОВАЯ_ССЫЛКА = "0c4320aa-624f-11f0-a7a0-fa78dd2b3d42"
+ПУТЬ_КОНТРАГЕНТА = f"{КОНТРАГЕНТЫ}(guid'{ССЫЛКА}')"
+КИ = f"{КОНТРАГЕНТЫ}_КонтактнаяИнформация"
 ИНН = "7707083893"
 НОВЫЙ_ИНН = "7736050003"
 НАЗВАНИЕ = "ООО Ромашка"
+ТЕЛЕФОН = "+7 495 000-00-00"
 
 
 def настройки(*, write: bool = True, ещё: str = "") -> str:
@@ -95,32 +100,58 @@ async def среда(дом, tmp_path):
     await с.tools.aclose()
 
 
+def _путь(request: httpx.Request) -> str:
+    """Путь запроса после `standard.odata/`, раскодированный: так его строит шлюз."""
+    сырой = urllib.parse.unquote(request.url.raw_path.decode("ascii"))
+    return сырой.split("standard.odata/", 1)[1].split("?", 1)[0]
+
+
 class Одинс:
-    """Поддельная 1С: GET отдаёт одного контрагента с соблюдением `$select`, PATCH сливает тело
-    с объектом и растит `DataVersion` (так ведёт себя настоящая — проба P8)."""
+    """Поддельная 1С с состоянием: GET соблюдает `$select`, PATCH сливает тело с объектом и
+    растит `DataVersion`, POST на набор создаёт объект (формы пробы P8)."""
 
     def __init__(self, router: respx.MockRouter) -> None:
-        self.объект = {
-            "Ref_Key": ССЫЛКА,
-            "DataVersion": "AAAAAAAAAAE=",
-            "DeletionMark": False,
-            "Code": "000000711",
-            "Description": НАЗВАНИЕ,
-            "ИНН": ИНН,
+        self.объекты = {
+            ПУТЬ_КОНТРАГЕНТА: {
+                "Ref_Key": ССЫЛКА,
+                "DataVersion": "AAAAAAAAAAE=",
+                "DeletionMark": False,
+                "Code": "000000711",
+                "Description": НАЗВАНИЕ,
+                "ИНН": ИНН,
+            }
         }
         self.get = router.get(url__regex=r".*standard\.odata/[^?]+").mock(side_effect=self._get)
         self.patch = router.patch(url__regex=r".*").mock(side_effect=self._patch)
-        self.post = router.post(url__regex=r".*").mock(return_value=httpx.Response(500, json={}))
+        self.post = router.post(url__regex=r".*").mock(side_effect=self._post)
 
     def _get(self, request: httpx.Request) -> httpx.Response:
+        объект = self.объекты.get(_путь(request))
+        if объект is None:
+            return httpx.Response(
+                404,
+                json={"odata.error": {"code": "9", "message": {"value": "Экземпляр не найден"}}},
+            )
         выбор = request.url.params.get("$select")
-        поля = set(выбор.split(",")) if выбор else set(self.объект)
-        return httpx.Response(200, json={к: з for к, з in self.объект.items() if к in поля})
+        поля = set(выбор.split(",")) if выбор else set(объект)
+        return httpx.Response(200, json={к: з for к, з in объект.items() if к in поля})
 
     def _patch(self, request: httpx.Request) -> httpx.Response:
-        self.объект.update(json.loads(request.content))
-        self.объект["DataVersion"] = "AAAAAAAAAAI="
-        return httpx.Response(200, json=self.объект)
+        путь = _путь(request)
+        self.объекты[путь].update(json.loads(request.content))
+        self.объекты[путь]["DataVersion"] = "AAAAAAAAAAI="
+        return httpx.Response(200, json=self.объекты[путь])
+
+    def _post(self, request: httpx.Request) -> httpx.Response:
+        тело = {
+            "Ref_Key": НОВАЯ_ССЫЛКА,
+            "DataVersion": "AAAAAAAAAAE=",
+            "DeletionMark": False,
+            "Code": "000000042",
+            **json.loads(request.content),
+        }
+        self.объекты[f"{_путь(request)}(guid'{НОВАЯ_ССЫЛКА}')"] = тело
+        return httpx.Response(201, json=тело)
 
     @property
     def записей(self) -> int:
@@ -155,6 +186,23 @@ async def подготовить(среда: Среда) -> dict:
         entity=КОНТРАГЕНТЫ,
         key=ССЫЛКА,
         data={"ИНН": токен(среда.tools, НОВЫЙ_ИНН)},
+    )
+    ответ = json.loads(текст)
+    assert "pending_id" in ответ, текст
+    return ответ
+
+
+async def подготовить_create(среда: Среда) -> dict:
+    """`create` контрагента со строкой табличной части — у неё своя сущность и свои разрешения."""
+    текст = await среда.запись.create(
+        SessionScope(),
+        "s1",
+        base="ut",
+        entity=КОНТРАГЕНТЫ,
+        data={
+            "Description": "ООО Новый",
+            "КонтактнаяИнформация": [{"Тип": "Телефон", "Представление": ТЕЛЕФОН}],
+        },
     )
     ответ = json.loads(текст)
     assert "pending_id" in ответ, текст
@@ -196,6 +244,63 @@ async def test_поле_запрещено_после_подготовки_commi
     ответ = await выполнить(среда, подготовка["pending_id"])
     assert ответ["error"]["code"] == "field_write_denied"
     assert одинс.записей == 0
+
+
+async def test_pending_несёт_аргументы_проверки_разрешений_подготовки(среда, одинс):
+    """Перепроверка при `commit` обязана проверять ТО ЖЕ САМОЕ, что проверила подготовка, а к
+    тому времени ни тела от модели, ни описаний из индекса под рукой нет — аргументы едут в
+    операции. Пустые `write_rows` сделали бы построчную перепроверку тихим «всё разрешено»."""
+    подготовка = await подготовить_create(среда)
+
+    операция = await среда.стор.take(подготовка["pending_id"], "s1")
+
+    assert операция.write_fields == ("Description", "КонтактнаяИнформация")
+    assert операция.write_rows == ((КИ, ("Тип", "Представление")),)
+    assert операция.write_action is None
+
+
+async def test_поле_табличной_части_запрещено_после_подготовки_create_отказывает_без_POST(
+    среда, одинс, дом
+):
+    """Решение контроллера к задаче 6: SPEC §7.1 требует перепроверить раздел `permissions`
+    ЦЕЛИКОМ, а запрет поля СТРОКИ табличной части — то же правило `deny_fields`, только у
+    сущности строки. Без этой перепроверки подготовленный `create` записал бы строку, которую
+    свежему `create` база уже не разрешает."""
+    подготовка = await подготовить_create(среда)
+
+    переписать(
+        дом / "bases.yaml",
+        настройки(ещё=f"    permissions:\n      deny_fields: ['{КИ}.Представление']\n"),
+    )
+
+    ответ = await выполнить(среда, подготовка["pending_id"])
+    assert ответ["error"]["code"] == "field_write_denied"
+    assert одинс.записей == 0
+    assert ТЕЛЕФОН not in json.dumps(ответ, ensure_ascii=False)
+    assert (await среда.стор.take(подготовка["pending_id"], "s1")).status == "pending"
+
+
+async def test_табличная_часть_скрыта_после_подготовки_create_отказывает_без_POST(
+    среда, одинс, дом
+):
+    """Та же перепроверка, шаг 1: политика скрыла сущность строки после подготовки. Шапку
+    `_resolve_entity` пропускает — скрыта не она."""
+    подготовка = await подготовить_create(среда)
+    путь = policy_path(дом, "ut")
+    переписать(путь, путь.read_text(encoding="utf-8") + f"entities:\n  {КИ}: {{hide: true}}\n")
+
+    ответ = await выполнить(среда, подготовка["pending_id"])
+    assert ответ["error"]["code"] == "entity_hidden"
+    assert одинс.записей == 0
+
+
+async def test_create_с_табличной_частью_проходит_когда_ничего_не_запрещали(среда, одинс, дом):
+    """Сторож обратного для строк: перепроверка не должна отказывать сама по себе."""
+    подготовка = await подготовить_create(среда)
+
+    ответ = await выполнить(среда, подготовка["pending_id"])
+    assert "error" not in ответ, ответ
+    assert одинс.post.call_count == 1
 
 
 async def test_правка_не_про_разрешения_записи_не_мешает(среда, одинс, дом):

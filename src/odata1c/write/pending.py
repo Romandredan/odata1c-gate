@@ -90,6 +90,10 @@ class PendingOp:
     # (`Post`/`Unpost`) — значений тела в этих полях нет, скрывать нечего.
     write_fields: tuple[str, ...] = ()
     write_action: str | None = None
+    # Аргументы проверки разрешений СТРОК табличных частей (`_проверить_права_строк`, шаги 1, 5 и
+    # 6 SPEC §7.1 у сущности строки) — по той же причине и в той же форме: сущность строки и
+    # имена её полей. Непусто только у `create`: `update` табличные части не пишет вовсе.
+    write_rows: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _pending_unknown() -> WriteError:
