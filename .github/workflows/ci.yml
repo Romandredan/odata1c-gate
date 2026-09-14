@@ -1,0 +1,45 @@
+# Проверка ветки на обеих целевых ОС. Живая 1С не нужна: интеграционные тесты поднимают
+# поддельную публикацию (`tests/integration/fake_1c.py`), секретов в прогоне нет вообще.
+name: ci
+
+on:
+  push:
+    branches: [main, m0-probes]
+  pull_request:
+
+# Читать код — единственное, что нужно прогону. Выпуск (`publish.yml`) права запрашивает сам.
+permissions:
+  contents: read
+
+# Новый толчок в ту же ветку отменяет незаконченный прогон предыдущего: смотрят всё равно на
+# последний, а очередь на Windows-исполнителях дорогая.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "${{ matrix.python }}"
+          enable-cache: true
+      # --frozen: состав окружения берётся из uv.lock как есть. Расхождение lock-файла с
+      # pyproject.toml должно валить прогон, а не молча пересобираться под свежие версии.
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # PYTHONUTF8=1 — как в рабочем прогоне на машине владельца: в исходниках, тестовых данных и
+      # сообщениях кириллица, а кодировка по умолчанию на Windows-исполнителе не utf-8.
+      # -p no:cacheprovider — прогон одноразовый, каталог .pytest_cache писать некуда и незачем.
+      - run: uv run pytest -q -p no:cacheprovider
+        env:
+          PYTHONUTF8: "1"

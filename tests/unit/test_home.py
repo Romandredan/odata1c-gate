@@ -133,3 +133,24 @@ def test_narrow_permissions_не_падает_в_режиме_принудите
 
     assert вывод.err == ""
     assert status.permissions_narrowed is True
+
+
+# --- POSIX: права файлов настроек (M3 задача 9) ----------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="права-биты POSIX; на Windows доступ — ACL")
+def test_шаблоны_настроек_закрыты_правами_владельца(tmp_path):
+    """`bases.yaml` хранит пароли 1С открытым текстом (SPEC §2.3), а новый файл получает права из
+    umask — на обычной машине это `0644`, «читают все». Закрывается при создании, а не только
+    каталогом вокруг: проверка прав (`check_file_permissions`) смотрит на сам файл, и без этого
+    демон и `doctor` встречали бы владельца предупреждением на ровном месте."""
+    from odata1c.config.writer import ensure_templates
+
+    home = tmp_path / "home"
+    ensure_home(home)
+    ensure_templates(home)
+
+    for имя in ("bases.yaml", "daemon.yaml"):
+        режим = stat.S_IMODE((home / имя).stat().st_mode)
+        assert режим == 0o600, f"{имя}: {oct(режим)}"
+        assert check_file_permissions(home / имя) is None

@@ -8,7 +8,12 @@
 """
 
 import odata1c.launch_parent as lp
-from odata1c.launch_parent import ИМЕНА_CLAUDE_CODE, значимый_предок, родитель_заверён
+from odata1c.launch_parent import (
+    ИМЕНА_CLAUDE_CODE,
+    claude_code_в_командной_строке,
+    значимый_предок,
+    родитель_заверён,
+)
 
 # Хвост цепочки CLI владельца: `uv run … odata1c mcp` → python(лаунчер) ← python.exe(шим venv)
 # ← odata1c.exe ← uv.exe ← claude.exe. `предки` — снизу вверх, без самого лаунчера.
@@ -81,3 +86,52 @@ def test_предки_текущего_на_этой_ос_читаются():
         assert all(isinstance(и, str) and и for и in предки)
         # У pytest есть значимый предок (не все процессы вверх — шимы запуска).
         assert значимый_предок(предки) is not None
+
+
+# --- Linux: Claude Code, поставленный через npm (M3 задача 9) --------------------------------
+#
+# Образ такого процесса — `node`, а сам Claude Code стоит в аргументах. Имя разрешается по
+# содержимому `/proc/<pid>/cmdline`; здесь проверяется само правило разбора, дерево процессов —
+# в `tests/integration/test_launch_parent_linux.py`.
+
+
+def _cmdline(*аргументы: str) -> str:
+    """Командная строка в том виде, в каком её отдаёт `/proc`: аргументы разделены нулевым
+    байтом, в конце — ещё один."""
+    return "\0".join(аргументы) + "\0"
+
+
+def test_node_с_cli_js_claude_code_опознан():
+    assert claude_code_в_командной_строке(
+        _cmdline(
+            "/usr/bin/node",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            "--version",
+        )
+    )
+    # Установка в домашний каталог пользователя — тот же признак, другой путь.
+    assert claude_code_в_командной_строке(
+        _cmdline("node", "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/cli.js")
+    )
+
+
+def test_посторонний_node_не_опознан():
+    # Ни одного из двух признаков по отдельности не хватает: `cli.js` есть у половины пакетов npm,
+    # а под каталогом claude-code лежит не один файл.
+    assert not claude_code_в_командной_строке(_cmdline("node", "/opt/чужой-пакет/cli.js"))
+    assert not claude_code_в_командной_строке(
+        _cmdline("node", "/usr/lib/node_modules/@anthropic-ai/claude-code/sdk.mjs")
+    )
+    assert not claude_code_в_командной_строке(_cmdline("node", "server.js"))
+    # Прочитать командную строку не удалось — не заверяем (пустая строка ничего не доказывает).
+    assert not claude_code_в_командной_строке("")
+
+
+def test_node_не_шим_и_не_имя_claude_code():
+    """Ключевая для Ruling 61 пара свойств. `node` в `ИМЕНА_CLAUDE_CODE` сделал бы Claude Code из
+    любой программы на Node; `node` в `_ШИМЫ` сделал бы его прозрачным, и заверение получал бы
+    тот, кто запустил эту программу."""
+    assert "node" not in {и.lower() for и in ИМЕНА_CLAUDE_CODE}
+    assert not lp._шим("node")
+    assert значимый_предок(["python3", "node", "claude"]) == "node"
+    assert родитель_заверён(ИМЕНА_CLAUDE_CODE, предки=["python3", "node", "claude"])[0] is False

@@ -30,7 +30,13 @@ from odata1c.config.writer import ensure_gate_secret
 from odata1c.daemon import is_listening, spawn_detached
 from odata1c.daemon import stop as daemon_stop
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="подъём демона — Windows")
+# Обе целевые ОС (M3 задача 9). Механика подъёма у них разная — Планировщик заданий на Windows,
+# `start_new_session` на Linux, — а проверяется здесь то, что от неё не зависит: отделившийся
+# демон живёт, pid-файл на месте, и `stop()` не выдаёт отказ за успех. На Linux это вдобавок
+# единственная проверка отделения демона на настоящем процессе.
+pytestmark = pytest.mark.skipif(
+    sys.platform not in ("win32", "linux"), reason="подъём демона — Windows и Linux"
+)
 
 ПРЕДЕЛ_ГОТОВНОСТИ_С = 25
 ПРЕДЕЛ_ОСТАНОВКИ_С = 10
@@ -54,11 +60,17 @@ def test_stop_на_живом_демоне_не_врёт_про_успех(tmp_p
 
     try:
         spawn_detached(home, порт)
+        # Готовность — порт И pid-файл: демон пишет файл после того, как uvicorn занял порт
+        # (`serve`), и между этими двумя событиями есть промежуток. На загруженной машине он
+        # достаточен, чтобы порт уже слушался, а файла ещё не было, — а проверяется здесь как раз
+        # обращение `stop()` с этим файлом.
         предел = time.monotonic() + ПРЕДЕЛ_ГОТОВНОСТИ_С
-        while not is_listening(порт) and time.monotonic() < предел:
+        while not (is_listening(порт) and pid_файл.exists()):
+            if time.monotonic() >= предел:
+                break
             time.sleep(0.2)
         assert is_listening(порт), "демон не поднялся — проверять нечего"
-        assert pid_файл.exists()
+        assert pid_файл.exists(), "демон занял порт, но pid-файл так и не появился"
         номер = pid_файл.read_text(encoding="utf-8").strip()
         номер_демона[0] = номер
 

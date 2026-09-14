@@ -41,6 +41,21 @@ def ensure_templates(home: pathlib.Path) -> None:
             continue
         шаблон = importlib.resources.files("odata1c.templates").joinpath(имя_шаблона)
         назначение.write_text(шаблон.read_text(encoding="utf-8"), encoding="utf-8")
+        закрыть_права_файла(назначение)
+
+
+def закрыть_права_файла(path: pathlib.Path) -> None:
+    """Оставить файлу права только владельца (`0600`) — в остальных ОС, кроме Windows.
+
+    Зачем: `bases.yaml` хранит пароли 1С открытым текстом (SPEC §2.3), а новый файл получает права
+    по умолчанию из `umask` — на обычной Linux-машине это `0644`, то есть «читают все». Домашний
+    каталог закрыт (`ensure_home` → `0700`), но проверка прав (`check_file_permissions`) смотрит на
+    сам файл и предупреждает владельца именно о нём.
+
+    На Windows `chmod` правами не управляет — там доступ задают списки ACL самого NTFS, и закрывает
+    их `icacls` на весь домашний каталог (`odata1c.config.home.ensure_home`)."""
+    if os.name != "nt":
+        path.chmod(0o600)
 
 
 def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
@@ -161,6 +176,9 @@ def append_base(path: pathlib.Path, name: str, values: dict) -> None:
     if not текст.endswith("\n"):
         текст += "\n"
     path.write_text(текст + "\n" + render_base(name, values), encoding="utf-8")
+    # Файла могло не быть вовсе (`base add` на голом доме без `init`) — тогда он создан этой
+    # строкой и по умолчанию открыт всем; в нём пароль 1С.
+    закрыть_права_файла(path)
 
     испорчен = False
     try:
@@ -226,7 +244,7 @@ def процесс_жив(pid: int) -> bool:
         except OSError:
             # PermissionError — процесс есть, он чужой; прочие OSError — выяснить не удалось.
             return True
-        return True
+        return not _похоронен_не_до_конца(pid)
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
@@ -248,6 +266,34 @@ def процесс_жив(pid: int) -> bool:
         return код_выхода.value == _STILL_ACTIVE
     finally:
         kernel32.CloseHandle(дескриптор)
+
+
+def _похоронен_не_до_конца(pid: int) -> bool:
+    """Процесс уже завершился, но его номер ещё занят записью для родителя (состояние `Z` в
+    `/proc`) — POSIX, где запись держится до `wait()` родителя.
+
+    Почему без этой проверки ответ неверен: `os.kill(pid, 0)` на такой номер отвечает успехом —
+    запись в таблице процессов есть. Но исполняется по ней уже ничего: порт освобождён, файлы
+    закрыты. Для вопроса «работает ли ещё демон» (`daemon.stop`) и «жив ли держатель замка» это
+    «нет», и без различения `stop()` на Linux честно докладывал бы об отказе там, где процесс
+    снят: pid-файл остаётся, управлять демоном больше нечем. Проявляется, когда снимаемый процесс
+    — потомок снимающего (в работе так бывает, если демон поднят из этого же процесса; в тестах —
+    всегда).
+
+    `/proc` есть не везде (macOS, BSD). Там файла просто нет, и функция отвечает `False` —
+    сомнение по-прежнему трактуется в пользу «жив», как и в остальной части `процесс_жив`.
+    """
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    # Имя образа во втором поле заключено в скобки и может содержать и пробел, и скобку — поэтому
+    # поля берутся после ПОСЛЕДНЕЙ закрывающей скобки; состояние идёт сразу за ней.
+    закрывающая = stat.rfind(")")
+    if закрывающая == -1:
+        return False
+    поля = stat[закрывающая + 2 :].split()
+    return bool(поля) and поля[0] == "Z"
 
 
 def _владелец_замка(lock_path: pathlib.Path) -> int | None:

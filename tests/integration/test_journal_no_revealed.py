@@ -47,7 +47,11 @@ from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="подъём демона — Windows")
+# Обе целевые ОС (M3 задача 9): нужен не Windows, а отдельный процесс демона — на Linux его
+# поднимает тот же `spawn_detached`, только без Планировщика заданий.
+pytestmark = pytest.mark.skipif(
+    sys.platform not in ("win32", "linux"), reason="подъём демона — Windows и Linux"
+)
 
 ПРЕДЕЛ_ГОТОВНОСТИ_С = 25
 ПРЕДЕЛ_ВЫЗОВОВ_С = 30
@@ -129,11 +133,19 @@ async def test_журнал_живого_демона_не_хранит_раск
         журнал = home / "logs" / "daemon.log"
         try:
             spawn_detached(home, порт_демона)
+            # Готовность — порт И pid-файл: демон пишет файл после того, как uvicorn занял порт
+            # (`serve`), и между этими двумя событиями есть промежуток. На загруженной машине он
+            # достаточен, чтобы порт уже слушался, а файла, по которому этот тест снимает демон в
+            # `finally`, ещё не было.
+            pid_файл = home / "daemon.pid"
             предел = time.monotonic() + ПРЕДЕЛ_ГОТОВНОСТИ_С
-            while not is_listening(порт_демона) and time.monotonic() < предел:
+            while not (is_listening(порт_демона) and pid_файл.exists()):
+                if time.monotonic() >= предел:
+                    break
                 await asyncio.sleep(0.2)
             assert is_listening(порт_демона), "демон не поднялся — проверять нечего"
-            номер_демона = (home / "daemon.pid").read_text(encoding="utf-8").strip()
+            assert pid_файл.exists(), "демон занял порт, но pid-файл так и не появился"
+            номер_демона = pid_файл.read_text(encoding="utf-8").strip()
 
             await asyncio.wait_for(_искать_по_токену(порт_демона), timeout=ПРЕДЕЛ_ВЫЗОВОВ_С)
         finally:

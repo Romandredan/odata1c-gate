@@ -1,0 +1,68 @@
+# Выпуск версии: тег `vX.Y.Z` → колесо и sdist на PyPI и те же файлы в GitHub Release.
+#
+# Паролей и токенов в рабочем процессе нет ни одного. PyPI принимает выгрузку по доверенной
+# публикации (trusted publishing): PyPI знает репозиторий, рабочий процесс и окружение, а GitHub
+# выдаёт прогону короткоживущий OIDC-жетон (`permissions: id-token: write`). Настраивается один
+# раз на стороне PyPI — проект `odata1c-gate`, владелец `Romandredan/odata1c-gate`, рабочий
+# процесс `publish.yml`, окружение `pypi`.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # Версия у пакета одна и берётся из src/odata1c/__about__.py (hatchling); проверку
+      # «тег совпадает с версией пакета» делает выпускающий до толчка тега (M3 задача 10).
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Окружение `pypi` — вторая половина доверенной публикации: PyPI сверяет его имя, а владелец
+    # может повесить на него ручное подтверждение выпуска.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Создание выпуска пишет в репозиторий — единственное место рабочего процесса, которому
+    # нужно право записи.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
