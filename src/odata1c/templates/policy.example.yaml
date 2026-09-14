@@ -3,7 +3,7 @@
 # и identifiers+names. Реиндекс его не переписывает; правки действуют сразу.
 # Что машина отнесла к защищаемому сама: policy.auto.yaml рядом (не редактировать, пересобирается
 # реиндексом). Итог по базе: odata1c policy show {{base}}. Проверить этот файл: odata1c policy check {{base}}.
-# Добавить правило командой: odata1c policy hide | open | set | custom (см. odata1c policy --help).
+# Добавить правило командой: odata1c policy hide | open | set (см. odata1c policy --help).
 version: 2
 
 # Классы (SPEC §6.4). Класс назначается полю в fields или своему классу в custom.

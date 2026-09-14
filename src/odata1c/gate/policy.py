@@ -275,6 +275,20 @@ def redact_policy(text: str, hidden: set[str]) -> str:
     return f"{ПРИМЕЧАНИЕ_О_СКРЫТЫХ}\n{свод}"
 
 
+def _место_ошибки(exc: Exception) -> str:
+    """Место ошибки разбора YAML — строка и колонка из `problem_mark`, и БОЛЬШЕ НИЧЕГО из
+    исключения. Общая часть для обоих разборщиков политики: `yaml` (pyyaml, `_разобрать_yaml`) и
+    `ruamel.yaml` (обратимый разбор, `read_roundtrip`) — оба дают `MarkedYAMLError` с этим полем.
+
+    Ни `str(exc)`, ни `exc.problem` в сообщение не попадают намеренно: текст `DuplicateKeyError`
+    несёт ЗНАЧЕНИЕ повторённого ключа («found duplicate key … with value …»), то есть кусок файла
+    владельца, а сообщение об ошибке уходит и в ответ тула (инвариант 1, AGENTS.md)."""
+    mark = getattr(exc, "problem_mark", None)
+    if mark is not None:
+        return f"строка {mark.line + 1}, колонка {mark.column + 1}"
+    return "точное место в файле не определено"
+
+
 def _разобрать_yaml(path: pathlib.Path) -> dict:
     """Прочитать YAML политики; синтаксическая ошибка — PolicyError с местом (строка, колонка),
     без фрагмента файла в сообщении (по образцу odata1c.config.loader._разобрать_yaml — то же
@@ -283,16 +297,53 @@ def _разобрать_yaml(path: pathlib.Path) -> dict:
     try:
         данные = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        if mark is not None:
-            место = f"строка {mark.line + 1}, колонка {mark.column + 1}"
-        else:
-            место = "точное место в файле не определено"
         raise PolicyError(
-            f"файл {path.name} повреждён и не разбирается как YAML: {место}",
+            f"файл {path.name} повреждён и не разбирается как YAML: {_место_ошибки(exc)}",
             hint=f"проверьте синтаксис файла {path}",
         ) from exc
     return данные or {}
+
+
+def read_roundtrip(path: pathlib.Path):
+    """Разобрать файл политики ОБРАТИМО (`ruamel.yaml`, round-trip) — с сохранением комментариев
+    и порядка разделов; вернуть пару «разборщик, данные» для последующей записи тем же разборщиком.
+
+    Одно место разбора на обоих писателей файла владельца — `strip_auto_section` (реиндекс уносит
+    раздел `auto`) и `policy_edit._открыть` (конструктор `policy hide | open | set`): ошибка
+    разбора обязана быть `PolicyError`, а не голым исключением ruamel (находка I1 итогового ревью
+    M2b). Отдельно от pyyaml: тот же файл два разборщика читают ПО-РАЗНОМУ — повторяющийся раздел
+    верхнего уровня (`entities: {}` шаблона плюс раскомментированный пример `# entities:` ниже)
+    pyyaml принимает молча, оставляя последний, а ruamel бросает `DuplicateKeyError`. Без обёртки
+    `odata1c reindex` и `policy hide|open|set` роняли голую трассировку, а тул `odata1c_reindex`
+    отвечал `internal` вместо `policy_invalid`.
+
+    Какой именно раздел повторён, сообщает `policy check` (`gate/policy_check.py`) — здесь только
+    место: текст исключения ruamel несёт значение ключа, то есть кусок файла (см. `_место_ошибки`).
+    Проверка формы разобранного (словарь ли это) остаётся за вызывающим: `strip_auto_section`
+    не-словарь терпит, конструктор отвергает."""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.constructor import DuplicateKeyError
+    from ruamel.yaml.error import YAMLError
+
+    yaml_rt = YAML()
+    yaml_rt.preserve_quotes = True
+    try:
+        with path.open(encoding="utf-8") as f:
+            данные = yaml_rt.load(f)
+    except DuplicateKeyError as exc:
+        raise PolicyError(
+            f"файл {path.name}: ключ встречается дважды — {_место_ошибки(exc)}",
+            hint=(
+                f"оставьте одну такую запись в {path}; какой это раздел, назовёт "
+                f"odata1c policy check <база>"
+            ),
+        ) from exc
+    except YAMLError as exc:
+        raise PolicyError(
+            f"файл {path.name} повреждён и не разбирается как YAML: {_место_ошибки(exc)}",
+            hint=f"проверьте синтаксис файла {path}",
+        ) from exc
+    return yaml_rt, данные
 
 
 def _проверить_тип_раздела(данные: dict, ключ: str, path: pathlib.Path) -> None:
@@ -328,6 +379,29 @@ def _проверить_ключи_строками(данные: dict, разд
             )
 
 
+def _проверить_значения_строками(данные: dict, раздел: str, path: pathlib.Path) -> None:
+    """Значение записи `fields`/`auto` — это КЛАСС поля (строка: `inn`, `keep`, `custom:tab`), а
+    не список и не отображение (находка I2 итогового ревью M2b). YAML охотно разберёт
+    `Catalog_X.Поле: [a, b]` как список, и до этой проверки такое значение доходило нетронутым:
+    `check_policy` сравнивал его с множеством допустимых классов (`TypeError: unhashable type`),
+    `Masker.mask` — точно так же, и все тулы базы отвечали `internal`. Раздел, порядковый номер
+    записи и тип — как у соседних проверок; ни ключ, ни значение в сообщении не цитируются
+    (тот же принцип, что у `_проверить_ключи_строками`).
+
+    Разделы `entities` и `custom` сюда не входят: там значение — набор настроек (`hide`,
+    `fields`/`regex`), и его форму проверяет `_проверить_разделы` отдельно."""
+    значение = данные.get(раздел)
+    if not isinstance(значение, dict):
+        return
+    for позиция, запись in enumerate(значение.values(), start=1):
+        if not isinstance(запись, str):
+            raise PolicyError(
+                f"{path.name}: раздел {раздел}: значение {позиция}-й записи — класс поля, "
+                f"то есть строка; получен {type(запись).__name__}",
+                hint=f"проверьте раздел {раздел} в {path}",
+            )
+
+
 def _проверить_список_строк(значение, где: str, path: pathlib.Path) -> None:
     """`names_for`/`defaults.addr.mask_for` — список имён сущностей: сам контейнер обязан быть
     списком (находка 3 повторного ревью задачи 4, Important: `mask_for: 5` итерировался бы как
@@ -359,6 +433,8 @@ def _проверить_разделы(данные: dict, path: pathlib.Path) -
         _проверить_тип_раздела(данные, раздел, path)
     for раздел in ("entities", "fields", "auto", "custom"):
         _проверить_ключи_строками(данные, раздел, path)
+    for раздел in ("fields", "auto"):
+        _проверить_значения_строками(данные, раздел, path)
     # Контейнер и элементы — обе проверки внутри `_проверить_список_строк` (находка 3 повторного
     # ревью задачи 4, Important: раньше отдельная проверка типа стояла только перед `names_for`,
     # а `defaults.addr.mask_for` доходил до цикла без неё — `mask_for: 5` итерировался бы как
@@ -445,6 +521,13 @@ def read_auto(path: pathlib.Path) -> dict:
     данные = _разобрать_yaml(path)
     _проверить_тип_раздела(данные, "auto", path)
     _проверить_тип_раздела(данные, "defaults", path)
+    # Ключи и значения `auto` — теми же проверками, что и у файла владельца (находка I2 итогового
+    # ревью M2b и отложенный минор задачи 4): файл пишет машина, но читается он с диска, а значит
+    # мог быть и правлен рукой, и обрезан на записи. Без проверок нестроковый ключ ронял бы
+    # `AttributeError` в `effective_rows`, а нестроковое значение — `TypeError` в `Masker.mask`,
+    # то есть `internal` на каждый тул базы вместо честного `policy_invalid`.
+    _проверить_ключи_строками(данные, "auto", path)
+    _проверить_значения_строками(данные, "auto", path)
     return {"defaults": данные.get("defaults") or {}, "auto": данные.get("auto") or {}}
 
 
@@ -484,12 +567,7 @@ def strip_auto_section(path: pathlib.Path) -> bool:
     §4.3): обратимый разбор `ruamel.yaml` сохраняет комментарии и порядок остальных разделов —
     обычный `yaml.safe_dump` их бы стёр. `True` — раздел был и удалён; `False` — файла владельца
     эта версия уже не касается (обычный случай на каждом следующем реиндексе)."""
-    from ruamel.yaml import YAML
-
-    yaml_rt = YAML()
-    yaml_rt.preserve_quotes = True
-    with path.open(encoding="utf-8") as f:
-        данные = yaml_rt.load(f)
+    yaml_rt, данные = read_roundtrip(path)
     if not isinstance(данные, dict) or "auto" not in данные:
         return False
     del данные["auto"]

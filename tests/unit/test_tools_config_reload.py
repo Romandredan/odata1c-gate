@@ -29,6 +29,7 @@ from odata1c.tools.service import ПРЕДУПРЕЖДЕНИЕ_СМЕНЫ_ПОЛ
 URL_UT = "http://localhost/ut/odata/standard.odata/"
 URL_DEV = "http://localhost/dev/odata/standard.odata/"
 НОВЫЙ_URL_UT = "http://localhost/ut2/odata/standard.odata/"
+НОВЫЙ_URL_DEV = "http://localhost/dev2/odata/standard.odata/"
 # Пароль 1С лежит в том же файле: ни одно сообщение об ошибке разбора не вправе его повторить.
 ПАРОЛЬ = "пароль-1с-из-файла"
 
@@ -203,6 +204,68 @@ async def test_гейт_строится_по_текущему_уровню_а_�
         await служба.bases(SessionScope())
 
         assert служба._gate_for(снимок).mode == "identifiers+names"
+    finally:
+        await служба.aclose()
+
+
+def запись_dev(url: str) -> str:
+    """Запись базы `dev` с произвольным адресом — дописывается в конец раздела `bases`."""
+    return (
+        "  dev:\n"
+        "    label: Песочница\n"
+        f"    url: {url}\n"
+        "    user: u\n"
+        f"    password: {ПАРОЛЬ}\n"
+        "    role: dev\n"
+    )
+
+
+async def test_клиент_по_снимку_исчезнувшей_базы_не_кэшируется(дом):
+    """Находка M9 итогового ревью M2b: база исчезла из файла, а вызов в полёте всё равно
+    доводится до конца по своему снимку (`_запись_базы`). Построенный по снимку клиент в общий
+    кэш процесса попадать не вправе: база, вернувшаяся под тем же именем с ДРУГИМ адресом,
+    обслуживалась бы им и дальше — `_применить_настройки` вытесняет клиента, только сравнивая
+    прежнюю запись с новой (`прежняя is None → continue`), а прежней в момент возвращения нет."""
+    служба = ToolService(load_config(дом), client_factory=ПоддельныйКлиент)
+    try:
+        снимок = служба._registry.get("dev", SessionScope())
+        переписать(дом / "bases.yaml", настройки(dev=None))
+        await служба.bases(SessionScope())  # чужое перечитывание убрало базу из файла
+
+        в_полёте = служба._client_for(снимок)
+        assert в_полёте.base.url == URL_DEV, "начатый вызов доводится до конца по своему снимку"
+        assert "dev" not in служба._clients, "но в общий кэш снимок исчезнувшей базы не ложится"
+
+        переписать(дом / "bases.yaml", настройки(dev=None) + запись_dev(НОВЫЙ_URL_DEV))
+        await служба.bases(SessionScope())
+
+        вернувшийся = служба._client_for(служба._registry.get("dev", SessionScope()))
+        assert вернувшийся.base.url == НОВЫЙ_URL_DEV
+        assert вернувшийся is not в_полёте
+    finally:
+        await служба.aclose()
+
+
+async def test_гейт_по_снимку_исчезнувшей_базы_не_кэшируется(дом):
+    """То же для гейта: он собирает маскировщик на уровне при построении, и гейт снимка
+    обслуживал бы вернувшуюся базу прежним, более мягким уровнем."""
+    служба = ToolService(load_config(дом), client_factory=ПоддельныйКлиент)
+    try:
+        снимок = служба._registry.get("dev", SessionScope())
+        assert снимок.gate.mode == "off", "роль dev: гейт выключен"
+        переписать(дом / "bases.yaml", настройки(dev=None))
+        await служба.bases(SessionScope())
+
+        assert служба._gate_for(снимок).mode == "off"
+        assert "dev" not in служба._gates
+
+        строгая = запись_dev(URL_DEV) + "    gate:\n      mode: identifiers+names\n"
+        переписать(дом / "bases.yaml", настройки(dev=None) + строгая)
+        await служба.bases(SessionScope())
+
+        assert служба._gate_for(служба._registry.get("dev", SessionScope())).mode == (
+            "identifiers+names"
+        )
     finally:
         await служба.aclose()
 

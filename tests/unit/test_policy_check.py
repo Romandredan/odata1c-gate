@@ -6,6 +6,7 @@ import pathlib
 import textwrap
 
 import pytest
+from conftest import политика_из_шаблона_с_дублем_entities
 
 from odata1c.gate.policy import PolicyError, load_policy, parse_owner_file
 from odata1c.gate.policy_check import Finding, check_policy, render_effective
@@ -347,3 +348,127 @@ def test_render_effective_скрывает_строку_потомка_неза�
     assert "Document_X_Товары.Номенклатура" not in для_владельца
     assert "Document_X_Товары.Номенклатура" not in для_модели
     assert "Document_X_Товары" not in для_модели  # и сам потомок не назван модели по имени
+
+
+# --- повтор раздела верхнего уровня (находка I1 итогового ревью M2b) ---------------------------
+
+
+def test_повтор_раздела_из_шаблона_даёт_error_с_номером_строки(tmp_path):
+    """Владелец раскомментировал пример `# entities:` и оставил заглушку `entities: {}` выше —
+    файл, который `pyyaml` разбирает молча (побеждает последний раздел), а `ruamel` (реиндекс и
+    конструктор политики) разобрать не может вовсе. `policy check` обязан назвать раздел."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+
+    находки = check_policy(путь, None)
+
+    повторы = [н for н in находки if н.where == "entities"]
+    assert len(повторы) == 1
+    assert повторы[0].level == "error"
+    assert "дважды" in повторы[0].message
+    assert "entities" in повторы[0].hint
+
+
+def test_сообщение_о_повторе_не_цитирует_содержимое_раздела(tmp_path):
+    """Инвариант 1: текст `DuplicateKeyError` ruamel несёт значение повторённого ключа
+    («found duplicate key … with value …»). В находку идут только имя раздела и номер строки."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+
+    повторы = [н for н in check_policy(путь, None) if н.where == "entities"]
+
+    assert "Catalog_ФизическиеЛица" not in повторы[0].message
+    assert "Catalog_ФизическиеЛица" not in повторы[0].hint
+    assert "hide" not in повторы[0].message
+
+
+def test_повтор_раздела_не_мешает_остальным_проверкам(tmp_path):
+    путь = _владелец(
+        tmp_path,
+        """
+        version: 2
+        fields:
+          Catalog_Контрагенты.ИНН: secret
+        fields:
+          Catalog_Контрагенты.ИНН: secret
+        """,
+    )
+
+    находки = check_policy(путь, None)
+
+    assert any(н.where == "fields" and н.level == "error" for н in находки)
+    assert any(
+        н.where == "fields.Catalog_Контрагенты.ИНН" and "неизвестен" in н.message for н in находки
+    )
+
+
+def test_без_повторов_находки_о_повторе_нет(tmp_path, индекс_ut):
+    путь = _владелец(
+        tmp_path,
+        """
+        version: 2
+        entities:
+          Catalog_ФизическиеЛица: { hide: true }
+        """,
+    )
+
+    находки = check_policy(путь, индекс_ut)
+
+    assert not any(н.where == "entities" for н in находки)
+
+
+# --- формат ключа fields без индекса (находка I3 итогового ревью M2b) --------------------------
+
+
+def test_ключ_fields_без_точки_даёт_error_и_без_индекса(tmp_path):
+    """`fields: {ДопИдентификатор: inn}` — мёртвое правило при любом состоянии индекса:
+    `Policy.sensitivity_of` ищет ключ вида `Сущность.Поле`. Прежде проверка формата стояла внутри
+    ветки `repo is not None`, и без индекса `policy check` молчал."""
+    путь = _владелец(
+        tmp_path,
+        """
+        version: 2
+        fields:
+          ДопИдентификатор: inn
+        """,
+    )
+
+    находки = check_policy(путь, None)
+
+    ошибки = [н for н in находки if н.where == "fields.ДопИдентификатор"]
+    assert len(ошибки) == 1
+    assert ошибки[0].level == "error"
+    assert "Сущность.Поле" in ошибки[0].message
+
+
+def test_ключ_fields_без_точки_с_индексом_называет_формат_а_не_пропажу_имени(tmp_path, индекс_ut):
+    путь = _владелец(
+        tmp_path,
+        """
+        version: 2
+        fields:
+          ДопИдентификатор: inn
+        """,
+    )
+
+    ошибки = [н for н in check_policy(путь, индекс_ut) if н.where == "fields.ДопИдентификатор"]
+
+    assert len(ошибки) == 1
+    assert "Сущность.Поле" in ошибки[0].message
+    assert "не найдена в индексе" not in ошибки[0].message
+
+
+def test_пустая_часть_ключа_fields_тоже_error(tmp_path):
+    путь = _владелец(
+        tmp_path,
+        """
+        version: 2
+        fields:
+          Catalog_Контрагенты.: inn
+        """,
+    )
+
+    assert any(
+        н.where == "fields.Catalog_Контрагенты." and н.level == "error"
+        for н in check_policy(путь, None)
+    )

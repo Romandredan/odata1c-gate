@@ -8,8 +8,10 @@ import textwrap
 
 import pytest
 import yaml
+from conftest import политика_из_шаблона_с_дублем_entities
 
 from odata1c.config.models import BaseConfig
+from odata1c.gate.policy import PolicyError
 from odata1c.gate.service import (
     auto_policy_path,
     classifier_for,
@@ -182,3 +184,21 @@ def test_owner_names_for_пустой_список_это_не_отсутств�
     путь.write_text("version: 2\nnames_for: []\n", encoding="utf-8")
 
     assert owner_names_for(tmp_path, "ut") == set()
+
+
+def test_реиндекс_на_повторе_раздела_даёт_policyerror_а_не_ruamel(дом_с_индексом):
+    """Находка I1 итогового ревью M2b: файл владельца с повторяющимся разделом (заглушка шаблона
+    `entities: {}` и раскомментированный пример `# entities:` ниже) обратимый разбор `ruamel`
+    внутри `strip_auto_section` не принимает. Прежде `DuplicateKeyError` уходил голой
+    трассировкой: `odata1c reindex` падал, тул `odata1c_reindex` отвечал `internal`."""
+    путь = policy_path(дом_с_индексом, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+
+    with pytest.raises(PolicyError) as исключение:
+        refresh_policy(дом_с_индексом, база())
+
+    assert исключение.value.code == "policy_invalid"
+    assert исключение.value.hint
+    # Инвариант 1: ни значения повторённого ключа, ни строк файла в сообщении нет.
+    assert "Catalog_ФизическиеЛица" not in f"{исключение.value} {исключение.value.hint}"

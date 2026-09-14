@@ -224,6 +224,43 @@ def test_refresh_подхватывает_новую_политику(врата
     assert врата_prod.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is True
 
 
+def test_refresh_подхватывает_изменённую_авторазметку(tmp_path, словарь, guard):
+    """Находка M11 итогового ревью M2b: боевой сценарий ADR-0015 — владелец запускает `reindex` из
+    терминала, тот переписывает `policy.auto.yaml`, а живой демон обязан подхватить новый файл
+    ОБЫЧНЫМ `refresh()`, без `force` (`force` есть только у реиндекса через тул). Отметка гейта
+    считается по ОБОИМ файлам политики (`BaseGate._отметка`), и без второго слагаемого правка
+    авторазметки осталась бы незамеченной: новое защищаемое поле ушло бы модели открытым."""
+    путь_владельца = tmp_path / "policy.yaml"
+    путь_владельца.write_text("version: 2\nscan_free_text: true\n", encoding="utf-8")
+    путь_авто = tmp_path / "policy.auto.yaml"
+    путь_авто.write_text(
+        "version: 2\ndefaults: {}\nauto:\n  Catalog_Контрагенты.Code: keep\n", encoding="utf-8"
+    )
+    врата = BaseGate(
+        base=_база("ut", "identifiers+names"),
+        dictionary=словарь,
+        guard=guard,
+        policy_path=путь_владельца,
+        auto_path=путь_авто,
+    )
+    assert врата.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is False
+
+    # Так переписывает файл реиндекс: целиком и с другим содержимым (размер тоже меняется).
+    путь_авто.write_text(
+        "version: 2\ndefaults: {}\nauto:\n"
+        "  Catalog_Контрагенты.Code: inn\n"
+        "  Catalog_Контрагенты.ИНН: inn\n",
+        encoding="utf-8",
+    )
+    os.utime(путь_авто, (time.time() + 5, time.time() + 5))
+    врата.refresh()
+
+    assert врата.is_protected("Catalog_Контрагенты", "Code", shape=строение_неизвестно) is True
+    # Перечитанная на ходу политика обязана сообщить о себе модели (SPEC §6.9): флаг снимает
+    # слой тулов строкой в `warnings`.
+    assert врата.policy_changed is True
+
+
 def test_finish_text_прогоняет_стража(врата_prod, словарь):
     инн = "7707083893"
     словарь.token_for("inn", инн, base="ut", entity="E", field="ИНН")

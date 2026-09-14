@@ -18,6 +18,8 @@
 
 import pathlib
 
+from conftest import политика_из_шаблона_с_дублем_entities
+
 from odata1c.cli import main
 from odata1c.config.loader import load_config
 from odata1c.gate.policy import load_policy
@@ -417,10 +419,12 @@ def test_policy_set_необъявленного_custom_код_1_файл_не_�
     assert путь.read_text(encoding="utf-8") == исходный_текст
 
 
-def test_policy_set_без_индекса_пишет_и_предупреждает(tmp_path, capsys):
-    """Класс без индекса (`repo is None`): имена не проверяются — запись состоится, а находка
-    `check_policy` о том, что индекс отсутствует, печатается уже после записи (уточнение брифа
-    задачи 5)."""
+def test_policy_set_keep_без_индекса_пишет_и_предупреждает(tmp_path, capsys):
+    """Без индекса имя проверить нечем, и записывается только `keep` (находка I4 итогового ревью
+    M2b: ошибка в сторону закрытия допустима, в сторону открытия — нет). Сама запись при этом
+    прежняя: имя остаётся дословным, а находка `check_policy` об отсутствии индекса печатается
+    уже после записи (уточнение брифа задачи 5). Закрывающий класс без индекса — отказ, см.
+    `test_policy_set_закрывающего_класса_без_индекса_отказ`."""
     home = _домашний_с_базой(tmp_path)
     путь = _политика_с_версией(home)
     assert not index_path(home, "ut").exists()
@@ -574,3 +578,107 @@ def test_reveal_при_повреждённом_словаре(tmp_path, capsys)
     assert "dictionary_corrupt" in вывод
     assert "подсказка" in вывод.lower()
     assert "traceback" not in вывод.lower()
+
+
+# --- повтор раздела в файле владельца (находка I1 итогового ревью M2b) ------------------------
+
+
+def _политика_с_дублем(home: pathlib.Path) -> pathlib.Path:
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+    return путь
+
+
+def test_policy_check_на_повторе_раздела_называет_раздел(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    _политика_с_дублем(home)
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "error: entities:" in вывод
+    assert "дважды" in вывод
+    assert "traceback" not in вывод.lower()
+
+
+def test_policy_hide_на_повторе_раздела_даёт_policy_invalid_а_не_traceback(
+    tmp_path, capsys, edmx_ut_real
+):
+    """Конструктор разбирает файл обратимым `ruamel` — повтор раздела для него `DuplicateKeyError`.
+    Прежде команда падала голой трассировкой."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_дублем(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "policy_invalid" in вывод
+    assert "traceback" not in вывод.lower()
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+# --- конструктор без индекса (находки I3 и I4 итогового ревью M2b) ----------------------------
+
+
+def test_policy_set_без_индекса_ключ_без_точки_код_1_файл_не_тронут(tmp_path, capsys):
+    """Формат ключа проверяется безусловно, до ветки «индекса нет»: правило
+    `fields: {ДопИдентификатор: inn}` не сработало бы никогда, а прежде команда его записывала
+    и печатала успех."""
+    home = _домашний_с_базой(tmp_path)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+    assert not index_path(home, "ut").exists()
+
+    код = main(["policy", "set", "ut", "ДопИдентификатор", "inn", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "Сущность.Поле" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_hide_без_индекса_отказ_файл_не_тронут(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+    assert not index_path(home, "ut").exists()
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "имя не проверено" in вывод
+    assert "odata1c reindex ut" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_set_закрывающего_класса_без_индекса_отказ(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+
+    код = main(["policy", "set", "ut", "Catalog_Любая.Поле", "inn", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "имя не проверено" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_open_без_индекса_по_прежнему_пишет(tmp_path, capsys):
+    """Ошибка в сторону закрытия допустима, в сторону открытия нет: `policy open` (класс `keep`)
+    без индекса остаётся разрешённым."""
+    home = _домашний_с_базой(tmp_path)
+    путь = _политика_с_версией(home)
+
+    код = main(["policy", "open", "ut", "Catalog_Любая.ЧтоУгодно", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "открыто: Catalog_Любая.ЧтоУгодно" in вывод
+    assert "Catalog_Любая.ЧтоУгодно: keep" in путь.read_text(encoding="utf-8")

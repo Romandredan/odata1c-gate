@@ -667,9 +667,23 @@ class ToolService:
 
         Базы уже нет в файле (её убрали тем же перечитыванием) — остаётся снимок вызывающего:
         начатый вызов доводится до конца по тем настройкам, по которым начинался, а нового вызова
-        к этой базе не будет — `Registry.get` ответит `base_unknown`.
+        к этой базе не будет — `Registry.get` ответит `base_unknown`. Построенный по такому снимку
+        объект в общий кэш НЕ кладётся — см. `_gate_for`/`_client_for`.
         """
         return self._config.bases.get(base.name, base)
+
+    def _кэшировать(self, base: BaseConfig) -> bool:
+        """Класть ли построенный объект в общий кэш процесса (находка M9 итогового ревью M2b).
+
+        Не класть, если базы с таким именем в ТЕКУЩИХ настройках нет: объект построен по снимку
+        вызывающего (`_запись_базы`), то есть по записи, которой в файле уже не существует.
+        Владелец, удаливший базу и заведший её заново под тем же именем с другим `url` или уровнем
+        гейта, получил бы из кэша прежнего клиента: `_применить_настройки` вытесняет клиента,
+        только сравнивая ПРЕЖНЮЮ запись с новой (`прежняя is None → continue`), а прежней записи в
+        момент возвращения базы уже нет — вытеснять нечего, и снимок, закэшированный вызовом в
+        полёте, пережил бы обе правки. Вызов в полёте при этом доводится до конца как прежде: он
+        получает свой объект, просто никому его не оставляет."""
+        return base.name in self._config.bases
 
     def _gate_for(self, base: BaseConfig) -> BaseGate:
         base = self._запись_базы(base)
@@ -682,7 +696,8 @@ class ToolService:
                 policy_path=policy_path(self._config.home, base.name),
                 auto_path=auto_policy_path(self._config.home, base.name),
             )
-            self._gates[base.name] = гейт
+            if self._кэшировать(base):
+                self._gates[base.name] = гейт
         return гейт
 
     def _client_for(self, base: BaseConfig) -> Client1C:
@@ -690,7 +705,8 @@ class ToolService:
         клиент = self._clients.get(base.name)
         if клиент is None:
             клиент = self._client_factory(base)
-            self._clients[base.name] = клиент
+            if self._кэшировать(base):
+                self._clients[base.name] = клиент
         return клиент
 
     # -- общий конвейер вызова тула -------------------------------------------------------

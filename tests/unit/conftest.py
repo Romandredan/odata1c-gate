@@ -1,5 +1,6 @@
 """Общие фикстуры юнит-тестов."""
 
+import importlib.resources
 import pathlib
 
 import httpx
@@ -28,6 +29,36 @@ def обеспечить_policy_yaml(home: pathlib.Path, base_name: str) -> path
         путь.parent.mkdir(parents=True, exist_ok=True)
         путь.write_text("version: 2\nscan_free_text: true\n", encoding="utf-8")
     return путь
+
+
+def политика_из_шаблона_с_дублем_entities(base_name: str = "trade_dev") -> str:
+    """Текст `policy.yaml` ровно в том виде, какой получает владелец, раскомментировавший пример
+    `# entities:` и не убравший заглушку `entities: {}` строкой выше (находка I1 итогового ревью
+    M2b: шаблон к этому подталкивает сам — заглушка и пример стоят рядом).
+
+    Берётся НАСТОЯЩИЙ файл поставки (`odata1c/templates/policy.example.yaml`), а не его копия в
+    тесте: доказывается именно то, что шаблон провоцирует повтор раздела, а не то, что повтор
+    вообще ловится. Раскомментирование — механическое: строка `# entities:` и следующие за ней
+    строки с префиксом `#   ` теряют первые два символа."""
+    текст = (
+        importlib.resources.files("odata1c.templates")
+        .joinpath("policy.example.yaml")
+        .read_text(encoding="utf-8")
+        .replace("{{base}}", base_name)
+    )
+    строки: list[str] = []
+    внутри = False
+    for строка in текст.splitlines():
+        if строка.startswith("# entities:"):
+            внутри = True
+            строки.append(строка[2:])
+            continue
+        if внутри and строка.startswith("#   "):
+            строки.append(строка[2:])
+            continue
+        внутри = False
+        строки.append(строка)
+    return "\n".join(строки) + "\n"
 
 
 # По одному правдоподобному значению на каждый класс гейта (`tokens.CLASSES`, кроме `keep`).

@@ -5,8 +5,15 @@ import textwrap
 
 import pytest
 import yaml
+from conftest import политика_из_шаблона_с_дублем_entities
 
-from odata1c.gate.policy import PolicyError, generate_policy, load_policy, strip_auto_section
+from odata1c.gate.policy import (
+    PolicyError,
+    generate_policy,
+    load_policy,
+    read_auto,
+    strip_auto_section,
+)
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.repository import IndexRepository
 
@@ -324,3 +331,158 @@ def test_невалидный_regex_своего_класса_даёт_поня�
         load_policy(путь)
     assert исключение.value.code == "policy_invalid"
     assert исключение.value.hint
+
+
+# --- тип значения класса (находка I2 итогового ревью M2b) -------------------------------------
+
+
+def test_список_вместо_класса_в_fields_даёт_policyerror(tmp_path):
+    """`fields: {Catalog_X.Поле: [a, b]}` проходил разбор, а падал позже: `check_policy` и
+    `Masker.mask` ищут значение во множестве классов — `TypeError: unhashable type: 'list'`, то
+    есть `internal` на каждый тул базы вместо честного `policy_invalid`."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            fields:
+              Catalog_Контрагенты.ИНН: [inn, keep]
+        """),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError) as исключение:
+        load_policy(путь)
+    assert исключение.value.code == "policy_invalid"
+    assert "fields" in str(исключение.value)
+    assert исключение.value.hint
+
+
+def test_сообщение_о_типе_класса_не_цитирует_значение(tmp_path):
+    """Раздел, порядковый номер записи и тип — как у соседних проверок; ни ключ, ни значение
+    в сообщение не попадают (инвариант 1, тот же принцип, что у нестрокового ключа)."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            fields:
+              Catalog_Контрагенты.КодПоОКПО: keep
+              Catalog_Контрагенты.ИНН: { класс: inn }
+        """),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError) as исключение:
+        load_policy(путь)
+    сообщение = str(исключение.value)
+    assert "2-й записи" in сообщение
+    assert "dict" in сообщение
+    assert "Catalog_Контрагенты" not in сообщение
+    assert "inn" not in сообщение
+
+
+def test_число_вместо_класса_в_auto_файла_владельца_даёт_policyerror(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            auto:
+              Catalog_Контрагенты.ИНН: 5
+        """),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError) as исключение:
+        load_policy(путь)
+    assert исключение.value.code == "policy_invalid"
+    assert "auto" in str(исключение.value)
+
+
+def test_список_вместо_класса_в_авторазметке_даёт_policyerror(tmp_path):
+    """Файл авторазметки пишет машина, но читается он с диска: правка рукой, обрыв записи или
+    чужая версия формата не должны доходить до `Masker` нестроковым классом."""
+    путь = tmp_path / "policy.auto.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            defaults: {}
+            auto:
+              Catalog_Контрагенты.ИНН: [inn]
+        """),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError) as исключение:
+        read_auto(путь)
+    assert исключение.value.code == "policy_invalid"
+    assert "auto" in str(исключение.value)
+
+
+def test_нестроковый_ключ_в_авторазметке_даёт_policyerror(tmp_path):
+    """Отложенный минор задачи 4: ключи `auto` тоже обязаны быть строками — иначе `.partition`
+    на числе роняет `AttributeError` в `effective_rows`."""
+    путь = tmp_path / "policy.auto.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            defaults: {}
+            auto:
+              123: inn
+        """),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError) as исключение:
+        read_auto(путь)
+    assert исключение.value.code == "policy_invalid"
+    assert "123" not in str(исключение.value)
+
+
+def test_строковый_класс_в_авторазметке_читается_как_прежде(tmp_path):
+    путь = tmp_path / "policy.auto.yaml"
+    путь.write_text(
+        textwrap.dedent("""
+            version: 2
+            defaults: {}
+            auto:
+              Catalog_Контрагенты.ИНН: inn
+        """),
+        encoding="utf-8",
+    )
+
+    assert read_auto(путь) == {"defaults": {}, "auto": {"Catalog_Контрагенты.ИНН": "inn"}}
+
+
+# --- повтор раздела верхнего уровня при обратимом разборе (находка I1 итогового ревью M2b) -----
+
+
+def test_strip_auto_section_на_повторе_раздела_даёт_policyerror_а_не_ruamel(tmp_path):
+    """Первый реиндекс новой версии зовёт `strip_auto_section` на файле владельца. Повтор раздела
+    (заглушка шаблона плюс раскомментированный пример) для `ruamel` — `DuplicateKeyError`, и
+    прежде он уходил голой трассировкой: `odata1c reindex` падал, тул `odata1c_reindex` отвечал
+    `internal`."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+
+    with pytest.raises(PolicyError) as исключение:
+        strip_auto_section(путь)
+
+    assert исключение.value.code == "policy_invalid"
+    assert исключение.value.hint
+    assert "строка" in str(исключение.value)
+
+
+def test_сообщение_о_повторе_при_разборе_не_цитирует_содержимое(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(политика_из_шаблона_с_дублем_entities(), encoding="utf-8")
+
+    with pytest.raises(PolicyError) as исключение:
+        strip_auto_section(путь)
+
+    сообщение = f"{исключение.value} {исключение.value.hint}"
+    assert "Catalog_ФизическиеЛица" not in сообщение
+    assert "hide" not in сообщение
+
+
+def test_битый_yaml_при_обратимом_разборе_тоже_policyerror(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\nfields: [не закрытый список\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError) as исключение:
+        strip_auto_section(путь)
+
+    assert исключение.value.code == "policy_invalid"

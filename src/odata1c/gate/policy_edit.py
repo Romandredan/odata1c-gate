@@ -17,21 +17,22 @@ from __future__ import annotations
 import os
 import pathlib
 
-from odata1c.gate.policy import PolicyError
+from odata1c.gate.policy import PolicyError, read_roundtrip
 
 
 def _открыть(path: pathlib.Path):
     """Разобрать файл владельца round-trip парсером ruamel — сохраняет комментарии и порядок
     разделов для последующей записи тем же разбором. Раздел неожиданного типа на верхнем уровне
     (не словарь) — `PolicyError`, тем же протоколом (`code`, `hint`), что и остальные ошибки
-    политики (`gate/policy.py::parse_owner_file`)."""
-    from ruamel.yaml import YAML
+    политики (`gate/policy.py::parse_owner_file`).
+
+    Сам разбор — общий `read_roundtrip` (`gate/policy.py`): ошибка YAML и повторяющийся раздел
+    (шаблонная заглушка `entities: {}` плюс раскомментированный пример `# entities:` ниже —
+    `DuplicateKeyError` ruamel, который pyyaml принимает молча) выходят отсюда `PolicyError`, а не
+    голой трассировкой ruamel посреди команды владельца (находка I1 итогового ревью M2b)."""
     from ruamel.yaml.comments import CommentedMap
 
-    yaml_rt = YAML()
-    yaml_rt.preserve_quotes = True
-    with path.open(encoding="utf-8") as f:
-        данные = yaml_rt.load(f)
+    yaml_rt, данные = read_roundtrip(path)
     if not isinstance(данные, CommentedMap):
         raise PolicyError(
             f"policy.yaml: ожидался словарь разделов, файл {path}",
