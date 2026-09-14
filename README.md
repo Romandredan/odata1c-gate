@@ -10,11 +10,13 @@
 Клиент — Claude Code (другие клиенты MCP работают, но подтверждение записи у них устроено иначе,
 см. [docs/install.md](docs/install.md)).
 
-**Статус: чтение и запись закрыты (M1, M2), идёт этап поставки M3.** Работают демон, лаунчер,
-индекс метаданных, гейт всех уровней, девять тулов чтения и семь тулов записи; приёмка на живой
-базе 1С пройдена и для чтения, и для записи ([docs/probes/M1d-live-check.md](docs/probes/M1d-live-check.md),
-[docs/probes/M2-live-check.md](docs/probes/M2-live-check.md)). Этап M3 собирает всё это в пакет
-PyPI и плагин Claude Code; первый выпуск — `0.1.0` ([CHANGELOG.md](CHANGELOG.md)).
+**Статус: выпуск `0.1.0` (чтение M1, запись M2 и поставка M3 закрыты 2026-09-14).** Работают
+демон, лаунчер, индекс метаданных, гейт всех уровней, девять тулов чтения и семь тулов записи;
+приёмка на живой базе 1С пройдена для чтения, записи и установки из PyPI и маркетплейса
+([docs/probes/M1d-live-check.md](docs/probes/M1d-live-check.md),
+[docs/probes/M2-live-check.md](docs/probes/M2-live-check.md),
+[docs/probes/M3-clean-install.md](docs/probes/M3-clean-install.md)); перечень изменений —
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Зачем это
 
