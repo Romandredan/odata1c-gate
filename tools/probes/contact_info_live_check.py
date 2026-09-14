@@ -318,7 +318,9 @@ def собрать_дом(
     исходный = рабочий / "bases" / БАЗА
     каталог = дом / "bases" / БАЗА
     каталог.mkdir()
-    for имя in ("metadata.sqlite", "policy.yaml", "recipes.yaml"):
+    # `policy.auto.yaml` — авторазметка реиндекса (ADR-0015): без неё во временном доме нет
+    # ни справочников людей, ни классов полей, и раздел «люди» показывает ложные открытые ФИО.
+    for имя in ("metadata.sqlite", "policy.yaml", "policy.auto.yaml", "recipes.yaml"):
         if (исходный / имя).exists():
             shutil.copy2(исходный / имя, каталог / имя)
     рецепты_путь = каталог / "recipes.yaml"

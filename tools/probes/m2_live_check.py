@@ -603,6 +603,9 @@ def собрать_дом(рабочий: pathlib.Path, адрес_посред�
         каталог.mkdir()
         скопировать_индекс(исходный / "metadata.sqlite", каталог / "metadata.sqlite")
         shutil.copy2(исходный / "policy.yaml", каталог / "policy.yaml")
+        # Авторазметка реиндекса (ADR-0015) — без неё гейт копии не знает классов полей.
+        if (исходный / "policy.auto.yaml").exists():
+            shutil.copy2(исходный / "policy.auto.yaml", каталог / "policy.auto.yaml")
     return дом
 
 
