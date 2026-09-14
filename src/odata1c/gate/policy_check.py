@@ -66,7 +66,7 @@ def _подсказка_поля(repo: IndexRepository, сущность: str, �
     return f"похожие поля: {', '.join(похожие)}" if похожие else ""
 
 
-def повторяющиеся_разделы(owner_path: pathlib.Path) -> list[tuple[str, int]]:
+def _повторяющиеся_разделы(owner_path: pathlib.Path) -> list[tuple[str, int]]:
     """Разделы верхнего уровня, встречающиеся в файле дважды, — пара «имя раздела, номер строки
     повтора» (находка I1 итогового ревью M2b).
 
@@ -144,7 +144,7 @@ def check_policy(owner_path: pathlib.Path, repo: IndexRepository | None) -> list
     owner_data = parse_owner_file(owner_path)
     находки: list[Finding] = []
 
-    for раздел, строка in повторяющиеся_разделы(owner_path):
+    for раздел, строка in _повторяющиеся_разделы(owner_path):
         находки.append(
             Finding(
                 level="error",
