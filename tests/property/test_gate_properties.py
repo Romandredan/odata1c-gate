@@ -11,7 +11,6 @@
 import contextlib
 import json
 import pathlib
-import random
 import re
 import tempfile
 import typing
@@ -426,16 +425,14 @@ def test_разные_значения_получают_разные_токен�
     ),
     до=st.text(max_size=30),
     после=st.text(max_size=30),
-    seed=st.integers(min_value=0, max_value=10_000),
+    ключи=st.permutations(["Description", "Комментарий", "Номер", "Сумма"]),
 )
 @settings(max_examples=100, deadline=None)
 def test_m5_название_не_остаётся_открытым_ни_при_каком_порядке_ключей(
-    название, до, после, seed
+    название, до, после, ключи
 ) -> None:
     """SPEC §6.6: два прохода — инвариант маскировщика. Ключи записи перемешиваются: ответ не
     должен зависеть от порядка, в котором их прислала 1С."""
-    ключи = ["Description", "Комментарий", "Номер", "Сумма"]
-    random.Random(seed).shuffle(ключи)
     значения = {
         "Description": название,
         "Комментарий": f"{до}{название}{после}",
