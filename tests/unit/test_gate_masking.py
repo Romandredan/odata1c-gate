@@ -1,5 +1,7 @@
 """Прямая подмена: поля по классу, свободный текст, уровни, служебные поля (SPEC §6.2, §6.4, §5.1)."""  # noqa: E501
 
+import json
+
 import pytest
 
 from odata1c.gate.dictionary import Dictionary
@@ -10,6 +12,7 @@ from odata1c.gate.masking import (
 )
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
+from odata1c.gate.tokens import parse_token
 
 СЕКРЕТ = "секрет ровно для тестов подмены!!".encode()
 
@@ -1399,3 +1402,27 @@ def test_masked_fields_свойство_каждое_значение_токен
         assert результат.partially_masked_fields == ["Комментарий"]
     finally:
         словарь.close()
+
+
+@pytest.mark.parametrize(
+    "порядок",
+    [("Description", "Комментарий"), ("Комментарий", "Description")],
+    ids=["класс-первым", "текст-первым"],
+)
+def test_m5_название_в_тексте_закрыто_токеном_своего_поля(гейт, порядок) -> None:
+    """M-5 (хвост M1d). Словарь пуст; в одной записи ответа название стоит и в поле с классом
+    `org`, и внутри свободного текста. Оба поля обязаны отдать ОДИН И ТОТ ЖЕ токен, и результат
+    не должен зависеть от порядка ключей в JSON, который прислала 1С."""
+    название = "Ромашка Плюс"
+    текст = f"оплата от {название} по счёту"
+    запись = {
+        порядок[0]: название if порядок[0] == "Description" else текст,
+        порядок[1]: название if порядок[1] == "Description" else текст,
+    }
+
+    итог = гейт("identifiers+names").mask(запись, entity="Catalog_Контрагенты")
+
+    токен = итог.data["Description"]
+    assert parse_token(токен), токен
+    assert название not in json.dumps(итог.data, ensure_ascii=False)
+    assert токен in итог.data["Комментарий"]

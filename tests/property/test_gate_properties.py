@@ -11,6 +11,7 @@
 import contextlib
 import json
 import pathlib
+import random
 import re
 import tempfile
 import typing
@@ -417,3 +418,33 @@ def test_разные_значения_получают_разные_токен�
         assert ТОКЕН_ИНН.match(второй), второй
         assert г.словарь.reveal(первый) == первый_инн
         assert г.словарь.reveal(второй) == второй_инн
+
+
+@given(
+    название=st.text(
+        alphabet=st.characters(min_codepoint=0x410, max_codepoint=0x44F), min_size=4, max_size=20
+    ),
+    до=st.text(max_size=30),
+    после=st.text(max_size=30),
+    seed=st.integers(min_value=0, max_value=10_000),
+)
+@settings(max_examples=100, deadline=None)
+def test_m5_название_не_остаётся_открытым_ни_при_каком_порядке_ключей(
+    название, до, после, seed
+) -> None:
+    """SPEC §6.6: два прохода — инвариант маскировщика. Ключи записи перемешиваются: ответ не
+    должен зависеть от порядка, в котором их прислала 1С."""
+    ключи = ["Description", "Комментарий", "Номер", "Сумма"]
+    random.Random(seed).shuffle(ключи)
+    значения = {
+        "Description": название,
+        "Комментарий": f"{до}{название}{после}",
+        "Номер": "ТД-000001",
+        "Сумма": 100,
+    }
+    запись = {ключ: значения[ключ] for ключ in ключи}
+
+    with связка() as г:
+        итог = г.маскировщик.mask(запись, entity=СУЩНОСТЬ)
+
+    assert название not in json.dumps(итог.data, ensure_ascii=False)
