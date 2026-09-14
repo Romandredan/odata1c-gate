@@ -637,7 +637,7 @@ wheels = [
 ]
 
 [[package]]
-name = "odata1c"
+name = "odata1c-gate"
 source = { editable = "." }
 dependencies = [
     { name = "ahocorasick-rs" },

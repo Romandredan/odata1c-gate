@@ -1,0 +1,13 @@
+{
+  "name": "odata1c-gate",
+  "description": "Шлюз к OData 1С для Claude Code с гейтом псевдонимизации.",
+  "owner": { "name": "romandredan" },
+  "plugins": [
+    {
+      "name": "odata1c",
+      "source": "./plugin",
+      "description": "Тулы чтения и записи 1С через OData за гейтом токенов, навыки, хук подтверждения записи, агент-следователь.",
+      "version": "0.1.0.dev0"
+    }
+  ]
+}

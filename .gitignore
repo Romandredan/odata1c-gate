@@ -59,3 +59,7 @@ Thumbs.db
 # Служебные каталоги: кэш hypothesis, рабочие копии агентов Claude Code
 .hypothesis/
 .claude/worktrees/
+
+# --- Плагин Claude Code ------------------------------------------------------
+# Результаты прогонов claude plugin eval — не поставка, локальный вывод (M3 задача 7).
+plugin/evals/results/

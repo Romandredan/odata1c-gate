@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "odata1c"
+name = "odata1c-gate"
 dynamic = ["version"]
 description = "Локальный MCP-шлюз к OData 1С:Предприятие с гейтом псевдонимизации"
 readme = "README.md"
@@ -28,6 +28,10 @@ dependencies = [
     "ahocorasick-rs>=0.22",
     "uvicorn>=0.30",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Romandredan/odata1c-gate"
+Repository = "https://github.com/Romandredan/odata1c-gate"
 
 [project.optional-dependencies]
 keyring = ["keyring>=25.0"]
@@ -57,6 +61,9 @@ exclude = ["tools/probes", "docs/probes", "tests/fixtures/edmx/*.full.edmx"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["error"]
+# tools/ — обычные скрипты, не пакет в составе дистрибутива; путь только для тестов,
+# которые импортируют tools.bump_version и tools.plugin_dev_copy напрямую (Задача 1 M3).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
