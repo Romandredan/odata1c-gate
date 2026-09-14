@@ -14,6 +14,7 @@ from odata1c.gate.guard import Guard, GuardResult
 from odata1c.gate.pipeline import BaseGate, guard_only
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.tokens import TOKEN_RE
+from odata1c.gate.unmasking import GateError
 from odata1c.tools.response import items_of
 
 СЕКРЕТ = "секрет-для-тестов-ровно-32-байта".encode()
@@ -488,3 +489,37 @@ def test_m7_счётчик_inlinecount_не_подменяется_коротк�
     записи, всего = items_of(разобрано)
     assert всего == 1
     assert записи[0]["КПП"] != "1"
+
+
+# --- M3b §3.6: то же правило пустого литерала на пути ЗАПИСИ ------------------------------------
+#
+# `BaseGate.check_open_literal` — вход подготовки `update` (Ruling 45): она сравнивает тело с
+# текущим состоянием и отвечает «изменений нет», то есть задаёт 1С тот же вопрос, что `eq`/`ne` на
+# чтении. Правило обязано быть одним и тем же на обоих путях, а тесты `Unmasker` этого пути не
+# видят: без своих тестов `литерал=value` можно снять при рефакторинге, и суд остался бы зелёным.
+
+КИ_КОНТРАГЕНТОВ = "Catalog_Контрагенты_КонтактнаяИнформация"
+
+
+def test_check_open_literal_пропускает_пустую_строку_на_контактной_информации(врата_prod):
+    """Очистка поля контактной информации — «поле не заполнено», один бит, а не подбор значения."""
+    врата_prod.check_open_literal(КИ_КОНТРАГЕНТОВ, "Представление", "", shape=строение_неизвестно)
+
+
+def test_check_open_literal_отклоняет_литерал_из_пробелов_на_контактной_информации(врата_prod):
+    """Послабление — ровно пустая строка: строка из пробелов остаётся открытым литералом."""
+    with pytest.raises(GateError) as отказ:
+        врата_prod.check_open_literal(
+            КИ_КОНТРАГЕНТОВ, "Представление", " ", shape=строение_неизвестно
+        )
+    assert отказ.value.code == "filter_syntax"
+
+
+def test_check_open_literal_не_пропускает_пустую_строку_на_дате_рождения(врата_prod):
+    """Контроль: класс `dob` послабления не получает — очистить дату нечем, кроме пустой даты 1С
+    (`0001-01-01T00:00:00`), и `литерал` его ветку не задевает."""
+    with pytest.raises(GateError) as отказ:
+        врата_prod.check_open_literal(
+            "Catalog_ФизическиеЛица", "ДатаРождения", "", shape=строение_неизвестно
+        )
+    assert отказ.value.code == "filter_syntax"
