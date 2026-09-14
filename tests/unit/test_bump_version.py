@@ -58,6 +58,29 @@ def test_bump_отклоняет_версию_неверного_формата(
     assert about_текст == исходный
 
 
+def test_plugin_json_канонический_и_bump_меняет_одну_строку() -> None:
+    """м-9 итогового ревью M3: манифест хранится ровно в той форме, в какой его пишет
+    `bump_version._записать_json`. Иначе первый же выпуск перекладывает весь файл, и разница
+    коммита выпуска не читается глазами.
+
+    Тест ничего не переписывает: он сравнивает файл с его же канонической сериализацией и
+    отдельно считает, сколько строк изменила бы подмена версии. `strict=True` у `zip` заодно
+    ловит изменение ЧИСЛА строк."""
+    путь = КОРЕНЬ / "plugin/.claude-plugin/plugin.json"
+    текст = путь.read_text(encoding="utf-8")
+    данные = json.loads(текст)
+    assert текст == json.dumps(данные, ensure_ascii=False, indent=2) + "\n"
+
+    данные["version"] = "9.9.9"
+    новый = json.dumps(данные, ensure_ascii=False, indent=2) + "\n"
+    различия = [
+        (было, стало)
+        for было, стало in zip(текст.splitlines(), новый.splitlines(), strict=True)
+        if было != стало
+    ]
+    assert len(различия) == 1
+
+
 def test_dev_copy_локальный_mcp_json_и_побайтная_копия_plugin_json(tmp_path):
     out = tmp_path / "plugin-dev"
 

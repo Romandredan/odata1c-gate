@@ -12,12 +12,12 @@ import pathlib
 
 import pytest
 
-from odata1c.cli import main
+from odata1c.cli import _проверить_рецепт_по_индексу, main
 from odata1c.config.loader import load_config
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
-from odata1c.recipes.model import RecipeError, library_dir, load_recipe_file
+from odata1c.recipes.model import Recipe, RecipeError, library_dir, load_recipe_file
 
 URL_UT = "http://localhost/ut/odata/standard.odata/"
 BASES_UT = f"""
@@ -365,6 +365,62 @@ def test_recipe_check_подсказка_не_называет_скрытую_с
 
     assert код == 1
     assert "Catalog_Контрагенты" not in вывод
+
+
+def _индекс_с_сущностью(tmp_path: pathlib.Path, entity: str, fields: set[str]) -> IndexRepository:
+    """Минимальный индекс с одной сущностью (ключ `Ref_Key` плюс перечисленные строковые поля) —
+    для м-3 итогового ревью M3: подсказка «похожие поля» не должна называть состав сущности,
+    скрытой владельцем, а реальный образец `$metadata` здесь не нужен."""
+    свойства = "\n".join(
+        f'        <Property Name="{поле}" Type="Edm.String" Nullable="true"/>'
+        for поле in sorted(fields)
+    )
+    edmx = f"""<?xml version="1.0" encoding="UTF-8"?>
+<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
+  <edmx:DataServices m:DataServiceVersion="3.0"
+                     xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+    <Schema Namespace="StandardODATA" xmlns="http://schemas.microsoft.com/ado/2009/11/edm">
+      <EntityType Name="{entity}">
+        <Key><PropertyRef Name="Ref_Key"/></Key>
+        <Property Name="Ref_Key" Type="Edm.Guid" Nullable="false"/>
+{свойства}
+      </EntityType>
+      <EntityContainer Name="StandardODATA" m:IsDefaultEntityContainer="true">
+        <EntitySet Name="{entity}" EntityType="StandardODATA.{entity}"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>""".encode()
+
+    репозиторий = IndexRepository(tmp_path / "metadata.sqlite")
+    репозиторий.write(parse_edmx(edmx))
+    return репозиторий
+
+
+def test_скрытая_сущность_не_подсказывает_похожие_поля(tmp_path) -> None:
+    """м-3 итогового ревью M3, согласованно с Ruling 80. Сущность найдена в индексе, но скрыта
+    владельцем: промах по полю печатается (статус проверки не меняется), а «похожие поля» —
+    нет, иначе состав скрытой сущности утёк бы через диагностику рецептов.
+
+    Рецепт называет поле «description» (строчными буквами) — опечатка в регистре реального имени
+    поля «Description»: `field_names` сравнивает точно, поэтому это промах, а не совпадение, но
+    достаточно похожий, чтобы `difflib.get_close_matches` в открытом случае назвал «Description»
+    в подсказке."""
+    repo = _индекс_с_сущностью(tmp_path, "Catalog_Контрагенты", {"Description", "ИНН", "КПП"})
+    try:
+        рецепт = Recipe(entity="Catalog_Контрагенты", select=["description"])
+
+        открытая = _проверить_рецепт_по_индексу(repo, tmp_path / "ut.yaml", рецепт)
+        скрытая = _проверить_рецепт_по_индексу(
+            repo, tmp_path / "ut.yaml", рецепт, hidden=frozenset({"Catalog_Контрагенты"})
+        )
+
+        assert "похожие поля: Description" in открытая[0]
+        assert len(скрытая) == 1
+        assert скрытая[0].startswith("error: ")
+        assert "похожие поля" not in скрытая[0]
+    finally:
+        repo.close()
 
 
 # --- recipe list ----------------------------------------------------------------------------

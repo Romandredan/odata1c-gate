@@ -188,6 +188,13 @@ claude mcp add odata1c -- uvx --from odata1c-gate odata1c mcp
 `plugin/.mcp.json` и `.claude-plugin/marketplace.json` она повторяется, и юнит-тест
 `tests/unit/test_versions_agree.py` требует равенства всех четырёх.
 
+**`main` двигается только выпусками.** Маркетплейс отдаёт плагин из ветки по умолчанию, а
+`plugin/.mcp.json` закрепляет версию дистрибутива на PyPI: любая правка `main` немедленно
+доходит до всех, кто поставил плагин. Поэтому в `main` попадает только коммит выпуска с тегом
+`v<версия>`, а рабочая ветка между выпусками живёт с версией `X.Y.Z.devN` во всех четырёх
+местах (`odata1c --version` тогда честно говорит, что это не выпуск). `claude plugin validate`
+версию с суффиксом `.devN` принимает.
+
 ```text
 uv run python tools/bump_version.py 0.1.0
 uv run pytest -q
