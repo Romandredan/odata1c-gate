@@ -196,8 +196,9 @@ SPEC §13. Пока этап не закрыт, часть описанного 
 - `uv run python tools/bump_version.py <версия>` — переписать версию во всех четырёх местах
   поставки (`__about__.py`, манифест плагина, `.mcp.json`, маркетплейс);
 - `claude plugin validate plugin/` — проверить манифест плагина, навыки, хук и агента;
-- `uv run python tools/plugin_dev_copy.py` — дев-копия плагина в `build/plugin-dev` на локально
-  собранное колесо, вход для `claude plugin eval` (команда прогона — `docs/install.md`).
+- `uv run python tools/plugin_dev_copy.py` — дев-копия плагина в `build/plugin-dev`, указывающая
+  на рабочую копию репозитория (`uv run --directory …`), вход для `claude plugin eval` (команда
+  прогона — `plugin/evals/README.md`).
 
 CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base list|base test|reindex|policy show|check|hide|open|set|recipe check|recipe list|reveal|doctor|service install|remove`.
 
