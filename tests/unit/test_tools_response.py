@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from odata1c.tools.response import (
     fit_result,
     items_of,
@@ -32,6 +34,17 @@ def test_strip_оставляет_dataversion_по_запросу():
 def test_count_строкой_становится_числом():
     записи, всего = items_of({"odata.count": "1103", "value": [{"a": 1}]})
     assert записи == [{"a": 1}] and всего == 1103
+
+
+@pytest.mark.parametrize("счётчик", ["", "   ", "неизвестно", None])
+def test_нечисловой_count_читается_как_неизвестный(счётчик):
+    """Минор ревью задачи 3: `int("")` ронял разбор ответа целиком. Публикация 1С счётчик отдаёт
+    строкой (проба P4), и пустая строка на месте числа — не повод отвечать `internal`: «сколько
+    всего» просто неизвестно, ровно как без `$inlinecount`. Тот же ответ и у `raw_get`, где тело
+    приходит от произвольного пути."""
+    записи, всего = items_of({"odata.count": счётчик, "value": [{"a": 1}]})
+    assert записи == [{"a": 1}]
+    assert всего is None
 
 
 def test_усечение_не_режет_токен():
