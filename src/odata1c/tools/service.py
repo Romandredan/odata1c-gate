@@ -63,10 +63,11 @@ from odata1c.index.repository import (
     IndexRepository,
 )
 from odata1c.recipes.model import (
+    Layered,
     Recipe,
-    RecipeBook,
     RecipeError,
-    load_recipes,
+    library_dir,
+    load_layered,
     recipes_path,
     template_hint,
 )
@@ -469,7 +470,7 @@ def _рецепты_markdown(конверт: dict) -> str:
         строки += [конверт["hint"], ""]
     for рецепт in конверт["recipes"]:
         заголовок = рецепт["title"] or рецепт["name"]
-        строки.append(f"## {рецепт['name']} — {заголовок}")
+        строки.append(f"## {рецепт['name']} — {заголовок} ({рецепт['source']})")
         if рецепт["description"]:
             строки.append(рецепт["description"])
         строки.append(f"Сущность: `{рецепт['entity']}`")
@@ -1306,6 +1307,13 @@ class ToolService:
                 "role": состояние.role,
                 "gate": состояние.gate_mode,
                 "write": состояние.write,
+                # Конфигурация для библиотеки рецептов (SPEC §8, ADR-0011 amended, M3 задача 3):
+                # `bases.yaml` модели не виден, а навык `odata1c-recipe` должен узнать `config`
+                # базы, чтобы найти её библиотеку (`recipes/<config>/`) — берётся из ТЕКУЩЕГО
+                # `self._config` (перечитан строкой выше, `_перечитать_настройки`), не из
+                # `BaseState`: там поле не заведено, а дублировать источник незачем — состояние
+                # реестра и `self._config.bases` синхронны сразу после перечитывания настроек.
+                "config": self._config.bases[состояние.name].config,
                 "indexed": False,
                 "indexed_at": None,
                 "entity_count": None,
@@ -1356,7 +1364,7 @@ class ToolService:
         # Не guard_only (ревью, раунд 1, Minor — обсуждено и оставлено как есть): guard_only —
         # строжайший уровень ДЛЯ ДАННЫХ 1С у ещё не определённой базы (см. докстринг
         # pipeline.guard_only), а здесь база у каждой строки определена, и то, что уходит в
-        # конверт, — ТОЛЬКО локальные данные: bases.yaml (name, label, role, gate, write) и
+        # конверт, — ТОЛЬКО локальные данные: bases.yaml (name, label, role, gate, write, config) и
         # метаданные индекса (indexed_at, entity_count, index_error — текст IndexCorruptError,
         # см. выше). Пропустить их через страж на строжайшем уровне ломает, а не защищает:
         # доказано исполнением — label "Песочница 7707083893" у базы с gate=off после
@@ -1711,16 +1719,17 @@ class ToolService:
         """
 
         async def тело(base_config, гейт, репозиторий, раскрытое):
-            книга = self._книга_рецептов(base_config)
+            слои = self._книга_рецептов(base_config)
             if not name:
-                return self._перечислить(base_config, гейт, книга)
+                return self._перечислить(base_config, гейт, слои)
 
+            книга = слои[0] if слои is not None else None
             рецепт = книга.recipes.get(name) if книга is not None else None
             if рецепт is None:
                 raise RecipeError(
                     "recipe_unknown",
                     f"рецепт с таким именем у базы «{base_config.name}» не описан",
-                    self._подсказка_рецептов(base_config, книга),
+                    self._подсказка_рецептов(base_config, слои),
                 )
 
             описание = self._resolve_entity(репозиторий, гейт, рецепт.entity)
@@ -1752,16 +1761,16 @@ class ToolService:
         # зависит, от него зависит только пометка применимости.
         return await self._run(scope, base, тело, with_index=bool(name))
 
-    def _книга_рецептов(self, base: BaseConfig) -> RecipeBook | None:
-        """Рецепты базы; `None` — файла нет вовсе (это не ошибка: рецепты необязательны).
+    def _книга_рецептов(self, base: BaseConfig) -> Layered | None:
+        """Слои рецептов базы (SPEC §8, ADR-0011, поправка 2026-09-14): шаблон пакета ← библиотека
+        конфигурации (`config` базы) ← собственный файл базы, с источником каждого имени.
+        `None` — рецептов показать неоткуда: ни `config`, ни собственного файла.
 
-        Файл читается на каждый вызов, без кэша по mtime: он маленький, вызовы редки, а правка
-        рецепта должна действовать сразу, без перезапуска демона.
+        Все слои читаются на каждый вызов, без кэша по mtime: они маленькие, вызовы редки, а
+        правка (нового файла в библиотеке в том числе) должна действовать сразу, без перезапуска
+        демона.
         """
-        путь = recipes_path(self._config.home, base)
-        if not путь.exists():
-            return None
-        return load_recipes(путь)
+        return load_layered(self._config.home, base)
 
     def _проверить_условия(
         self,
@@ -1843,7 +1852,7 @@ class ToolService:
             готовые[имя] = значение
         return готовые
 
-    def _перечислить(self, base: BaseConfig, gate: BaseGate, book: RecipeBook | None) -> dict:
+    def _перечислить(self, base: BaseConfig, gate: BaseGate, layered: Layered | None) -> dict:
         """Перечень рецептов с индексом базы, если он есть: непроиндексированная база — не повод
         отказывать в списке, применимость в этом случае просто неизвестна."""
         try:
@@ -1851,7 +1860,7 @@ class ToolService:
         except _ServiceError:
             репозиторий = None
         try:
-            return self._список_рецептов(base, gate, репозиторий, book)
+            return self._список_рецептов(base, gate, репозиторий, layered)
         finally:
             if репозиторий is not None:
                 репозиторий.close()
@@ -1861,14 +1870,15 @@ class ToolService:
         base: BaseConfig,
         gate: BaseGate,
         repo: IndexRepository | None,
-        book: RecipeBook | None,
+        layered: Layered | None,
     ) -> dict:
-        """Перечень рецептов базы с параметрами и пометкой применимости (SPEC §8): сущность
-        рецепта может отсутствовать в базе (шаблон УТ на базе БП), быть скрыта политикой или не
-        быть виртуальной таблицей, хотя рецепт задаёт её параметры — такой рецепт помечается
-        `applicable: false` с подсказкой, а не молча остаётся в списке наравне с рабочими.
+        """Перечень рецептов базы с параметрами, источником слоя и пометкой применимости
+        (SPEC §8, ADR-0011, поправка 2026-09-14): сущность рецепта может отсутствовать в базе
+        (шаблон УТ на базе БП), быть скрыта политикой или не быть виртуальной таблицей, хотя
+        рецепт задаёт её параметры — такой рецепт помечается `applicable: false` с подсказкой, а
+        не молча остаётся в списке наравне с рабочими.
 
-        `repo is None` — база ещё не проиндексирована: сами рецепты видны (они лежат в файле, а
+        `repo is None` — база ещё не проиндексирована: сами рецепты видны (они лежат в файлах, а
         не в индексе), но применимость неизвестна — `applicable: null` и подсказка про реиндекс.
         """
         конверт: dict = {
@@ -1877,9 +1887,10 @@ class ToolService:
             "gate": gate.mode,
             "recipes": [],
         }
-        if book is None:
-            конверт["hint"] = self._подсказка_рецептов(base, book)
+        if layered is None:
+            конверт["hint"] = self._подсказка_рецептов(base, layered)
             return конверт
+        book, источники = layered
 
         скрытые = self._скрытые(repo, gate)
         скрыто_рецептов = 0
@@ -1896,6 +1907,7 @@ class ToolService:
                 continue
             строка: dict = {
                 "name": имя,
+                "source": источники.get(имя, "base"),
                 "title": рецепт.title,
                 "description": рецепт.description,
                 "entity": рецепт.entity,
@@ -1928,7 +1940,7 @@ class ToolService:
             конверт["recipes"].append(строка)
         подсказки: list[str] = []
         if not конверт["recipes"] and not скрыто_рецептов:
-            подсказки.append(self._подсказка_рецептов(base, book))
+            подсказки.append(self._подсказка_рецептов(base, layered))
         elif repo is None:
             подсказки.append(
                 f"база «{base.name}» не проиндексирована: применимость рецептов неизвестна — "
@@ -1953,18 +1965,36 @@ class ToolService:
             конверт["hint"] = "; ".join(подсказки)
         return конверт
 
-    def _подсказка_рецептов(self, base: BaseConfig, book: RecipeBook | None) -> str:
+    def _подсказка_рецептов(self, base: BaseConfig, layered: Layered | None) -> str:
         """Подсказка о рецептах базы — одного вида во всех ветках (находка П4 приёмки через
-        настоящие инструменты): нет файла, файл пуст, рецепт не найден в пустой книге. Раньше
-        первая ветка называла путь и команду, вторая — только «файл рецептов базы пуст», третья —
-        команду без пути; команда `base add --recipes` у уже описанной базы вдобавок не работает.
-        Теперь каждая называет файл базы и откуда скопировать шаблон (`recipes.template_hint`)."""
+        настоящие инструменты): нет ни одного слоя, слои есть, но книга пуста, рецепт не найден в
+        непустой книге. Каждая называет файл СОБСТВЕННЫХ рецептов базы и откуда взять шаблон
+        (`recipes.template_hint`); если у базы задан `config` (ADR-0011, поправка 2026-09-14),
+        второе место — библиотека конфигурации (`recipes.library_dir`), куда рецепт можно
+        положить и без правки конкретной базы.
+
+        «Файла нет» и «файл пуст» различаются существованием СОБСТВЕННОГО файла базы, а не тем,
+        есть ли в объединённой книге хоть один рецепт: у базы с `config`, чей шаблон и библиотека
+        пусты (например, `config: bp` без единого рецепта в `recipes/bp/`), собственного файла
+        может не быть вовсе — `layered` тогда всё равно не `None` (слой `config` есть), а книга
+        пуста. Без этого различения такая база получила бы «файл рецептов базы пуст» о файле,
+        которого на диске нет."""
         путь = recipes_path(self._config.home, base)
-        if book is None:
-            return f"у базы «{base.name}» нет файла рецептов; {template_hint(путь)}"
-        if not book.recipes:
-            return f"файл рецептов базы «{base.name}» пуст; {template_hint(путь)}"
-        return f"рецепты базы: {', '.join(book.recipes)}"
+        if layered is None:
+            подсказка = f"у базы «{base.name}» нет файла рецептов; {template_hint(путь)}"
+        else:
+            book, _ = layered
+            if book.recipes:
+                return f"рецепты базы: {', '.join(book.recipes)}"
+            подсказка = (
+                f"файл рецептов базы «{base.name}» пуст; {template_hint(путь)}"
+                if путь.exists()
+                else f"у базы «{base.name}» нет файла рецептов; {template_hint(путь)}"
+            )
+        if base.config:
+            каталог = library_dir(self._config.home, base.config)
+            подсказка += f"; либо положите рецепт в библиотеку конфигурации {каталог}"
+        return подсказка
 
     async def resource_recipes(self, scope: SessionScope, base: str) -> str:
         """Ресурс `odata1c://recipes/{base}` — список рецептов базы в читаемом виде (SPEC §8).

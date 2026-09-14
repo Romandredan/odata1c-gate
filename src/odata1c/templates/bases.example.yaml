@@ -10,6 +10,7 @@ bases:
   #   user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
   #   password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС (odata1c base secret ut)
   #   role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
+  #   config: ut                       # конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя
 
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
     # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
@@ -35,8 +36,12 @@ bases:
     #   mode: identifiers+names      # off | identifiers | identifiers+names, см. SPEC §6.2
     #                                # что именно скрывать и что открыть: bases/ut/policy.yaml
 
-    # --- рецепты ---
-    # recipes: bases/ut/recipes.yaml # путь относительно домашнего каталога; создаётся из шаблона (base add --recipes ut)
+    # --- рецепты (SPEC §8, ADR-0011, поправка 2026-09-14) ---
+    # config задаёт библиотеку конфигурации (recipes/<config>/, см. выше) и шаблон пакета — оба
+    # подставляются сами, без копирования файла; recipes ниже — СОБСТВЕННЫЙ файл базы, верхний
+    # слой поверх них (odata1c base add --recipes создаёт его копией шаблона, как и прежде — сам
+    # config копии не требует; odata1c recipe list <база> показывает источник каждого рецепта)
+    # recipes: bases/ut/recipes.yaml # путь относительно домашнего каталога
 
   # buh:
   #   label: БП 3.0, боевая

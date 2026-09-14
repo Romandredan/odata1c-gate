@@ -57,6 +57,7 @@ from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path, reindex
 from odata1c.index.repository import IndexCorruptError, IndexRepository
 from odata1c.launcher import run_launcher
+from odata1c.recipes.model import Recipe, RecipeError, library_dir, load_layered, load_recipe_file
 from odata1c.registry.registry import Registry, SessionScope
 
 # Ошибки старта лаунчера (odata1c mcp), которые cmd_mcp форматирует сама, в stderr — не через
@@ -158,6 +159,17 @@ def main(argv: list[str] | None = None) -> int:
         "cls", metavar="класс", help="CLASSES (gate/tokens.py) | scan | custom:<имя>"
     )
 
+    recipe = команды.add_parser("recipe", help="библиотека рецептов", parents=[домашний])
+    recipe_sub = recipe.add_subparsers(dest="подкоманда", required=True)
+    recipe_check = recipe_sub.add_parser(
+        "check", help="проверить библиотеку рецептов конфигурации", parents=[домашний]
+    )
+    recipe_check.add_argument("config", help="имя конфигурации (каталог recipes/<config>/)")
+    recipe_list = recipe_sub.add_parser(
+        "list", help="список рецептов базы (шаблон, библиотека, файл базы)", parents=[домашний]
+    )
+    recipe_list.add_argument("name", help="имя базы")
+
     daemon_parser = команды.add_parser(
         "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
     )
@@ -230,6 +242,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_policy_open(home, args.name, args.field)
         if args.команда == "policy" and args.подкоманда == "set":
             return cmd_policy_set(home, args.name, args.field, args.cls)
+        if args.команда == "recipe" and args.подкоманда == "check":
+            return cmd_recipe_check(home, args.config)
+        if args.команда == "recipe" and args.подкоманда == "list":
+            return cmd_recipe_list(home, args.name)
         if args.команда == "daemon" and getattr(args, "действие", None) == "stop":
             return cmd_daemon_stop(home)
         if args.команда == "daemon":
@@ -249,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         DictionaryCorruptError,
         DictionaryBusyError,
         DaemonError,
+        RecipeError,
     ) as ошибка:
         # ConfigError (настройки), OdataError (ответ 1С), EdmxError (не удалось разобрать
         # $metadata), IndexCorruptError (файл индекса повреждён — reindex открывает прежний
@@ -257,10 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         # гейта — не SQLite или повреждён; правка по итогам ревью задачи 9: раньше эти два
         # класса были объявлены с тем же протоколом code/hint, что и остальные, но не попадали
         # в общий перехват — команды policy show и reveal роняли голый traceback вместо
-        # понятного сообщения) и DaemonError (план M1d, задача 5: порт демона уже занят) —
-        # разные классы, но у всех есть code и hint, и str() на всех даёт человекочитаемое
-        # сообщение (Exception.__init__ получает его же); одно место форматирования вместо
-        # шести копий.
+        # понятного сообщения), DaemonError (план M1d, задача 5: порт демона уже занят) и
+        # RecipeError (M3 задача 3: файл рецептов базы или библиотеки не читается — та же
+        # ветка, что читает `recipe list`, не только `recipe check`, которая сама печатает
+        # находки построчно и сюда не долетает) — разные классы, но у всех есть code и hint, и
+        # str() на всех даёт человекочитаемое сообщение (Exception.__init__ получает его же);
+        # одно место форматирования вместо шести копий.
         print(f"[{ошибка.code}] {ошибка}")
         if ошибка.hint:
             print(f"подсказка: {ошибка.hint}")
@@ -912,6 +931,19 @@ def cmd_reveal(
 
 
 def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) -> int:
+    """`odata1c base add <имя> [--role] [--recipes ut|bp|zup]`.
+
+    `--recipes <config>` (M3 задача 3, ADR-0011 amended, design §4b) пишет `config: <config>` в
+    `bases.yaml` — это и есть новое: библиотеку `~/.claude/odata1c/recipes/<config>/` и шаблон
+    пакета база после этого видит САМА, нижними слоями `recipes.model.load_layered`, без правки
+    файла. И, КАК ПРЕЖДЕ, копирует шаблон `templates/recipes/<config>.yaml` в
+    `bases/<имя>/recipes.yaml` (`_скопировать_рецепты`) — решение владельца сохранить прежнее
+    поведение команды один в один (design §4b, строка 130): копия становится верхним слоем и
+    перекрывает одноимённые рецепты библиотеки и шаблона, пока владелец её не поправит или не
+    уберёт. Параметр по-прежнему называется `recipes` (имя аргумента командной строки), но
+    пишется и полем `config`, и содержимым скопированного файла — это одно и то же значение с
+    двумя следствиями: снаружи вопрос «рецепты какой конфигурации», внутри — поле настроек и
+    стартовая копия."""
     cmd_init(home)
     config = load_config(home)
     _печать_предупреждений(config)
@@ -928,6 +960,7 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
         "user": input("пользователь 1С: ").strip(),
         "password": getpass.getpass("пароль 1С (не отображается): "),
         "role": role,
+        "config": recipes,
     }
     try:
         BaseConfig(name=name, **values)  # проверка имени и адреса до записи в файл
@@ -941,6 +974,10 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
         print(f"создан файл политики владельца: {policy_path(home, name)}")
     if recipes:
         _скопировать_рецепты(home, name, recipes)
+        print(
+            f"библиотека рецептов конфигурации «{recipes}»: {library_dir(home, recipes)} "
+            "(recipe list покажет источник каждого рецепта)"
+        )
     print(f"проверить соединение: odata1c base test {name}")
     return 0
 
@@ -996,6 +1033,21 @@ def _прочитать_env(path: pathlib.Path) -> str:
     )
 
 
+def _скопировать_рецепты(home: pathlib.Path, name: str, шаблон: str) -> None:
+    """Копия шаблона пакета в файл СОБСТВЕННЫХ рецептов базы — прежнее поведение `base add
+    --recipes`, сохранённое дословно (design §4b, строка 130: «и, как прежде, копирует шаблон»).
+    Существующий файл не трогает: повторный вызов на уже описанной базе (у которой `--recipes` не
+    задан её первым `base add`) печатает, что рецепты уже есть, и молчит дальше."""
+    источник = importlib.resources.files("odata1c.templates.recipes").joinpath(f"{шаблон}.yaml")
+    назначение = base_dir(home, name) / "recipes.yaml"
+    назначение.parent.mkdir(parents=True, exist_ok=True)
+    if назначение.exists():
+        print(f"рецепты уже есть: {назначение}, не трогаю")
+        return
+    назначение.write_text(источник.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"скопированы рецепты {шаблон}: {назначение}")
+
+
 def _без_учётных_данных(url: str) -> str:
     """Убрать user:password@ из адреса перед печатью. Прежний сервер иногда хранил их прямо
     в URL (https://имя:пароль@сервер/...) — переносим значение в bases.yaml как есть, но
@@ -1019,12 +1071,110 @@ def _записать_базу_по_умолчанию(path: pathlib.Path, name:
     path.write_text(f"default: {name}\n{текст}", encoding="utf-8")
 
 
-def _скопировать_рецепты(home: pathlib.Path, name: str, шаблон: str) -> None:
-    источник = importlib.resources.files("odata1c.templates.recipes").joinpath(f"{шаблон}.yaml")
-    назначение = base_dir(home, name) / "recipes.yaml"
-    назначение.parent.mkdir(parents=True, exist_ok=True)
-    if назначение.exists():
-        print(f"рецепты уже есть: {назначение}, не трогаю")
-        return
-    назначение.write_text(источник.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"скопированы рецепты {шаблон}: {назначение}")
+def _индекс_для_конфигурации(home: pathlib.Path, config: str) -> IndexRepository | None:
+    """Индекс первой описанной базы с этим `config`, у которой он уже есть (`odata1c reindex`
+    выполнен), — для сверки имён `recipe check` по метаданным. Несколько баз одной конфигурации
+    — обычное дело (тестовая и боевая УТ), и достаточно любой проиндексированной: имена сущностей
+    и полей одной типовой конфигурации от конкретной базы не зависят. Ни одной с индексом — `None`
+    (в т. ч. если баз с этим `config` нет вовсе): `cmd_recipe_check` в этом случае предупреждает,
+    а не отказывает — библиотека рецептов не привязана к тому, описана ли уже хоть одна база."""
+    for base in load_config(home).bases.values():
+        if base.config != config:
+            continue
+        репозиторий = _открыть_индекс_для_политики(home, base.name)
+        if репозиторий is not None:
+            return репозиторий
+    return None
+
+
+def _проверить_рецепт_по_индексу(
+    repo: IndexRepository, путь: pathlib.Path, recipe: Recipe
+) -> list[str]:
+    """Находки `recipe check` по одному рецепту: сущность и поля (`select`, `orderby`, поля
+    условий через `Recipe.param_field`) сверяются с индексом тем же способом, что и в
+    `gate/policy_check.py` (`resolve_name`, `field_names`, `suggest_names`,
+    `difflib.get_close_matches`) — два разных разбора одного и того же вопроса расходятся, урок
+    Ruling 20 из `recipes/render.py`."""
+    строки: list[str] = []
+    каноническое = repo.resolve_name(recipe.entity)
+    if каноническое is None:
+        строки.append(
+            f"error: {путь}: сущность «{recipe.entity}» не найдена в индексе базы"
+            f"{_похожие_сущности(repo, recipe.entity)}"
+        )
+        return строки  # поля сверять не с чем без канонического имени сущности
+
+    поля_индекса = repo.field_names(каноническое)
+    поля_рецепта = set(recipe.select)
+    if recipe.orderby:
+        поля_рецепта.add(recipe.orderby)
+    for имя_параметра in recipe.params:
+        поле = recipe.param_field(имя_параметра)
+        if поле:
+            поля_рецепта.add(поле)
+
+    for поле in sorted(поля_рецепта):
+        if поле not in поля_индекса:
+            похожие_поля = difflib.get_close_matches(поле, поля_индекса, n=3)
+            подсказка = f" (похожие поля: {', '.join(похожие_поля)})" if похожие_поля else ""
+            строки.append(
+                f"error: {путь}: поле «{поле}» не найдено у сущности «{recipe.entity}»{подсказка}"
+            )
+    return строки
+
+
+def cmd_recipe_check(home: pathlib.Path, config: str) -> int:
+    """`odata1c recipe check <config>` (M3 задача 3): каждый файл библиотеки рецептов
+    (`recipes/<config>/*.yaml`) читается через `load_recipe_file`; ошибка чтения (YAML, обёртка
+    книги вместо одного рецепта, неверное имя файла, поле рецепта) — строка `error` с путём файла.
+    Имена сущностей и полей сверяются по индексу первой проиндексированной базы с этим `config`
+    (`_индекс_для_конфигурации`); индекса ни у одной такой базы нет — одна строка `warning`, а не
+    отказ: библиотека рецептов существует независимо от того, добавлена ли уже база.
+
+    Код возврата — 1, только если есть хоть одна `error`; один `warning` без единой `error`
+    возврату не мешает (тот же принцип, что у `policy check`)."""
+    строки: list[str] = []
+    рецепты: list[tuple[pathlib.Path, Recipe]] = []
+    for путь in sorted(library_dir(home, config).glob("*.yaml")):
+        try:
+            рецепты.append((путь, load_recipe_file(путь)))
+        except RecipeError as ошибка:
+            строки.append(f"error: {путь}: {ошибка.message}")
+
+    репозиторий = _индекс_для_конфигурации(home, config)
+    if репозиторий is None:
+        строки.append(f"warning: имена не проверены: индекса базы с config={config} нет")
+    else:
+        try:
+            for путь, рецепт in рецепты:
+                строки.extend(_проверить_рецепт_по_индексу(репозиторий, путь, рецепт))
+        finally:
+            репозиторий.close()
+
+    if not строки:
+        print("замечаний нет")
+        return 0
+    for строка in строки:
+        print(строка)
+    return 1 if any(строка.startswith("error:") for строка in строки) else 0
+
+
+def cmd_recipe_list(home: pathlib.Path, name: str) -> int:
+    """`odata1c recipe list <база>` (M3 задача 3): все рецепты, которые видит база, — шаблон
+    пакета, библиотека конфигурации и собственный файл базы (`recipes.model.load_layered`),
+    строкой `<имя>  <источник>  <заголовок>` каждый, по алфавиту имени. Ни файла, ни `config` —
+    печатается, что рецептов нет, без ошибки: рецепты у базы необязательны."""
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    слои = load_layered(home, base)
+    if слои is None:
+        print(f"у базы «{base.name}» нет рецептов: ни собственного файла, ни config")
+        return 0
+    книга, источники = слои
+    if not книга.recipes:
+        print(f"у базы «{base.name}» рецептов нет")
+        return 0
+    for имя in sorted(книга.recipes):
+        рецепт = книга.recipes[имя]
+        print(f"{имя}  {источники.get(имя, 'base')}  {рецепт.title}")
+    return 0

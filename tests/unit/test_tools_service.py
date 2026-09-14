@@ -1305,6 +1305,29 @@ async def test_bases_показывает_статус_индекса(серви
     assert по_имени["dev"]["indexed"] is False
 
 
+async def test_bases_показывает_config(tmp_path, edmx_ut_real):
+    """SPEC §8 (ADR-0011 amended, M3 задача 3): навык `odata1c-recipe` узнаёт `config` базы
+    только отсюда — `bases.yaml` модели не виден. У базы с `config: ut` строка называет его,
+    у базы без — `null` (дополнение брифа задачи 3 от контроллера)."""
+    home = _дом(tmp_path, edmx_ut_real)
+    текст_настроек = (home / "bases.yaml").read_text(encoding="utf-8")
+    (home / "bases.yaml").write_text(
+        текст_настроек.replace("role: prod", "role: prod\n    config: ut", 1),
+        encoding="utf-8",
+    )
+    from odata1c.config.loader import load_config
+
+    служба = ToolService(load_config(home))
+    try:
+        данные = json.loads(await служба.bases(SessionScope()))
+    finally:
+        await служба.aclose()
+
+    по_имени = {б["name"]: б for б in данные["bases"]}
+    assert по_имени["ut"]["config"] == "ut"
+    assert по_имени["dev"]["config"] is None
+
+
 async def test_bases_на_пустом_доме_даёт_подсказку(tmp_path):
     home = tmp_path / "пустой_дом"
     main(["init", "--home", str(home)])
@@ -5073,3 +5096,46 @@ async def test_i1_добавленный_тип_не_меняет_списки_�
     assert ответы[0]["masked_fields"] == ответы[1]["masked_fields"]
     assert ответы[0]["partially_masked_fields"] == ответы[1]["partially_masked_fields"]
     assert "Тип" not in ответы[0]["masked_fields"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Библиотека рецептов по конфигурации (SPEC §8, ADR-0011, поправка 2026-09-14, M3 задача 3):
+# источник каждой строки перечня `odata1c_recipe` без имени.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_odata1c_recipe_показывает_источник_каждой_строки(дом):
+    """`config: ut` у базы (ADR-0011 amended) подключает библиотеку `recipes/ut/` и шаблон
+    пакета нижними слоями: рецепт библиотеки с тем же ИМЕНЕМ, что и у рецепта шаблона (`stock`),
+    перекрывает его целиком и показывается один раз, с `source: library` — не дважды и не с
+    `source: template`."""
+    from odata1c.config.loader import load_config
+    from odata1c.recipes.model import library_dir
+
+    текст_настроек = (дом / "bases.yaml").read_text(encoding="utf-8")
+    (дом / "bases.yaml").write_text(
+        текст_настроек.replace("role: prod", "role: prod\n    config: ut", 1),
+        encoding="utf-8",
+    )
+    каталог = library_dir(дом, "ut")
+    каталог.mkdir(parents=True, exist_ok=True)
+    (каталог / "stock.yaml").write_text(
+        "title: Контрагенты (переопределено библиотекой)\n"
+        "entity: Catalog_Контрагенты\n"
+        "select: [Ref_Key, Description]\n",
+        encoding="utf-8",
+    )
+
+    служба = ToolService(load_config(дом))
+    try:
+        ответ = json.loads(await служба.recipe(SessionScope(), base="ut"))
+    finally:
+        await служба.aclose()
+
+    assert ответ["recipes"], "библиотека и шаблон вместе должны дать хотя бы один рецепт"
+    assert all("source" in строка for строка in ответ["recipes"])
+
+    строки_stock = [строка for строка in ответ["recipes"] if строка["name"] == "stock"]
+    assert len(строки_stock) == 1, "рецепт с перекрытым именем должен быть в перечне один раз"
+    assert строки_stock[0]["source"] == "library"
+    assert строки_stock[0]["title"] == "Контрагенты (переопределено библиотекой)"

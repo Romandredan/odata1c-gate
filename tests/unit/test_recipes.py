@@ -685,6 +685,28 @@ async def test_без_файла_рецептов_подсказка_того_ж
     _подсказка_ведёт_к_шаблону(ответ["hint"], файл)
 
 
+async def test_config_без_файла_и_без_рецептов_говорит_файла_нет(дом):
+    """Находка advisor-ревью M3 задачи 3: у базы задан `config`, чьи шаблон и библиотека пусты
+    (`bp` — пакетный шаблон без единого рецепта, SPEC design §10), а собственного `recipes.yaml`
+    нет вовсе (`layered` при этом не `None`: слой `config` есть) — подсказка должна называть
+    ФАКТ («нет файла рецептов»), а не выдумывать несуществующий файл пустым."""
+    (дом / "bases.yaml").write_text(
+        BASES_YAML.replace("role: prod", "role: prod\n    config: bp", 1), encoding="utf-8"
+    )
+    (дом / "bases" / "ut" / "recipes.yaml").unlink()
+
+    служба = ToolService(load_config(дом))
+    try:
+        ответ = json.loads(await служба.recipe(SessionScope()))
+    finally:
+        await служба.aclose()
+
+    assert ответ["recipes"] == []
+    assert "нет файла рецептов" in ответ["hint"]
+    assert "пуст" not in ответ["hint"]
+    assert "библиотеку конфигурации" in ответ["hint"]
+
+
 async def test_неизвестный_рецепт_у_пустой_книги_подсказывает_шаблон(сервис, дом):
     файл = дом / "bases" / "ut" / "recipes.yaml"
     файл.write_text("version: 1\nrecipes: {}\n", encoding="utf-8")
