@@ -172,6 +172,14 @@ class Policy:
                 собранное[поле] = f"custom:{имя}"
         return собранное
 
+    def auto_items(self) -> dict[str, str]:
+        """Копия раздела `auto` действующей политики (`Сущность.Поле` → класс) — задача 4
+        (`policy show`/`policy check`, ADR-0015): `effective_rows` строит объединённый вид
+        (владелец поверх авторазметки) и не должен получить доступ к приватному `_auto`
+        напрямую. Копия — вызывающий может фильтровать и сортировать результат, не трогая
+        саму политику."""
+        return dict(self._auto)
+
 
 def load_policy(path: pathlib.Path, auto_path: pathlib.Path | None = None) -> Policy:
     """Собрать действующую политику базы (ADR-0015): правила владельца (`path`, `policy.yaml`)
@@ -185,8 +193,7 @@ def load_policy(path: pathlib.Path, auto_path: pathlib.Path | None = None) -> Po
     участвует в слиянии, но уступает файлу авторазметки. Умолчания собираются `merge_defaults`:
     владелец поверх авторазметки, `defaults.addr.mask_for` — объединением списков."""
     path = pathlib.Path(path)
-    данные = _разобрать_yaml(path) if path.exists() else {}
-    _проверить_разделы(данные, path)
+    данные = parse_owner_file(path)
 
     if auto_path is not None:
         авто = read_auto(auto_path)
@@ -322,6 +329,18 @@ def _проверить_разделы(данные: dict, path: pathlib.Path) -
                     f"выражение: {exc}",
                     hint=f"проверьте regex своего класса custom:{имя} в {path}",
                 ) from exc
+
+
+def parse_owner_file(path: pathlib.Path) -> dict:
+    """Прочитать и провалидировать файл владельца (`policy.yaml`) — публичная обёртка над
+    `_разобрать_yaml` + `_проверить_разделы` (задача 4, ADR-0015: `policy_check.py` и
+    `load_policy` разбирают один и тот же файл одним и тем же способом — раздвоения правил
+    валидации нет). Нет файла — пустой словарь, как и раньше в `load_policy`; синтаксическая
+    ошибка или раздел неожиданного типа — `PolicyError` наружу."""
+    path = pathlib.Path(path)
+    данные = _разобрать_yaml(path) if path.exists() else {}
+    _проверить_разделы(данные, path)
+    return данные
 
 
 def generate_policy(index, *, names_for: set[str] | None = None) -> dict:

@@ -1,4 +1,5 @@
-"""Команды CLI `policy show` и `reveal`: код и подсказка на всех путях ошибок (SPEC §3.5, §14.5).
+"""Команды CLI `policy show`, `policy check` и `reveal`: код и подсказка на всех путях ошибок
+(SPEC §3.5, §14.5).
 
 Правки по итогам ревью задачи 9 (Important): у обеих команд не было ни одного автотеста — именно
 поэтому падение на повреждённом словаре нашлось только ручной проверкой. Здесь же проверены
@@ -6,13 +7,18 @@
 несуществующей базе, на испорченном YAML; раскрытие известного токена (с указанием базы и поля и
 без него), неизвестного, испорченного (не соответствующего формату), токена реквизита и — на
 повреждённом файле словаря.
-"""
+
+Задача 4 плана M2b (ADR-0015) добавляет источник строки к `policy show` (`владелец` | `авто`) и
+новую команду `policy check` — тесты обеих ниже, в собственных разделах."""
 
 import pathlib
 
 from odata1c.cli import main
 from odata1c.config.loader import load_config
-from odata1c.gate.service import gate_db_path, open_dictionary, policy_path
+from odata1c.gate.service import auto_policy_path, gate_db_path, open_dictionary, policy_path
+from odata1c.index.edmx import parse_edmx
+from odata1c.index.reindex import index_path
+from odata1c.index.repository import IndexRepository
 
 URL = "http://localhost/ut/odata/standard.odata/"
 BASES = f"""
@@ -32,6 +38,14 @@ def _домашний_с_базой(tmp_path) -> pathlib.Path:
     main(["init", "--home", str(home)])
     (home / "bases.yaml").write_text(BASES, encoding="utf-8")
     return home
+
+
+def _построить_индекс(home: pathlib.Path, edmx_ut_real: bytes) -> None:
+    """Настоящий индекс на урезанном образце УТ (проба P4) — для тестов, которым нужны
+    существующие сущности/поля (счётчик дочерних у скрытых, проверка имён в `policy check`)."""
+    хранилище = IndexRepository(index_path(home, "ut"))
+    хранилище.write(parse_edmx(edmx_ut_real))
+    хранилище.close()
 
 
 # --- policy show ------------------------------------------------------------------------------
@@ -89,6 +103,138 @@ def test_policy_show_испорченной_политики(tmp_path, capsys):
     assert "policy_invalid" in вывод
     assert "подсказка" in вывод.lower()
     assert "traceback" not in вывод.lower()
+
+
+def test_policy_show_печатает_источник_строк(tmp_path, capsys):
+    """Задача 4: за файлом владельца следует объединённый вид — каждая строка помечена
+    источником, `владелец` или `авто` (ADR-0015: auto живёт в `policy.auto.yaml`)."""
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text(
+        "version: 2\nscan_free_text: true\nfields:\n  Catalog_Контрагенты.КодПоОКПО: keep\n",
+        encoding="utf-8",
+    )
+    auto_policy_path(home, "ut").write_text(
+        "version: 2\ndefaults: {}\nauto:\n  Catalog_Контрагенты.ИНН: inn\n", encoding="utf-8"
+    )
+
+    код = main(["policy", "show", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "действующая политика" in вывод
+    assert "Catalog_Контрагенты.ИНН: inn" in вывод
+    assert "# авто" in вывод
+    assert "Catalog_Контрагенты.КодПоОКПО: keep" in вывод
+    assert "# владелец" in вывод
+
+
+def test_policy_show_со_скрытыми_показывает_имена_владельцу(tmp_path, capsys, edmx_ut_real):
+    """`policy show` — локальная команда владельца, не MCP: в отличие от ресурса
+    `odata1c://policy/{base}` (задача 4, `names_visible=False`), здесь имя скрытой сущности
+    показывается как есть — это его собственный файл, и он его и так видит целиком выше."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text(
+        "version: 2\nentities:\n  Catalog_Контрагенты: { hide: true }\n", encoding="utf-8"
+    )
+
+    код = main(["policy", "show", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "# скрыты: Catalog_Контрагенты" in вывод
+    assert "дочерних" in вывод  # индекс есть — счётчик поддерева печатается
+
+
+def test_policy_show_без_индекса_без_счётчика_дочерних(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text(
+        "version: 2\nentities:\n  Catalog_Контрагенты: { hide: true }\n", encoding="utf-8"
+    )
+    assert not index_path(home, "ut").exists()
+
+    код = main(["policy", "show", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "# скрыты: Catalog_Контрагенты" in вывод
+    assert "дочерних" not in вывод
+
+
+# --- policy check -----------------------------------------------------------------------------
+
+
+def test_policy_check_без_файла_политики(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "политика ещё не создана" in вывод
+
+
+def test_policy_check_без_индекса_только_предупреждение(tmp_path, capsys):
+    """Без индекса имена не проверяются — одна `warning`, но она не даёт код 1: код возврата
+    зависит только от `error` (уточнение брифа задачи 4)."""
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nscan_free_text: true\n", encoding="utf-8")
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "warning: index: индекса нет" in вывод
+
+
+def test_policy_check_ошибка_даёт_код_1(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nfields:\n  Catalog_Контрагенты.ИНН: secret\n", encoding="utf-8")
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "error: fields.Catalog_Контрагенты.ИНН" in вывод
+    assert "неизвестен" in вывод
+
+
+def test_policy_check_без_замечаний(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nfields:\n  Catalog_Контрагенты.ИНН: inn\n", encoding="utf-8")
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "замечаний нет" in вывод
+
+
+def test_policy_check_испорченной_политики(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("fields: [не закрытый список\n", encoding="utf-8")
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "policy_invalid" in вывод
 
 
 # --- reveal ------------------------------------------------------------------------------------

@@ -41,7 +41,8 @@ from odata1c.gate.masking import (
     Resolve,
 )
 from odata1c.gate.pipeline import СТРОЖАЙШИЙ_УРОВЕНЬ, BaseGate, guard_only
-from odata1c.gate.policy import PolicyError, redact_policy
+from odata1c.gate.policy import PolicyError, parse_owner_file, redact_policy
+from odata1c.gate.policy_check import render_effective
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.service import (
     auto_policy_path,
@@ -2077,7 +2078,8 @@ class ToolService:
         return await self._run(scope, base, тело)
 
     async def resource_policy(self, scope: SessionScope, base: str) -> str:
-        """Ресурс `odata1c://policy/{base}` — текст `policy.yaml` базы через страж.
+        """Ресурс `odata1c://policy/{base}` — файл владельца плюс объединённый вид (владелец
+        поверх авторазметки, задача 4 плана M2b: `policy_check.render_effective`), через страж.
 
         В политике только имена сущностей и полей с классами защиты, самих значений там нет, —
         поэтому её можно показать модели: это и есть ответ на вопрос «почему это поле пришло
@@ -2085,10 +2087,18 @@ class ToolService:
         правит человек, и в комментарий к правилу он может вписать что угодно.
 
         Целиком — только пока владелец ничего не скрывал (Ruling 29, итоговое ревью M1d, раунд 3).
-        Правила скрытых сущностей и сам факт сокрытия из ответа вычёркиваются
+        Правила скрытых сущностей и сам факт сокрытия из текста файла вычёркиваются
         (`policy.redact_policy`): прежде ресурс печатал секцию `entities` с `hide: true` дословно
         и был самым полным раскрытием имён из всех тулов — при том что `describe` их уже не
         называл. Прочие настройки остаются: они объясняют поведение гейта и имён не выдают.
+
+        Объединённый блок (`render_effective`) на этот же текст НЕ пересобирается через
+        `redact_policy` — пересборка YAML стирает комментарии `# владелец`/`# авто` целиком, а
+        именно они и есть смысл задачи 4. Вместо этого `render_effective` сам исключает строки
+        скрытых сущностей (данные, не оформление — фильтр работает независимо от того, назван ли
+        файл владельца выше) и, с `names_visible=False`, не называет скрытые сущности в
+        комментариях `# скрыты:`/`# названия скрываются у:` (Ruling 29: имя скрытой сущности не
+        появляется ни в одном ответе, а не только в тексте самого файла).
 
         Наследование запрета на дочерние объекты (Ruling 30) знает только индекс, поэтому при
         наличии правил `hide` он читается и здесь — иначе строку `Document_X_Товары.Поле` не
@@ -2109,12 +2119,15 @@ class ToolService:
                     f"политика базы «{base_config.name}» ещё не создана",
                     "она собирается при первом реиндексе: odata1c_reindex(base)",
                 )
-            текст = путь.read_text(encoding="utf-8")
+            owner_text = путь.read_text(encoding="utf-8")
+            owner_data = parse_owner_file(путь)
+            # `гейт._policy` — тот же приём, что и в `describe_entity` (см. комментарий там):
+            # `pipeline.py` не даёт публичного доступа к `Policy`, а собирать её заново здесь
+            # (`load_policy`) означало бы читать оба файла политики второй раз и не видеть
+            # состояния, которое `гейт.refresh()` (вызван в `_run` перед `тело`) уже применил.
+            policy = гейт._policy
             if not гейт.has_hidden_entities():
-                # Ничего не скрыто — текст отдаётся дословно, вместе с комментариями владельца:
-                # пересборка YAML их теряет, и платить эту цену там, где вычёркивать нечего,
-                # незачем.
-                return текст
+                return render_effective(owner_text, policy, owner_data)
             try:
                 репозиторий = self._open_index(base_config)
             except (_ServiceError, IndexCorruptError) as ошибка:
@@ -2127,9 +2140,12 @@ class ToolService:
                 ) from ошибка
             try:
                 скрытые = self._скрытые(репозиторий, гейт)
+                текст_владельца = redact_policy(owner_text, set(скрытые))
+                return render_effective(
+                    текст_владельца, policy, owner_data, repo=репозиторий, names_visible=False
+                )
             finally:
                 репозиторий.close()
-            return redact_policy(текст, set(скрытые))
 
         return await self._run(
             scope,

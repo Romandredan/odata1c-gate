@@ -34,7 +34,8 @@ from odata1c.config.writer import (
 from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_detached
 from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
-from odata1c.gate.policy import PolicyError, load_policy
+from odata1c.gate.policy import PolicyError, load_policy, parse_owner_file
+from odata1c.gate.policy_check import check_policy, render_effective
 from odata1c.gate.service import (
     auto_policy_path,
     classifier_for,
@@ -43,8 +44,8 @@ from odata1c.gate.service import (
     refresh_policy,
 )
 from odata1c.index.edmx import EdmxError
-from odata1c.index.reindex import reindex
-from odata1c.index.repository import IndexCorruptError
+from odata1c.index.reindex import index_path, reindex
+from odata1c.index.repository import IndexCorruptError, IndexRepository
 from odata1c.launcher import run_launcher
 from odata1c.registry.registry import Registry, SessionScope
 
@@ -119,6 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     policy_sub = policy.add_subparsers(dest="подкоманда", required=True)
     show = policy_sub.add_parser("show", help="показать политику базы", parents=[домашний])
     show.add_argument("name", help="имя базы")
+    check = policy_sub.add_parser(
+        "check", help="проверить файл владельца по индексу", parents=[домашний]
+    )
+    check.add_argument("name", help="имя базы")
 
     daemon_parser = команды.add_parser(
         "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
@@ -173,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_reindex(home, args.name, args.force)
         if args.команда == "policy" and args.подкоманда == "show":
             return cmd_policy_show(home, args.name)
+        if args.команда == "policy" and args.подкоманда == "check":
+            return cmd_policy_check(home, args.name)
         if args.команда == "daemon" and getattr(args, "действие", None) == "stop":
             return cmd_daemon_stop(home)
         if args.команда == "daemon":
@@ -349,21 +356,84 @@ async def _реиндекс(base: BaseConfig, home: pathlib.Path, force: bool) -
     return 0
 
 
+def _открыть_индекс_для_политики(home: pathlib.Path, name: str) -> IndexRepository | None:
+    """Открыть индекс базы для `policy show`/`policy check`, если файл уже есть — с проверкой
+    версии разбора (тот же приём, что и `ToolService._open_index`): устаревший файл индекса не
+    должен ронять команду сырым `sqlite3.OperationalError` вместо понятной диагностики.
+    `IndexCorruptError` уходит наверх — общий перехват `main()` печатает код и подсказку. Нет
+    файла — `None`, обе команды работают и без индекса (см. их докстринги)."""
+    путь = index_path(home, name)
+    if not путь.exists():
+        return None
+    репозиторий = IndexRepository(путь)
+    try:
+        репозиторий.require_current_version()
+    except IndexCorruptError:
+        репозиторий.close()
+        raise
+    return репозиторий
+
+
 def cmd_policy_show(home: pathlib.Path, name: str) -> int:
+    """`odata1c policy show <база>` (задача 4 плана M2b, ADR-0015): файл владельца как есть,
+    плюс объединённый вид (владелец поверх авторазметки) с источником каждой строки —
+    `render_effective` (`gate/policy_check.py`).
+
+    Индекс открывается, только если файл индекса уже есть (`index_path`) — на свежей базе,
+    ещё не прошедшей `reindex`, команда работает и без него, просто без счётчика дочерних
+    у скрытых сущностей (см. докстринг `render_effective`); это НЕ отказ, в отличие от
+    `resource_policy` — там нужна гарантия наследования запрета `hide` на дочерние объекты,
+    здесь — только диагностика для владельца, ошибиться в счётчике не опасно."""
     config = load_config(home)
     base = Registry(config).get(name, SessionScope())
     путь = policy_path(home, base.name)
     if not путь.exists():
         print(f"политика ещё не создана; выполните: odata1c reindex {base.name}")
         return 1
-    # Валидация тем же способом, что и остальной код (gate/policy.py::load_policy), а не молчаливая
-    # печать сырого текста: испорченный YAML или раздел неожиданного типа должны остановить команду
-    # понятной ошибкой, а не мусором на экране (правка по итогам ревью задачи 9). PolicyError
-    # уходит наверх — форматирует общий перехват в main() (код + подсказка).
-    load_policy(путь)
+    # Валидация тем же способом, что и остальной код (gate/policy.py::parse_owner_file/
+    # load_policy), а не молчаливая печать сырого текста: испорченный YAML или раздел
+    # неожиданного типа должны остановить команду понятной ошибкой, а не мусором на экране
+    # (правка по итогам ревью задачи 9). PolicyError уходит наверх — форматирует общий перехват
+    # в main() (код + подсказка).
+    owner_data = parse_owner_file(путь)
+    policy = load_policy(путь, auto_policy_path(home, base.name))
+    репозиторий = _открыть_индекс_для_политики(home, base.name)
+    try:
+        текст = render_effective(
+            путь.read_text(encoding="utf-8"), policy, owner_data, repo=репозиторий
+        )
+    finally:
+        if репозиторий is not None:
+            репозиторий.close()
     print(f"# {путь}")
-    print(путь.read_text(encoding="utf-8"))
+    print(текст)
     return 0
+
+
+def cmd_policy_check(home: pathlib.Path, name: str) -> int:
+    """`odata1c policy check <база>` (задача 4 плана M2b): находки `check_policy` —
+    опечатки в именах сущностей и полей (по индексу, если он есть), неизвестные классы, свой
+    класс без `fields`/`regex`, `keep` на сущности, которую владелец сам же скрыл. Код возврата
+    1 только если есть хоть одна `error`; одни `warning` возврату не мешают."""
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    путь = policy_path(home, base.name)
+    if not путь.exists():
+        print(f"политика ещё не создана; выполните: odata1c reindex {base.name}")
+        return 1
+    репозиторий = _открыть_индекс_для_политики(home, base.name)
+    try:
+        находки = check_policy(путь, репозиторий)
+    finally:
+        if репозиторий is not None:
+            репозиторий.close()
+    if not находки:
+        print("замечаний нет")
+        return 0
+    for находка in находки:
+        подсказка = f" ({находка.hint})" if находка.hint else ""
+        print(f"{находка.level}: {находка.where}: {находка.message}{подсказка}")
+    return 1 if any(находка.level == "error" for находка in находки) else 0
 
 
 def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
