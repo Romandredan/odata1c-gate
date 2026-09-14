@@ -8,7 +8,10 @@ bases:
   #   label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
   #   url: https://1c.corp.local/ut/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
   #   user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
-  #   password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС (odata1c base secret ut)
+  #   password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС — нужна установка
+  #                                     # с extra keyring (uv tool install "odata1c-gate[keyring]"),
+  #                                     # секрет кладётся командой пакета keyring:
+  #                                     # keyring set odata1c/base <имя базы>
   #   role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
   #   config: ut                       # конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя
 
@@ -24,7 +27,8 @@ bases:
     # permissions:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов
-    #   independent_register_delete: false   # DELETE записей регистров сведений без регистратора (odata1c_delete_record)
+    #   independent_register_delete: false   # зарезервирован: тула удаления записей регистров в
+    #                                         # поставке нет, флаг ни на что не влияет (Ruling 100)
     #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта (Ruling 57)
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
@@ -55,4 +59,4 @@ bases:
   #   url: http://localhost/ut_test/odata/standard.odata/
   #   user: Администратор
   #   password: ""
-  #   role: dev                      # гейт выключен, запись и удаление в независимых регистрах разрешены
+  #   role: dev                      # гейт выключен, запись разрешена
