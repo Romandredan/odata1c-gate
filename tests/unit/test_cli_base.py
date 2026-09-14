@@ -7,6 +7,7 @@ import pytest
 import respx
 import yaml
 
+import odata1c
 import odata1c.cli as cli
 from odata1c.cli import main
 from odata1c.config.loader import ConfigError, load_config
@@ -42,6 +43,18 @@ def test_init_не_затирает_существующие_настройки(
     (home / "bases.yaml").write_text(BASES, encoding="utf-8")
     main(["init", "--home", str(home)])
     assert "УТ 11, тестовая" in (home / "bases.yaml").read_text(encoding="utf-8")
+
+
+def test_version_печатает_версию_пакета(capsys):
+    """Ruling 64: `odata1c --version` не требует подкоманды (action="version" завершает разбор
+    аргументов раньше проверки required=True у подпарсеров) и печатает версию из __about__.py —
+    единственного места, откуда версия берётся (AGENTS.md: «версия одна на всё»)."""
+    with pytest.raises(SystemExit) as выход:
+        main(["--version"])
+    вывод = capsys.readouterr().out
+
+    assert выход.value.code == 0
+    assert вывод.strip() == f"odata1c-gate {odata1c.__version__}"
 
 
 def test_base_list_показывает_роль_и_уровень_гейта(tmp_path, capsys):

@@ -65,6 +65,7 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp_types import ToolAnnotations
 from pydantic import ValidationError
 
+from odata1c import __version__
 from odata1c.config.home import check_file_permissions, ensure_home
 from odata1c.config.loader import load_config
 from odata1c.config.models import AppConfig, Limits
@@ -607,6 +608,7 @@ def build_server(
     слой = write if write is not None else build_write_layer(service)
     server = _GateServer(
         "odata1c",
+        version=__version__,
         instructions=INSTRUCTIONS,
         refuse=service._guard_error,
         trace=service._записать_трассировку,

@@ -19,6 +19,8 @@ import httpx2
 import pydantic
 from mcp.shared.exceptions import MCPError
 
+from odata1c import doctor
+from odata1c.__about__ import __version__
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
 from odata1c.config.home import base_dir, ensure_home, resolve_home
@@ -92,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="odata1c", description="Шлюз к OData 1С с гейтом", parents=[домашний]
     )
+    # Ruling 64: версия пакета — одна на весь инструмент, источник — __about__.py (SPEC design
+    # §2). action="version" печатает и завершает разбор ДО проверки required=True у подпарсеров
+    # ниже — `odata1c --version` не требует подкоманды.
+    parser.add_argument("--version", action="version", version=f"odata1c-gate {__version__}")
     команды = parser.add_subparsers(dest="команда", required=True)
 
     команды.add_parser(
@@ -176,6 +182,17 @@ def main(argv: list[str] | None = None) -> int:
         "--url", help="адрес демона явно (иначе daemon_url из порта daemon.yaml)"
     )
 
+    doctor_parser = команды.add_parser(
+        "doctor",
+        help="проверка окружения: uv, дом, базы, индекс, политика, демон, Claude Code",
+        parents=[домашний],
+    )
+    doctor_parser.add_argument(
+        "--online",
+        action="store_true",
+        help="дополнительно проверить соединение с 1С каждой видимой базы (как base test)",
+    )
+
     reveal = команды.add_parser(
         "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
     )
@@ -219,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_daemon(home, args.foreground)
         if args.команда == "mcp":
             return cmd_mcp(home, args.bases, args.default, args.url)
+        if args.команда == "doctor":
+            return cmd_doctor(home, args.online)
         if args.команда == "reveal":
             return cmd_reveal(home, args.token, base=args.base, field=args.field)
     except (
@@ -778,6 +797,17 @@ def cmd_daemon_stop(home: pathlib.Path) -> int:
     итог = остановить_демон(home)
     print(итог.причина)
     return 0 if итог.снят else 1
+
+
+def cmd_doctor(home: pathlib.Path, online: bool) -> int:
+    """`odata1c doctor [--online]` (план M3, задача 2): десять строк проверки окружения —
+    `doctor.run` собирает их без единого пароля, имени пользователя 1С или полного адреса базы
+    в выводе (`doctor.py`, докстринг модуля); эта команда только печатает таблицу и возвращает
+    код по худшей строке. `doctor.run` не бросает исключений сама (см. её докстринг) — обёртывать
+    вызов в try/except здесь незачем."""
+    проверки = doctor.run(home, online=online)
+    print(doctor.render(проверки), end="")
+    return doctor.exit_code(проверки)
 
 
 def _разобрать_bases(raw: str | None) -> list[str] | None:
