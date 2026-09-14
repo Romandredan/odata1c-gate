@@ -303,16 +303,58 @@ def _проверить_тип_раздела(данные: dict, ключ: str,
         )
 
 
+def _проверить_ключи_строками(данные: dict, раздел: str, path: pathlib.Path) -> None:
+    """Ключи `entities`/`fields`/`auto`/`custom` — это `Сущность.Поле`, имя сущности или имя
+    класса, а не произвольное значение; YAML без кавычек охотно разберёт `123: keep` как ключ-
+    число или `true: {...}` как ключ-булево. Без этой проверки такой ключ доходил бы необработанным
+    до `check_policy`/`effective_rows` (`.partition` на не-строке — `AttributeError`, смешанная
+    сортировка строк и чисел — `TypeError`) и до `redact_policy`, которая эту форму уже переживала
+    через `isinstance` (находка 2 ревью задачи 4, Important: то же самое, только раньше, здесь
+    честной ошибкой политики, а не голым исключением посреди ответа тула)."""
+    значение = данные.get(раздел)
+    if not isinstance(значение, dict):
+        return
+    for ключ in значение:
+        if not isinstance(ключ, str):
+            raise PolicyError(
+                f"{path.name}: раздел {раздел} — ключ {ключ!r} должен быть строкой, "
+                f"получено {type(ключ).__name__}",
+                hint=f"проверьте раздел {раздел} в {path}",
+            )
+
+
+def _проверить_список_строк(значение, где: str, path: pathlib.Path) -> None:
+    """Элементы `names_for`/`defaults.addr.mask_for` — имена сущностей, тоже обязаны быть
+    строками (та же находка 2: нестроковый элемент списка иначе доходил бы до `resolve_name`/
+    `startswith` необработанным)."""
+    if значение is None:
+        return
+    for элемент in значение:
+        if not isinstance(элемент, str):
+            raise PolicyError(
+                f"{path.name}: {где} — элемент {элемент!r} должен быть строкой, "
+                f"получено {type(элемент).__name__}",
+                hint=f"проверьте {где} в {path}",
+            )
+
+
 def _проверить_разделы(данные: dict, path: pathlib.Path) -> None:
-    """Раздел неожиданного типа и недопустимое regex своего класса — ошибка при чтении политики,
-    а не при первом обращении к полю посреди обработки ответа тула (SPEC §6.9)."""
+    """Раздел неожиданного типа, нестроковый ключ/элемент и недопустимое regex своего класса —
+    ошибка при чтении политики, а не при первом обращении к полю посреди обработки ответа тула
+    (SPEC §6.9)."""
     for раздел in ("defaults", "entities", "fields", "auto", "custom"):
         _проверить_тип_раздела(данные, раздел, path)
+    for раздел in ("entities", "fields", "auto", "custom"):
+        _проверить_ключи_строками(данные, раздел, path)
     имена = данные.get("names_for")
     if имена is not None and not isinstance(имена, list):
         raise PolicyError(
             f"policy.yaml: раздел names_for должен быть списком, получено {type(имена).__name__}"
         )
+    _проверить_список_строк(имена, "names_for", path)
+    адрес = (данные.get("defaults") or {}).get("addr")
+    if isinstance(адрес, dict):
+        _проверить_список_строк(адрес.get("mask_for"), "defaults.addr.mask_for", path)
     for имя, описание in (данные.get("custom") or {}).items():
         if not isinstance(описание, dict):
             raise PolicyError(

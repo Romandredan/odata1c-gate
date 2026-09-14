@@ -7,8 +7,8 @@ import textwrap
 
 import pytest
 
-from odata1c.gate.policy import PolicyError
-from odata1c.gate.policy_check import Finding, check_policy
+from odata1c.gate.policy import PolicyError, load_policy, parse_owner_file
+from odata1c.gate.policy_check import Finding, check_policy, render_effective
 
 
 def _владелец(tmp_path: pathlib.Path, текст: str) -> pathlib.Path:
@@ -205,3 +205,82 @@ def test_finding_атрибуты_по_умолчанию():
     находка = Finding(level="warning", where="x", message="сообщение")
 
     assert находка.hint == ""
+
+
+# --- ревью задачи 4 (Important) ------------------------------------------------------------
+
+
+def test_нестроковый_ключ_в_fields_даёт_policyerror_а_не_голое_исключение(tmp_path):
+    """Находка 2 ревью задачи 4 (Important): YAML без кавычек разбирает `123: keep` как ключ-
+    число — без проверки типа `check_policy` падал `AttributeError` на `ключ.partition(".")`,
+    а `effective_rows` — `TypeError` при сортировке смешанных строк и чисел. Теперь это ошибка
+    политики (`PolicyError`, код `policy_invalid`), как и любой другой неверный файл владельца —
+    не исключение посреди работы тула/команды."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\nfields:\n  123: keep\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError) as ошибка:
+        check_policy(путь, None)
+
+    assert ошибка.value.code == "policy_invalid"
+    assert "fields" in str(ошибка.value)
+
+
+def test_нестроковый_элемент_names_for_даёт_policyerror(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\nnames_for: [Catalog_Контрагенты, 42]\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError):
+        parse_owner_file(путь)
+
+
+def test_нестроковый_элемент_mask_for_даёт_policyerror(tmp_path):
+    путь = tmp_path / "policy.yaml"
+    путь.write_text(
+        "version: 2\ndefaults:\n  addr:\n    mask_for: [Catalog_ФизическиеЛица, 1]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PolicyError):
+        parse_owner_file(путь)
+
+
+def test_render_effective_скрывает_строку_потомка_независимо_от_names_visible(tmp_path):
+    """Находка 1 ревью задачи 4 (Important): `render_effective` больше не пересчитывает набор
+    скрытых сама (из `policy.hidden_entities()` и необязательного `repo`) — полный набор
+    (корень + поддерево) передаёт вызывающий через обязательный `hidden`. Здесь имитируется
+    вызывающий, который посчитал набор верно (как `ToolService._скрытые`/`repo.descendants`):
+    строка авторазметки дочернего объекта (`…_Товары.Номенклатура`) не должна появиться ни во
+    владельческом виде (`names_visible=True`), ни в виде для модели (`names_visible=False`).
+
+    Раздел `auto` — в ОТДЕЛЬНОМ файле авторазметки (ADR-0015), а не в теле владельца: иначе сама
+    строка `Document_X_Товары.Номенклатура: org` лежала бы в `owner_text` буквально (владелец
+    печатается как есть, без редактирования), и тест проверял бы не фильтр `render_effective`,
+    а совсем другое — что уже отфильтровал вызывающий до него."""
+    путь = tmp_path / "policy.yaml"
+    путь.write_text("version: 2\nentities:\n  Document_X: { hide: true }\n", encoding="utf-8")
+    путь_авто = tmp_path / "policy.auto.yaml"
+    путь_авто.write_text(
+        "version: 2\ndefaults: {}\nauto:\n  Document_X_Товары.Номенклатура: org\n",
+        encoding="utf-8",
+    )
+    owner_data = parse_owner_file(путь)
+    policy = load_policy(путь, путь_авто)
+    корни = policy.hidden_entities()
+    assert корни == {"Document_X"}
+    полный_набор = корни | {"Document_X_Товары"}  # то, что вернул бы repo.descendants(корни)
+
+    для_владельца = render_effective(
+        путь.read_text(encoding="utf-8"), policy, owner_data, hidden=полный_набор
+    )
+    для_модели = render_effective(
+        путь.read_text(encoding="utf-8"),
+        policy,
+        owner_data,
+        hidden=полный_набор,
+        names_visible=False,
+    )
+
+    assert "Document_X_Товары.Номенклатура" not in для_владельца
+    assert "Document_X_Товары.Номенклатура" not in для_модели
+    assert "Document_X_Товары" not in для_модели  # и сам потомок не назван модели по имени

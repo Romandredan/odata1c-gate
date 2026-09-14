@@ -2127,7 +2127,7 @@ class ToolService:
             # состояния, которое `гейт.refresh()` (вызван в `_run` перед `тело`) уже применил.
             policy = гейт._policy
             if not гейт.has_hidden_entities():
-                return render_effective(owner_text, policy, owner_data)
+                return render_effective(owner_text, policy, owner_data, hidden=set())
             try:
                 репозиторий = self._open_index(base_config)
             except (_ServiceError, IndexCorruptError) as ошибка:
@@ -2139,10 +2139,15 @@ class ToolService:
                     f"дочернего объекта скрытой сущности от постороннего ({ошибка})",
                 ) from ошибка
             try:
+                # Один и тот же ПОЛНЫЙ набор скрытых (корни + поддерево) идёт и в `redact_policy`
+                # (текст файла владельца), и в `render_effective` (объединённый блок) — находка 1
+                # ревью задачи 4 (Important): раньше `render_effective` пересчитывала набор сама
+                # из `repo`, и без него (или при иной ошибке дисциплины вызывающего) получала бы
+                # неполный набор — только корни, без потомков.
                 скрытые = self._скрытые(репозиторий, гейт)
                 текст_владельца = redact_policy(owner_text, set(скрытые))
                 return render_effective(
-                    текст_владельца, policy, owner_data, repo=репозиторий, names_visible=False
+                    текст_владельца, policy, owner_data, hidden=set(скрытые), names_visible=False
                 )
             finally:
                 репозиторий.close()

@@ -237,6 +237,40 @@ def test_policy_check_испорченной_политики(tmp_path, capsys):
     assert "policy_invalid" in вывод
 
 
+def test_policy_check_нестроковый_ключ_в_fields_даёт_policy_invalid_а_не_traceback(
+    tmp_path, capsys
+):
+    """Находка 2 ревью задачи 4 (Important): `fields: {123: keep}` — YAML разбирает `123` как
+    число, и без проверки типа `check_policy` падал `AttributeError` мимо перехвата `main()`.
+    Теперь это `PolicyError` (код `policy_invalid`), тем же путём, что и любой другой битый
+    файл владельца."""
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nfields:\n  123: keep\n", encoding="utf-8")
+
+    код = main(["policy", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "policy_invalid" in вывод
+    assert "traceback" not in вывод.lower()
+
+
+def test_policy_show_нестроковый_ключ_в_fields_даёт_policy_invalid_а_не_traceback(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nfields:\n  123: keep\n", encoding="utf-8")
+
+    код = main(["policy", "show", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "policy_invalid" in вывод
+    assert "traceback" not in вывод.lower()
+
+
 # --- reveal ------------------------------------------------------------------------------------
 
 

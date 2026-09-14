@@ -1673,6 +1673,34 @@ async def test_битая_политика_не_роняет_bases(дом):
         await служба.aclose()
 
 
+def _политика_с_нестроковым_ключом(дом):
+    """YAML без кавычек разбирает `123` как число — синтаксически файл валиден (в отличие от
+    `_сломать_политику`), но ключ раздела `fields` не строка (находка 2 ревью задачи 4,
+    Important)."""
+    from odata1c.gate.service import policy_path
+
+    путь = policy_path(дом, "ut")
+    путь.write_text(путь.read_text(encoding="utf-8") + "fields:\n  123: keep\n", encoding="utf-8")
+
+
+async def test_нестроковый_ключ_в_fields_не_роняет_resource_policy(дом):
+    """Находка 2 ревью задачи 4 (Important): без проверки типа ключа `effective_rows`/
+    `check_policy` падали `AttributeError`/`TypeError` мимо перехвата `_run`, и ресурс отвечал
+    `internal` — регресс относительно поведения ДО задачи 4 (`redact_policy` эту форму уже
+    переживала через `isinstance`). Теперь `PolicyError` встаёт на этапе построения гейта
+    (`load_policy` → `parse_owner_file` → `_проверить_разделы`), тем же путём и с тем же кодом,
+    что и любой другой битый `policy.yaml` (см. `test_битая_политика_не_роняет_*` выше)."""
+    from odata1c.config.loader import load_config
+
+    _политика_с_нестроковым_ключом(дом)
+    служба = ToolService(load_config(дом))
+    try:
+        ошибка = json.loads(await служба.resource_policy(SessionScope(), "ut"))["error"]
+        assert ошибка["code"] == "policy_invalid"
+    finally:
+        await служба.aclose()
+
+
 # =============================================================================================
 # Задача 7 плана M1d: reindex, info, raw_get, ресурсы
 # =============================================================================================

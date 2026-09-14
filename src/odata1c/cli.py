@@ -399,8 +399,14 @@ def cmd_policy_show(home: pathlib.Path, name: str) -> int:
     policy = load_policy(путь, auto_policy_path(home, base.name))
     репозиторий = _открыть_индекс_для_политики(home, base.name)
     try:
+        # Полный набор скрытых (корни + поддерево) — обязанность вызывающего (находка 1 ревью
+        # задачи 4, Important): `render_effective` больше не принимает индекс и не строит набор
+        # сама. Без индекса поддерево неизвестно — это диагностика, не отказ (в отличие от
+        # `resource_policy`, см. докстринг выше).
+        корни = policy.hidden_entities()
+        скрытые = корни | репозиторий.descendants(корни) if репозиторий is not None else корни
         текст = render_effective(
-            путь.read_text(encoding="utf-8"), policy, owner_data, repo=репозиторий
+            путь.read_text(encoding="utf-8"), policy, owner_data, hidden=set(скрытые)
         )
     finally:
         if репозиторий is not None:
