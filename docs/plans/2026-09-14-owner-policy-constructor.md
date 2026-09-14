@@ -573,9 +573,9 @@ def _применить_настройки(self, новая: AppConfig) -> None:
 
 Без кода. Выполняется владельцем или с его согласия, потому что трогает `~/.claude/odata1c/`.
 
-- [ ] **Step 1:** копия `bases/trade_dev/policy.yaml` и `bases.yaml` (`*.bak-adr15`).
-- [ ] **Step 2:** `uv run odata1c daemon stop` (демон старой версии) → `uv run odata1c reindex trade_dev` → появился `policy.auto.yaml` с шапкой, в `policy.yaml` раздела `auto` нет, ручные разделы на месте; `uv run odata1c policy check trade_dev` → без `error`.
-- [ ] **Step 3:** `uv run odata1c policy show trade_dev | head -60` — файл владельца, затем действующая политика с источниками.
-- [ ] **Step 4:** `uv run odata1c policy open trade_dev Catalog_Контрагенты.КодПоОКПО` → вывод «открыто…», `check` чистый; вернуть: `uv run odata1c policy set trade_dev Catalog_Контрагенты.КодПоОКПО keep` (то же), затем удалить строку руками или оставить — решение владельца.
-- [ ] **Step 5:** в Claude Code `/mcp` → переподключить `odata1c`; в `bases.yaml` сменить `gate.mode` у `trade_dev` на `identifiers` без перезапуска демона → `odata1c_bases` показывает новый уровень, в ответе предупреждение; вернуть `off`.
-- [ ] **Step 6:** записать результат в `docs/probes/M2b-owner-check.md` (счётчики и имена полей, без значений).
+- [x] **Step 1:** копия `bases/trade_dev/policy.yaml` и `bases.yaml` (`*.bak-adr15`).
+- [x] **Step 2:** `uv run odata1c daemon stop` (демон старой версии) → `uv run odata1c reindex trade_dev` → появился `policy.auto.yaml` с шапкой, в `policy.yaml` раздела `auto` нет, ручные разделы на месте; `uv run odata1c policy check trade_dev` → без `error`.
+- [x] **Step 3:** `uv run odata1c policy show trade_dev | head -60` — файл владельца, затем действующая политика с источниками.
+- [x] **Step 4:** `uv run odata1c policy open trade_dev Catalog_Контрагенты.КодПоОКПО` → вывод «открыто…», `check` чистый; вернуть: `uv run odata1c policy set trade_dev Catalog_Контрагенты.КодПоОКПО keep` (то же), затем удалить строку руками или оставить — решение владельца.
+- [x] **Step 5:** в Claude Code `/mcp` → переподключить `odata1c`; в `bases.yaml` сменить `gate.mode` у `trade_dev` на `identifiers` без перезапуска демона → `odata1c_bases` показывает новый уровень, в ответе предупреждение; вернуть `off`.
+- [x] **Step 6:** записать результат в `docs/probes/M2b-owner-check.md` (счётчики и имена полей, без значений).
