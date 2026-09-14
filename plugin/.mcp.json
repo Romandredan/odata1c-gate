@@ -2,6 +2,11 @@
   "gate": {
     "type": "stdio",
     "command": "uvx",
-    "args": ["--from", "odata1c-gate==0.1.0.dev0", "odata1c", "mcp"]
+    "args": [
+      "--from",
+      "odata1c-gate==0.1.0",
+      "odata1c",
+      "mcp"
+    ]
   }
 }

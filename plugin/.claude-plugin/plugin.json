@@ -1,10 +1,20 @@
 {
   "name": "odata1c",
   "description": "Шлюз к OData 1С:Предприятие с гейтом псевдонимизации: реквизиты и названия приходят модели токенами, запись в 1С только после подтверждения человеком. Навыки, хук подтверждения записи и агент-следователь.",
-  "version": "0.1.0.dev0",
-  "author": { "name": "Roman Danilov" },
+  "version": "0.1.0",
+  "author": {
+    "name": "Roman Danilov"
+  },
   "homepage": "https://github.com/Romandredan/odata1c-gate",
   "repository": "https://github.com/Romandredan/odata1c-gate",
   "license": "MIT",
-  "keywords": ["1c", "1c-enterprise", "odata", "mcp", "claude-code", "claude-code-plugin", "pseudonymization"]
+  "keywords": [
+    "1c",
+    "1c-enterprise",
+    "odata",
+    "mcp",
+    "claude-code",
+    "claude-code-plugin",
+    "pseudonymization"
+  ]
 }
