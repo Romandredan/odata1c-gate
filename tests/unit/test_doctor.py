@@ -10,15 +10,19 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import httpx
+import pytest
 import respx
 
 import odata1c
 from odata1c import doctor
 from odata1c.cli import main
 from odata1c.doctor import exit_code, render, run
+from odata1c.index.reindex import index_path
+from odata1c.index.repository import IndexRepository
 
 URL = "https://1c.example.local/ut/odata/standard.odata/"
 BASES = f"""
@@ -185,44 +189,265 @@ def test_online_вызывает_base_test(tmp_path):
     assert _статус(проверки, "соединение с ut") == "OK"
 
 
+# --- Ruling 74 (ревью раунда 1): «соединение с <имя>» — только класс исхода, без текста 1С -----
+
+
 @respx.mock
-def test_online_отказ_1с_не_разглашает_пароль(tmp_path):
-    """`--online` на отказавшей 1С: текст ошибки OData (`cli.cmd_base_test` берёт его как есть,
-    тот же путь здесь) не должен всё равно протащить пароль или имя пользователя базы — Basic Auth
-    отправляется в заголовке запроса, а не оказывается в тексте исключения httpx."""
+def test_online_401_с_именем_пользователя_1с_не_разглашает_имя(tmp_path):
+    """Находка M-1, форма 1 итогового ревью: 401 с разобранным телом платформы, где 1С называет
+    имя пользователя в тексте отказа («Пользователю ivanov отказано…»). Ruling 74 — строка не
+    печатает текст 1С вовсе, только класс «отказ аутентификации (<401|403>)»."""
     home = tmp_path / "home"
     main(["init", "--home", str(home)])
     (home / "bases.yaml").write_text(BASES, encoding="utf-8")
-    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(401, text="Unauthorized"))
+    тело = json.dumps(
+        {
+            "odata.error": {
+                "code": "",
+                "message": {
+                    "value": "Доступ запрещён. Пользователю ivanov отказано в праве "
+                    "использовать WEB-сервис."
+                },
+            }
+        }
+    )
+    respx.get(f"{URL}$metadata").mock(return_value=httpx.Response(401, text=тело))
 
     проверки = run(home, online=True, which=_which_нет, run=_run_нет, connect=_демон_молчит)
     текст = render(проверки)
 
     assert _статус(проверки, "соединение с ut") == "FAIL"
+    assert _деталь(проверки, "соединение с ut") == "отказ аутентификации (401)"
+    assert "ivanov" not in текст
     assert "p@ss" not in текст
     assert "кто-то" not in текст
 
 
 @respx.mock
-def test_online_5xx_не_разглашает_полный_адрес(tmp_path):
-    """Регресс: страница прокси/веб-сервера перед 1С на 5xx нередко повторяет запрошенный адрес
-    целиком (проба P7 — 1С сама эхом повторяет присланное в шести формах запроса из четырнадцати).
-    `OdataError._map_error` берёт такое тело как есть (`body.strip()[:500]`) — без явной чистки
-    `_check_connection`/`_без_адреса` полный путь базы (не только схема и хост) попал бы в
-    render(), нарушая footnote design §8 «адрес базы — только схема и хост»."""
+def test_online_5xx_не_разглашает_путь_публикации(tmp_path):
+    """Находка M-1, форма 2: ошибку отдал не 1С, а веб-сервер/посредник перед ней
+    (`platform_error=False`) — страница называет путь публикации без схемы и хоста, поэтому
+    прежний `_без_адреса` (вырезал только `base.url` целиком) его не ловил. Ruling 74 — деталь
+    строки теперь вообще не содержит тело ответа, только «HTTP <код>»."""
     home = tmp_path / "home"
     main(["init", "--home", str(home)])
     (home / "bases.yaml").write_text(BASES, encoding="utf-8")
     respx.get(f"{URL}$metadata").mock(
-        return_value=httpx.Response(502, text=f"Ошибка прокси при обращении к {URL}$metadata")
+        return_value=httpx.Response(
+            502, text="The requested URL /ut/odata/standard.odata/$metadata was not found"
+        )
     )
 
     проверки = run(home, online=True, which=_which_нет, run=_run_нет, connect=_демон_молчит)
     текст = render(проверки)
 
     assert _статус(проверки, "соединение с ut") == "FAIL"
+    assert _деталь(проверки, "соединение с ut") == "HTTP 502"
     assert "/ut/odata/standard.odata/" not in текст
+    # схема и хост остаются видны — но только из соседней строки «база ut», не из этой
     assert "https://1c.example.local" in текст
+
+
+@respx.mock
+def test_online_сеть_недоступна_класс_сеть_таймаут(tmp_path):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES, encoding="utf-8")
+    respx.get(f"{URL}$metadata").mock(side_effect=httpx.ConnectError("connection refused"))
+
+    проверки = run(home, online=True, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    assert _статус(проверки, "соединение с ut") == "FAIL"
+    assert _деталь(проверки, "соединение с ut") == "сеть/таймаут"
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_online_сертификат_не_найден_класс_tls(tmp_path):
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    сертификат = (tmp_path / "нет_такого.pem").as_posix()
+    (home / "bases.yaml").write_text(
+        "bases:\n"
+        "  ut:\n"
+        "    label: УТ\n"
+        f"    url: {URL}\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: test\n"
+        f'    verify_tls: "{сертификат}"\n',
+        encoding="utf-8",
+    )
+
+    проверки = run(home, online=True, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    assert _статус(проверки, "соединение с ut") == "FAIL"
+    assert _деталь(проверки, "соединение с ut") == "TLS"
+
+
+# --- Ruling 75 (ревью раунда 1): run() только читает, ни одной записи в файлы -----------------
+
+
+def test_run_не_пишет_в_файл_индекса(tmp_path):
+    """Находка M-2: `IndexRepository` без `read_only=True` заводит `PRAGMA journal_mode=WAL`
+    (файлы `-wal`/`-shm` рядом) и дописывает недостающие таблицы/колонки схемы — на индексе
+    ПРЕЖНЕЙ версии разбора (тот самый случай, ради которого строка «база <имя>» вообще открывает
+    файл) это молча меняло файл владельца. Проверяем побайтово: ни размер файла, ни его содержимое
+    не меняются, и не появляется ни `-wal`, ни `-shm`."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES, encoding="utf-8")
+
+    путь = index_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    репозиторий = IndexRepository(путь)  # старая версия разбора: parser_version не проставлен
+    репозиторий.close()
+    до = путь.read_bytes()
+    wal = путь.with_name(путь.name + "-wal")
+    shm = путь.with_name(путь.name + "-shm")
+    assert not wal.exists() and not shm.exists()
+
+    run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    assert путь.read_bytes() == до
+    assert not wal.exists()
+    assert not shm.exists()
+
+
+# --- Ruling 76 (ревью раунда 1): общий перехват, run() не бросает никогда ---------------------
+
+
+def test_повреждённый_индекс_не_роняет_run(tmp_path):
+    """Находка M-3, п. 1: конструктор `IndexRepository` был снаружи `try` в `_check_base` — файл,
+    который вообще не открывается как SQLite, ронял `run()` целиком (`IndexCorruptError` наружу),
+    а не давал одну строку WARN. Файл — реальный мусор, не заготовленный edmx/sqlite."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES, encoding="utf-8")
+    путь = index_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_bytes(b"\x00\x01\x02 not a sqlite file at all " * 20)
+
+    проверки = run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    # Ревью назвал исход точно: «строка станет WARN «индекс повреждён»» — не крах, не FAIL
+    # (реиндекс чинит это без потери данных, в отличие от ошибки самой политики).
+    assert _статус(проверки, "база ut") == "WARN"
+    assert "индекс повреждён" in _деталь(проверки, "база ut")
+    assert exit_code(проверки) == 1
+    # остальные строки таблицы всё равно построены — крах одной базы не обрывает run()
+    assert _статус(проверки, "демон") == "WARN"
+
+
+def test_нечисловой_порт_в_адресе_не_роняет_run(tmp_path):
+    """Находка M-3, п. 2: `urlsplit(...).port` бросает `ValueError` на нечисловом порте в адресе
+    (`BaseConfig._проверить_url` проверяет только окончание строки — до `.port` дело не доходит).
+    `_хост` теперь ловит это сама, а `_безопасно` — запасная линия, если где-то ещё не поймали."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(
+        "bases:\n"
+        "  ut:\n"
+        "    label: УТ\n"
+        "    url: https://1c.example.local:непорт/odata/standard.odata/\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: test\n",
+        encoding="utf-8",
+    )
+
+    проверки = run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    # Не крах: строка «база ut» строится с диагностикой адреса и WARN (индекса и политики у этой
+    # базы тоже нет — тот же худший статус, что и у обычного «индекса нет»), а не пятая аварийная
+    # FAIL-строка `_безопасно` с одним только именем класса исключения.
+    assert _статус(проверки, "база ut") == "WARN"
+    assert "порт не число" in _деталь(проверки, "база ut")
+    assert exit_code(проверки) == 1
+
+
+# --- Minor находки ревью раунда 1 --------------------------------------------------------------
+
+
+def test_bases_yaml_права_дают_warn(tmp_path, monkeypatch):
+    """m-1: шаг 3 брифа требует `check_file_permissions` и на дом, и на сам `bases.yaml` — был
+    реализован только первый. Права на файл с паролями 1С открытым текстом важнее прав на пустой
+    каталог вокруг него. Настоящий `icacls` не трогаем — подменяем `check_file_permissions`
+    так, чтобы отвечать только на путь `bases.yaml`, как это бывает в реальности (два разных
+    файла могут иметь разные права)."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(BASES, encoding="utf-8")
+    путь_bases = home / "bases.yaml"
+
+    def права(путь):
+        if путь == путь_bases:
+            return f"{путь} доступен другим учётным записям: TESTS\\Все:(R)"
+        return None
+
+    monkeypatch.setattr(doctor, "check_file_permissions", права)
+
+    проверки = run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    assert _статус(проверки, "bases.yaml") == "WARN"
+    assert "доступен другим учётным записям" in _деталь(проверки, "bases.yaml")
+
+
+def test_демон_порт_из_daemon_yaml_даже_при_битом_bases_yaml(tmp_path):
+    """m-2: `config` остаётся `None`, если `bases.yaml` не разобрался, а порт демона раньше в
+    этом случае всегда брался как умолчание 7171 — даже когда `daemon.yaml` исправен и называет
+    другой порт. `daemon` должен опрашиваться по НАСТОЯЩЕМУ порту независимо от судьбы соседнего
+    файла."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "daemon.yaml").write_text('gate_secret: "секрет"\nport: 7999\n', encoding="utf-8")
+    (home / "bases.yaml").write_text(
+        "bases:\n  ut:\n    password: 'не закрытая кавычка\n", encoding="utf-8"
+    )
+
+    увиденные_порты = []
+
+    def connect(port):
+        увиденные_порты.append(port)
+        return None
+
+    run(home, online=False, which=_which_нет, run=_run_нет, connect=connect)
+
+    assert увиденные_порты == [7999]
+
+
+def test_launcher_key_виден_при_битом_bases_yaml(tmp_path):
+    """m-3: строка `launcher.key` не зависит от того, разобрался ли `bases.yaml` — она читает
+    свой файл напрямую (`read_launcher_key`). Была спрятана под `if config is not None`, и
+    владелец, чинящий `bases.yaml`, заодно терял диагностику ключа лаунчера."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text("bases: [не, словарь]\n", encoding="utf-8")
+
+    проверки = run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+
+    assert _статус(проверки, "bases.yaml") == "FAIL"
+    assert _статус(проверки, "launcher.key") == "OK"  # odata1c init уже создал ключ
+
+
+def test_неизвестная_роль_даёт_строку_настройки_fail_без_значений(tmp_path):
+    """m-4: строка `настройки` (запасной путь — `load_config` отказал глубже, чем ловят
+    отдельные разборы `bases.yaml`/`daemon.yaml`) была объявлена в докстринге модуля, но не
+    исполнялась ни одним тестом. `role: prodd` — оба файла по отдельности разбираются, но
+    `apply_role` внутри `load_config` не знает такой роли."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+    (home / "bases.yaml").write_text(
+        f"bases:\n  ut:\n    label: УТ\n    url: {URL}\n    user: u\n    password: p@ss\n"
+        "    role: prodd\n",
+        encoding="utf-8",
+    )
+
+    проверки = run(home, online=False, which=_which_нет, run=_run_нет, connect=_демон_молчит)
+    текст = render(проверки)
+
+    assert _статус(проверки, "настройки") == "FAIL"
+    assert "p@ss" not in текст
+    assert exit_code(проверки) == 2
 
 
 # --- Step 4 брифа: CLI --------------------------------------------------------------------

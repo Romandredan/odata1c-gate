@@ -98,10 +98,18 @@ def _хост(url: str) -> str:
     схема и хост»). `urllib.parse.urlsplit` кладёт `user:password@` в `.username`/`.password`,
     а не в `.hostname` — сведения о доступе отсекаются самим разбором, а не последующей чисткой
     строки (та же ошибка класса, которую чинит `cli._без_учётных_данных`, но эта функция к тому
-    же убирает путь, которого `_без_учётных_данных` не трогает)."""
+    же убирает путь, которого `_без_учётных_данных` не трогает).
+
+    `.port` у `urlsplit` бросает `ValueError`, если порт в адресе не число (ревью раунда 1,
+    находка M-3, п. 2 — `BaseConfig._проверить_url` проверяет только окончание строки, нечисловой
+    порт в неё проходит) — перехватываем здесь же и отдаём безопасный запасной текст вместо того,
+    чтобы уронить `run()` целиком на одной кривой записи `bases.yaml`."""
     части = urllib.parse.urlsplit(url)
+    try:
+        порт = f":{части.port}" if части.port else ""
+    except ValueError:
+        return "адрес базы не разбирается (порт не число)"
     хост = части.hostname or ""
-    порт = f":{части.port}" if части.port else ""
     return f"{части.scheme}://{хост}{порт}"
 
 
@@ -196,15 +204,24 @@ def _check_bases_yaml(home: pathlib.Path) -> Check:
     путь = home / "bases.yaml"
     if not путь.exists():
         return Check("bases.yaml", "WARN", f"файла нет; выполните odata1c init --home {home}")
+    # Шаг 3 брифа требует check_file_permissions и на дом, и на сам bases.yaml (m-1 ревью раунда
+    # 1) — файл с паролями 1С открытым текстом, права на него важнее прав на пустой каталог вокруг.
+    предупреждение_прав = check_file_permissions(путь)
     данные, ошибка = _разобрать_yaml_доктор(путь)
     if ошибка is not None:
-        return Check("bases.yaml", "FAIL", ошибка)
+        деталь = ошибка if предупреждение_прав is None else f"{ошибка}; {предупреждение_прав}"
+        return Check("bases.yaml", "FAIL", деталь)
     # `bases:` без значения (шаблон поставки, ключ есть — строк под ним нет) разбирается как
     # `None`, а не как пустой словарь — тот же приём, что `config.loader._load_bases`
     # (`raw_bases = data.get("bases") or {}`): это не ошибка формата, а «баз нет».
     базы = (данные.get("bases") if isinstance(данные, dict) else None) or {}
     if not isinstance(базы, dict):
-        return Check("bases.yaml", "FAIL", f"{путь}: раздел bases должен быть словарём")
+        деталь = f"{путь}: раздел bases должен быть словарём"
+        if предупреждение_прав:
+            деталь = f"{деталь}; {предупреждение_прав}"
+        return Check("bases.yaml", "FAIL", деталь)
+    if предупреждение_прав:
+        return Check("bases.yaml", "WARN", предупреждение_прав)
     if not базы:
         return Check("bases.yaml", "WARN", "баз нет: опишите их в bases.yaml или odata1c base add")
     return Check("bases.yaml", "OK", f"разбирается, баз: {len(базы)}")
@@ -237,7 +254,13 @@ def _check_base(home: pathlib.Path, name: str, base: BaseConfig) -> Check:
     """Индекс базы, свежий ли (`IndexRepository.require_current_version`), и `check_policy` —
     та же проверка, что `cli.cmd_policy_check`, без печати. Открытый индекс здесь СВОЙ
     (`index_path`/`IndexRepository`), а не `cli._открыть_индекс_для_политики`: `cli` импортирует
-    этот модуль для команды `doctor`, обратный импорт замкнул бы цикл."""
+    этот модуль для команды `doctor`, обратный импорт замкнул бы цикл.
+
+    `IndexRepository(..., read_only=True)` (ревью раунда 1, M-2/Ruling 75) — `doctor` только
+    смотрит на индекс, не работает с ним, и не должен ни разу написать в файл владельца.
+    Конструктор — ВНУТРИ `try` (ревью раунда 1, M-3 п. 1): он сам поднимает `IndexCorruptError`
+    на файле, который вообще не открывается как SQLite (был снаружи `try`, и такой файл ронял
+    `run()` целиком вместо одной строки WARN)."""
     detail_parts = [_хост(base.url)]
 
     путь_индекса = index_path(home, name)
@@ -246,13 +269,14 @@ def _check_base(home: pathlib.Path, name: str, base: BaseConfig) -> Check:
     if not путь_индекса.exists():
         detail_parts.append("индекса нет")
     else:
-        репозиторий = IndexRepository(путь_индекса)
         try:
+            репозиторий = IndexRepository(путь_индекса, read_only=True)
             репозиторий.require_current_version()
             индекс_свежий = True
         except IndexCorruptError as ошибка:
-            detail_parts.append(f"индекс устарел: {ошибка.message}")
-            репозиторий.close()
+            detail_parts.append(f"индекс повреждён или устарел: {ошибка.message}")
+            if репозиторий is not None:
+                репозиторий.close()
             репозиторий = None
 
     путь_политики = policy_path(home, name)
@@ -292,36 +316,46 @@ def _check_base(home: pathlib.Path, name: str, base: BaseConfig) -> Check:
     return Check(f"база {name}", статус, "; ".join(detail_parts))
 
 
-def _без_адреса(текст: str, base: BaseConfig) -> str:
-    """Убрать из текста ошибки 1С полный адрес базы, если платформа или прокси перед ней повторили
-    его целиком (проба P7: 1С эхом повторяет присланное в тексте ошибки в шести формах запроса из
-    четырнадцати; страница веб-сервера/прокси перед 1С — тем более) — оставляя только схему и хост
-    (design §8: «адресов … не печатает»). `OdataError.message` для сетевых ошибок и ошибок 1С не
-    проходит через страж гейта (тот защищает только данные 1С, а не собственные диагностические
-    сообщения `doctor`), поэтому чистка — обязанность этой функции, единственной между `Client1C`
-    и `render()`."""
-    хост = _хост(base.url)
-    for форма in (base.url, base.url.rstrip("/")):
-        текст = текст.replace(форма, хост)
-    return текст
+def _класс_отказа(ошибка: OdataError) -> str:
+    """Класс исхода `--online` (Ruling 74, замена находки M-1): текст ответа 1С или посредника
+    перед ней никогда не попадает в `detail` — там бывают имя пользователя 1С (сообщение
+    платформы про отказ доступа) или путь публикации (страница IIS/Apache под 1С, когда отвечает
+    не сама 1С — `platform_error=False`), а `_без_адреса` их не ловила, потому что вырезала
+    только `base.url` целиком, а не произвольный текст. Пять допустимых значений всей строки:
+    `OK`, `отказ аутентификации (401|403)`, `HTTP <код>`, `сеть/таймаут`, `TLS` (последнее — только
+    при отказе конструктора `Client1C`, см. `_check_connection`). Подробности владелец смотрит
+    локально — `odata1c base test <имя>`, как у прежнего поведения `cmd_base_test` (страж на эту
+    команду тоже не заведён — расхождение с design §8 «текст через страж» уже существовало и не в
+    объёме этой задачи, только сужен риск в самом `doctor`, который агент видит через Bash в
+    первую очередь)."""
+    if ошибка.status in (401, 403):
+        return f"отказ аутентификации ({ошибка.status})"
+    if ошибка.status is not None:
+        return f"HTTP {ошибка.status}"
+    # status is None — сама 1С не ответила (сеть, таймаут, ошибка формирования запроса): у
+    # OdataError.status его выставляет только map_error() на реальном HTTP-ответе (см. докстринг
+    # выше). Код client1c/errors.py различает здесь "timeout" и "odata_error", но design §8 не
+    # заводит для сети отдельного от таймаута класса — оба одинаково «сеть/таймаут» владельцу.
+    return "сеть/таймаут"
 
 
 async def _check_connection(base: BaseConfig) -> Check:
     """`--online`: то же обращение, что `cli.cmd_base_test` (`Client1C.get_raw("$metadata", …)`),
-    но результат — строка таблицы, а не печать. Конструктор `Client1C` тоже может поднять
-    `OdataError` синхронно (сертификат не найден) — до входа в `try` тела запроса."""
+    но результат — строка таблицы с классом исхода (`_класс_отказа`), не печать текста ошибки.
+    Конструктор `Client1C` тоже может поднять `OdataError` синхронно (сертификат не найден,
+    единственный такой путь в клиенте) — до входа в `try` тела запроса, отдельным классом `TLS`."""
     имя_строки = f"соединение с {base.name}"
     try:
         client = Client1C(base)
-    except OdataError as ошибка:
-        return Check(имя_строки, "FAIL", _без_адреса(f"[{ошибка.code}] {ошибка}", base))
+    except OdataError:
+        return Check(имя_строки, "FAIL", "TLS")
     try:
         await client.get_raw("$metadata", accept="application/xml", add_format=False)
     except OdataError as ошибка:
-        return Check(имя_строки, "FAIL", _без_адреса(f"[{ошибка.code}] {ошибка}", base))
+        return Check(имя_строки, "FAIL", _класс_отказа(ошибка))
     finally:
         await client.close()
-    return Check(имя_строки, "OK", "base test прошёл")
+    return Check(имя_строки, "OK", "")
 
 
 async def _версия_демона(port: int) -> str:
@@ -366,6 +400,33 @@ def _check_daemon(port: int, connect: Callable[[int], str | None]) -> Check:
     return Check("демон", "OK", f"порт {port}, версия {версия}")
 
 
+def _порт_демона(home: pathlib.Path) -> int:
+    """Порт для строки `демон` — независимо от того, разобрался ли `bases.yaml` (ревью раунда 1,
+    m-2): битый `bases.yaml` не должен прятать непорядковый порт исправного `daemon.yaml` за
+    умолчанием 7171 — `config` в этом случае остаётся `None`, а раньше порт брался только из
+    него. Свой мелкий разбор, а не `_check_daemon_yaml`: та возвращает `Check` для печати, а не
+    порт для дальнейшего использования, и незачем тянуть на себя её форматирование ошибок ради
+    одного числа. Любая проблема (файла нет, не разобрался, поля нет, значение не число) — тихий
+    откат на умолчание `DaemonConfig().port`: строка `daemon.yaml` уже сказала об этом отдельно."""
+    данные, ошибка = _разобрать_yaml_доктор(home / "daemon.yaml")
+    if ошибка is not None or not isinstance(данные, dict):
+        return DaemonConfig().port
+    порт = данные.get("port")
+    return порт if isinstance(порт, int) else DaemonConfig().port
+
+
+def _безопасно(имя: str, проверка: Callable[[], Check]) -> Check:
+    """Общий перехват (ревью раунда 1, Ruling 76): любое исключение, не пойманное самой
+    проверкой, — строка FAIL с ИМЕНЕМ КЛАССА исключения в `detail`, без текста самого исключения
+    (текст может повторять значение из настроек или данных — тот же класс риска, что нашёлся в
+    M-1). `run()` не должно падать ни при каких условиях; эта функция — единственное место,
+    которое это гарантирует централизованно, а не разбросанными по каждой проверке try/except."""
+    try:
+        return проверка()
+    except Exception as ошибка:  # noqa: BLE001 — намеренно: последняя линия защиты, см. докстринг
+        return Check(имя, "FAIL", f"внутренняя ошибка проверки: {type(ошибка).__name__}")
+
+
 def run(
     home: pathlib.Path,
     *,
@@ -374,33 +435,56 @@ def run(
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     connect: Callable[[int], str | None] = опросить_демон,
 ) -> list[Check]:
-    """Все десять строк таблицы (design §8) — см. докстринг модуля. Никогда не бросает: каждая
-    проверка перехватывает свои ошибки сама; неожиданный сбой настроек (`ConfigError` от
-    `load_config`, когда оба файла по отдельности разобрались, но их содержимое не проходит
-    более глубокую проверку — неизвестная роль, битый URL и т.п.) превращается в отдельную
-    строку `настройки`, а не прерывает построение таблицы."""
-    checks: list[Check] = [_check_python(), _check_uv(which, run), _check_home(home)]
+    """Все десять строк таблицы (design §8) — см. докстринг модуля. Только читает (Ruling 75):
+    ни `ensure_home`, ни `ensure_gate_secret`, ни создание шаблонов, ни запись авторазметки —
+    отсутствие файла или каталога само по себе становится строкой WARN/FAIL, а не поводом что-то
+    создать. Никогда не бросает: `_безопасно` — общий перехват вокруг каждой проверки (Ruling 76);
+    неожиданный сбой настроек (`ConfigError` от `load_config`, когда оба файла по отдельности
+    разобрались, но их содержимое не проходит более глубокую проверку — неизвестная роль, битый
+    URL и т.п.) превращается в отдельную строку `настройки`, а не прерывает построение таблицы."""
+    checks: list[Check] = [
+        _безопасно("Python", _check_python),
+        _безопасно("uv", lambda: _check_uv(which, run)),
+        _безопасно("дом шлюза", lambda: _check_home(home)),
+    ]
 
     config = None
     if home.is_dir():
-        проверка_bases = _check_bases_yaml(home)
-        проверка_daemon = _check_daemon_yaml(home)
+        проверка_bases = _безопасно("bases.yaml", lambda: _check_bases_yaml(home))
+        проверка_daemon = _безопасно("daemon.yaml", lambda: _check_daemon_yaml(home))
         checks.append(проверка_bases)
         checks.append(проверка_daemon)
+        # launcher.key не зависит от bases.yaml/daemon.yaml вовсе (читает свой файл напрямую) —
+        # вне условия на config (ревью раунда 1, m-3): битый bases.yaml не должен прятать
+        # диагностику ключа лаунчера; порядок строки в таблице — как в design §8.
+        checks.append(_безопасно("launcher.key", lambda: _check_launcher_key(home)))
         if проверка_bases.status != "FAIL" and проверка_daemon.status != "FAIL":
             try:
                 config = load_config(home)
             except ConfigError as ошибка:
                 checks.append(Check("настройки", "FAIL", f"[{ошибка.code}] {ошибка}"))
+            except Exception as ошибка:  # noqa: BLE001 — Ruling 76, а не только ConfigError:
+                # load_config доходит и до `_из_keyring` (`password: keyring`), а тот может
+                # поднять `keyring.errors.KeyringError` — класс, не ловящийся `except ConfigError`
+                # выше и не обёрнутый `_безопасно` (этот вызов — единственный за пределами
+                # `_check_*`-функций). Без этой ветки такой сбой уходил бы из run() наружу — то
+                # самое M-3 через другую дверь (находка ревью до коммита раунда 1).
+                текст_ошибки = f"внутренняя ошибка проверки: {type(ошибка).__name__}"
+                checks.append(Check("настройки", "FAIL", текст_ошибки))
         if config is not None:
-            checks.append(_check_launcher_key(home))
             for name in sorted(config.bases):
                 base = config.bases[name]
-                checks.append(_check_base(home, name, base))
+                checks.append(
+                    _безопасно(f"база {name}", lambda b=base, n=name: _check_base(home, n, b))
+                )
                 if online:
-                    checks.append(asyncio.run(_check_connection(base)))
+                    checks.append(
+                        _безопасно(
+                            f"соединение с {name}", lambda b=base: asyncio.run(_check_connection(b))
+                        )
+                    )
 
-    port = config.daemon.port if config is not None else DaemonConfig().port
-    checks.append(_check_daemon(port, connect))
-    checks.append(_check_claude(which, run))
+    port = config.daemon.port if config is not None else _порт_демона(home)
+    checks.append(_безопасно("демон", lambda: _check_daemon(port, connect)))
+    checks.append(_безопасно("Claude Code", lambda: _check_claude(which, run)))
     return checks

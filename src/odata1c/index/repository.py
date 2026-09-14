@@ -85,12 +85,57 @@ class IndexCorruptError(Exception):
 
 
 class IndexRepository:
-    def __init__(self, path: pathlib.Path) -> None:
+    def __init__(self, path: pathlib.Path, *, read_only: bool = False) -> None:
+        """`read_only=True` (ревью раунда 1 задачи 2 M3, находка M-2/Ruling 75): открыть файл БЕЗ
+        побочных записей — обычный `index.schema.connect` не только читает, а заводит `PRAGMA
+        journal_mode=WAL` и выполняет `CREATE TABLE/INDEX IF NOT EXISTS` из `SCHEMA_SQL` — на
+        индексе прежней версии разбора это молча дописывает недостающие таблицы/колонки в файл
+        ВЛАДЕЛЬЦА. Диагностические пути (`odata1c doctor`), которым нужно только УЗНАТЬ состояние
+        индекса, а не работать с ним, открывают файл через `_open_read_only` — см. её докстринг."""
         self.path = pathlib.Path(path)
         try:
-            self._connection = connect(self.path)
+            if read_only:
+                self._connection = self._open_read_only(self.path)
+            else:
+                self._connection = connect(self.path)
         except sqlite3.DatabaseError as ошибка:
             raise IndexCorruptError(self.path, str(ошибка)) from ошибка
+
+    @staticmethod
+    def _open_read_only(path: pathlib.Path) -> sqlite3.Connection:
+        """Соединение только на чтение, без побочных файлов.
+
+        `mode=ro` в одиночку НЕ достаточен (проверено исполнением): файл в WAL-режиме (а он
+        всегда в WAL — `index.schema.connect` включает его при создании) заводит `-wal`/`-shm`
+        рядом с собой при ЛЮБОМ подключении, читающем через механизм WAL, даже без единой записи
+        в саму базу — это тоже файлы на диске владельца, которых доктор оставлять не должен.
+        `immutable=1` — штатный режим SQLite «файл не изменится, пока соединение открыто»: он
+        выключает WAL-машинерию совсем и читает напрямую из основного файла. Соединение здесь
+        живёт одно короткое чтение — риск (конкурентный reindex ровно в этот миг) даёт не худший
+        исход, чем WAL: не свежий, а не изменённый на диске файл, и следующий вызов doctor
+        увидит уже актуальное."""
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro&immutable=1", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            # sqlite3.connect() ленив — файл не трогается, пока не выполнен первый оператор
+            # (проверено исполнением: на мусорном файле голый connect() в режиме mode=ro не
+            # бросает ничего). Явный зонд здесь — по тому же поводу, что и `PRAGMA
+            # journal_mode=WAL` в ветке записи (`index.schema.connect`): повреждённый или
+            # не-SQLite файл должен проявить себя сразу, а не позже, из какого-нибудь SELECT
+            # внутри meta()/resolve_name(), куда конструктор уже не дотянется. `PRAGMA
+            # schema_version` существует в любой настоящей базе SQLite (даже пустой) и ничего
+            # не пишет.
+            connection.execute("PRAGMA schema_version").fetchone()
+        except sqlite3.DatabaseError:
+            # Находка ревью раунда 1 (регресс своей же правки, найден прогоном): без явного
+            # close() здесь соединение, уже открытое `sqlite3.connect()` выше, утекает —
+            # `raise` в __init__ поднимает IndexCorruptError, но объект Connection остаётся
+            # недостижимым и не закрытым, и sqlite3 на сборке мусора выдаёт ResourceWarning
+            # (в тестах — падение сессии pytest). Тот же приём, что уже есть в
+            # `index.schema.connect` для ветки записи.
+            connection.close()
+            raise
+        return connection
 
     def close(self) -> None:
         self._connection.close()
