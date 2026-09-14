@@ -117,8 +117,21 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
         return None
     if sys.platform == "win32":
         try:
+            # icacls спрашивается про ИМЯ файла из его каталога, а не про полный путь, — и
+            # ровно это имя он эхом печатает перед первой записью списка доступа. Причина —
+            # находка прогона ci на windows-latest: в полном пути почти всегда стоит имя
+            # пользователя (`C:\Users\<имя>\…`), а имя пользователя ниже по коду означает
+            # «запись своя». Пока путь остаётся в строке, первая запись списка — та, что
+            # напечатана рядом с ним, — считается своей ВСЕГДА, чей бы доступ она ни описывала:
+            # настоящий широкий доступ группе «Все», попавший на эту строку, проверка молча
+            # пропускала. Снимать путь текстом ненадёжно: он приходит из чужой утилиты и совпадать
+            # символ в символ с `str(path)` не обязан. Не передавать его вовсе — надёжно.
+            # У корня диска имени нет — тогда спрашиваем по полному пути, как раньше (свои
+            # файлы шлюз в корне диска не держит, но падать на этом незачем).
+            цель = path.name or str(path)
             raw = subprocess.run(
-                ["icacls", str(path)],
+                ["icacls", цель],
+                cwd=path.parent if path.name else None,
                 check=True,
                 capture_output=True,
                 text=False,
@@ -131,26 +144,20 @@ def check_file_permissions(path: pathlib.Path) -> str | None:
             username = getpass.getuser().lower()
         except Exception as exc:
             return f"не удалось определить имя пользователя: {exc}"
-        # Парсим вывод icacls: первая строка может содержать путь и первую запись
-        # Формат: "C:\path ГРУППА:(F)" или "C:\path ГРУППА1:(F)\n                 ГРУППА2:(R)"
-        lines = output.splitlines()
+        # Разбираем вывод icacls. Формат: "<имя> ГРУППА:(F)" в первой строке и по одной записи
+        # в каждой следующей, с отступом: "                 ГРУППА2:(R)".
         acl_entries = []
-        path_str = str(path)
-        for i, line in enumerate(lines):
+        имя_файла = path.name or str(path)
+        for line in output.splitlines():
             line = line.strip()
             if not line or "Successfully processed" in line or "Failed processing" in line:
                 continue
-            # Первая непустая строка может содержать путь и запись. Путь с неё снимается
-            # ОБЯЗАТЕЛЬНО и без учёта регистра: в нём почти всегда стоит имя пользователя
-            # (`C:\Users\<имя>\…`), а имя пользователя ниже — признак «запись своя». Оставленный
-            # путь делал бы своей ЛЮБУЮ запись с первой строки, включая настоящий широкий доступ.
-            if i == 0:
-                начало = line.lower().find(path_str.lower())
-                remainder = line[начало + len(path_str) :].strip() if начало != -1 else line
-                if remainder and ":" in remainder:
-                    acl_entries.append(remainder)
-            elif ":" in line:
-                # Остальные строки — это ACL записи
+            # Имя файла снимается с любой строки, где оно стоит в начале, а не со строки с
+            # номером ноль: пустая или посторонняя строка в начале вывода сдвинула бы нумерацию,
+            # и разбор поехал бы весь.
+            if line.lower().startswith(имя_файла.lower()):
+                line = line[len(имя_файла) :].strip()
+            if ":" in line:
                 acl_entries.append(line)
         # Проверяем каждую запись на наличие доступа для других учётных записей
         others = [
