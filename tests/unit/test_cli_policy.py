@@ -9,7 +9,12 @@
 повреждённом файле словаря.
 
 Задача 4 плана M2b (ADR-0015) добавляет источник строки к `policy show` (`владелец` | `авто`) и
-новую команду `policy check` — тесты обеих ниже, в собственных разделах."""
+новую команду `policy check` — тесты обеих ниже, в собственных разделах.
+
+Задача 5 плана M2b добавляет конструктор `policy hide | open | set` — тесты в своём разделе
+ниже: запись правила через настоящий индекс (проба P4, `Catalog_Контрагенты.ИНН` — существующая
+сущность и поле), отказ до записи на неизвестном поле и необъявленном `custom:*`, отказ
+подтверждения `policy hide` без `--yes`."""
 
 import pathlib
 
@@ -269,6 +274,172 @@ def test_policy_show_нестроковый_ключ_в_fields_даёт_policy_i
     assert код == 1
     assert "policy_invalid" in вывод
     assert "traceback" not in вывод.lower()
+
+
+# --- policy hide | open | set ------------------------------------------------------------------
+
+
+def _политика_с_версией(home: pathlib.Path) -> pathlib.Path:
+    """Минимальный файл владельца — как у `обеспечить_policy_yaml` из conftest, но здесь тест сам
+    решает, когда индекс уже построен, а когда ещё нет (`_построить_индекс` — по требованию)."""
+    путь = policy_path(home, "ut")
+    путь.parent.mkdir(parents=True, exist_ok=True)
+    путь.write_text("version: 2\nscan_free_text: true\n", encoding="utf-8")
+    return путь
+
+
+def test_policy_hide_с_yes_дописывает_правило_и_печатает_дочерних(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "дочерних" in вывод
+    assert "скрыто: Catalog_Контрагенты" in вывод
+    assert "entities:\n  Catalog_Контрагенты:\n    hide: true" in путь.read_text(encoding="utf-8")
+
+
+def test_policy_hide_без_yes_и_с_отказом_не_пишет_файл(tmp_path, capsys, monkeypatch, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+    monkeypatch.setattr("builtins.input", lambda подсказка="": "n")
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "отменено" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_hide_второй_раз_сообщает_что_уже_скрыта(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    _политика_с_версией(home)
+    main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    capsys.readouterr()
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "уже скрыта" in вывод
+
+
+def test_policy_hide_неизвестной_сущности_код_1_файл_не_тронут(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+
+    код = main(["policy", "hide", "ut", "Catalog_НетТакой", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "не найдена в индексе" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_hide_неизвестной_сущности_подсказывает_похожие_имена(
+    tmp_path, capsys, edmx_ut_real
+):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    _политика_с_версией(home)
+
+    код = main(["policy", "hide", "ut", "Catalog_НетТакой", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "похожие имена" in вывод
+    assert "Catalog_Контрагенты" in вывод
+
+
+def test_policy_open_пишет_keep_в_fields(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+
+    код = main(["policy", "open", "ut", "Catalog_Контрагенты.ИНН", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "открыто: Catalog_Контрагенты.ИНН" in вывод
+    assert "fields:\n  Catalog_Контрагенты.ИНН: keep" in путь.read_text(encoding="utf-8")
+
+
+def test_policy_set_печатает_прежний_класс(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+    main(["policy", "set", "ut", "Catalog_Контрагенты.ИНН", "keep", "--home", str(home)])
+    capsys.readouterr()
+
+    код = main(["policy", "set", "ut", "Catalog_Контрагенты.ИНН", "phone", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "класс поля Catalog_Контрагенты.ИНН: phone (было: keep)" in вывод
+    assert "fields:\n  Catalog_Контрагенты.ИНН: phone" in путь.read_text(encoding="utf-8")
+
+
+def test_policy_set_неизвестного_поля_код_1_файл_не_тронут(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+
+    код = main(["policy", "set", "ut", "Catalog_Контрагенты.Нет", "inn", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "не найдено" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_set_необъявленного_custom_код_1_файл_не_тронут(tmp_path, capsys, edmx_ut_real):
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь = _политика_с_версией(home)
+    исходный_текст = путь.read_text(encoding="utf-8")
+
+    код = main(["policy", "set", "ut", "Catalog_Контрагенты.ИНН", "custom:x", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "custom.x" in вывод
+    assert путь.read_text(encoding="utf-8") == исходный_текст
+
+
+def test_policy_set_без_индекса_пишет_и_предупреждает(tmp_path, capsys):
+    """Класс без индекса (`repo is None`): имена не проверяются — запись состоится, а находка
+    `check_policy` о том, что индекс отсутствует, печатается уже после записи (уточнение брифа
+    задачи 5)."""
+    home = _домашний_с_базой(tmp_path)
+    путь = _политика_с_версией(home)
+    assert not index_path(home, "ut").exists()
+
+    код = main(["policy", "set", "ut", "Catalog_Любая.ЧтоУгодно", "keep", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "warning: index: индекса нет" in вывод
+    assert "fields:\n  Catalog_Любая.ЧтоУгодно: keep" in путь.read_text(encoding="utf-8")
+
+
+def test_policy_hide_без_файла_политики(tmp_path, capsys):
+    home = _домашний_с_базой(tmp_path)
+
+    код = main(["policy", "hide", "ut", "Catalog_Контрагенты", "--yes", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "политика ещё не создана" in вывод
 
 
 # --- reveal ------------------------------------------------------------------------------------

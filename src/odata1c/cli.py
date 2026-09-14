@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import getpass
 import importlib.resources
 import pathlib
@@ -35,7 +36,8 @@ from odata1c.daemon import DaemonError, daemon_url, is_listening, serve, spawn_d
 from odata1c.daemon import остановить as остановить_демон
 from odata1c.gate.dictionary import DictionaryBusyError, DictionaryCorruptError
 from odata1c.gate.policy import PolicyError, load_policy, parse_owner_file
-from odata1c.gate.policy_check import check_policy, render_effective
+from odata1c.gate.policy_check import Finding, check_policy, render_effective, suggest_names
+from odata1c.gate.policy_edit import hide_entity, set_field_class
 from odata1c.gate.service import (
     auto_policy_path,
     classifier_for,
@@ -43,6 +45,7 @@ from odata1c.gate.service import (
     policy_path,
     refresh_policy,
 )
+from odata1c.gate.tokens import CLASSES
 from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path, reindex
 from odata1c.index.repository import IndexCorruptError, IndexRepository
@@ -124,6 +127,25 @@ def main(argv: list[str] | None = None) -> int:
         "check", help="проверить файл владельца по индексу", parents=[домашний]
     )
     check.add_argument("name", help="имя базы")
+    hide = policy_sub.add_parser(
+        "hide", help="скрыть сущность целиком (с дочерними)", parents=[домашний]
+    )
+    hide.add_argument("name", help="имя базы")
+    hide.add_argument("entity", help="имя сущности индекса")
+    hide.add_argument(
+        "--yes", action="store_true", help="не спрашивать подтверждение (для скриптов)"
+    )
+    policy_open = policy_sub.add_parser(
+        "open", help="открыть поле (класс keep)", parents=[домашний]
+    )
+    policy_open.add_argument("name", help="имя базы")
+    policy_open.add_argument("field", help="Сущность.Поле")
+    policy_set = policy_sub.add_parser("set", help="назначить полю класс", parents=[домашний])
+    policy_set.add_argument("name", help="имя базы")
+    policy_set.add_argument("field", help="Сущность.Поле")
+    policy_set.add_argument(
+        "cls", metavar="класс", help="CLASSES (gate/tokens.py) | scan | custom:<имя>"
+    )
 
     daemon_parser = команды.add_parser(
         "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
@@ -180,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_policy_show(home, args.name)
         if args.команда == "policy" and args.подкоманда == "check":
             return cmd_policy_check(home, args.name)
+        if args.команда == "policy" and args.подкоманда == "hide":
+            return cmd_policy_hide(home, args.name, args.entity, args.yes)
+        if args.команда == "policy" and args.подкоманда == "open":
+            return cmd_policy_open(home, args.name, args.field)
+        if args.команда == "policy" and args.подкоманда == "set":
+            return cmd_policy_set(home, args.name, args.field, args.cls)
         if args.команда == "daemon" and getattr(args, "действие", None) == "stop":
             return cmd_daemon_stop(home)
         if args.команда == "daemon":
@@ -436,10 +464,189 @@ def cmd_policy_check(home: pathlib.Path, name: str) -> int:
     if not находки:
         print("замечаний нет")
         return 0
+    _напечатать_находки(находки)
+    return 1 if any(находка.level == "error" for находка in находки) else 0
+
+
+def _напечатать_находки(находки: list[Finding]) -> None:
+    """Одна строка на находку — тот же формат, что печатает `cmd_policy_check`; переиспользуют
+    его и конструкторы `policy hide|open|set` (задача 5) после записи правила: показать владельцу
+    сразу, не испортило ли новое правило остальную политику."""
     for находка in находки:
         подсказка = f" ({находка.hint})" if находка.hint else ""
         print(f"{находка.level}: {находка.where}: {находка.message}{подсказка}")
-    return 1 if any(находка.level == "error" for находка in находки) else 0
+
+
+# --- policy hide | open | set (задача 5 плана M2b, ADR-0015) --------------------------------
+
+
+_БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ = CLASSES | {"scan"}
+
+
+def _похожие_сущности(repo: IndexRepository, query: str) -> str:
+    похожие = suggest_names(repo, query)
+    return f" (похожие имена: {', '.join(похожие)})" if похожие else ""
+
+
+def _разобрать_ключ_поля(ключ: str) -> tuple[str, str] | None:
+    """`Сущность.Поле` → (сущность, поле). Нет точки или одна из частей пуста (`.Поле`,
+    `Сущность.`, `Сущность`) — `None`, неверный формат."""
+    сущность, точка, поле = ключ.partition(".")
+    if not точка or not сущность or not поле:
+        return None
+    return сущность, поле
+
+
+def _проверить_поле_по_индексу(repo: IndexRepository | None, ключ: str) -> str | None:
+    """Сообщение отказа, если `ключ` (`Сущность.Поле`) не проходит проверку по индексу; `None` —
+    поле годится (или индекса нет вовсе — задача 5 плана M2b, «класс без индекса: имена не
+    проверяются», диагностику в этом случае даёт одна `warning` из `check_policy`, уже после
+    записи)."""
+    if repo is None:
+        return None
+    разбор = _разобрать_ключ_поля(ключ)
+    if разбор is None:
+        return f"«{ключ}» не похоже на «Сущность.Поле»"
+    сущность, поле = разбор
+    каноническое = repo.resolve_name(сущность)
+    if каноническое is None:
+        return f"сущность «{сущность}» не найдена в индексе базы{_похожие_сущности(repo, сущность)}"
+    if поле not in repo.field_names(каноническое):
+        похожие = difflib.get_close_matches(поле, repo.field_names(каноническое), n=3)
+        подсказка = f" (похожие поля: {', '.join(похожие)})" if похожие else ""
+        return f"поле «{поле}» не найдено у сущности «{сущность}»{подсказка}"
+    return None
+
+
+def _проверить_класс(cls: str, owner_data: dict) -> str | None:
+    """Сообщение отказа, если `cls` недопустим для `policy set`/`policy open`: не из `CLASSES`
+    (`gate/tokens.py`), не `scan` и не объявленный `custom:<имя>` (раздел `custom` файла
+    владельца, `parse_owner_file(path)["custom"]`) — `None`, если класс годится."""
+    допустимые = _БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ | {
+        f"custom:{имя}" for имя in (owner_data.get("custom") or {})
+    }
+    if cls in допустимые:
+        return None
+    перечень = ", ".join(sorted(_БАЗОВЫЕ_КЛАССЫ_ДЛЯ_ЗАПИСИ))
+    if cls.startswith("custom:"):
+        return (
+            f"класс «{cls}» не объявлен: нет раздела custom.{cls.split(':', 1)[1]} в файле "
+            f"владельца; допустимые: {перечень}, custom:<имя из раздела custom>"
+        )
+    return f"класс «{cls}» неизвестен; допустимые: {перечень}, custom:<имя из раздела custom>"
+
+
+def _путь_политики_или_отказ(home: pathlib.Path, base_name: str) -> pathlib.Path | None:
+    путь = policy_path(home, base_name)
+    if not путь.exists():
+        print(f"политика ещё не создана; выполните: odata1c reindex {base_name}")
+        return None
+    return путь
+
+
+def cmd_policy_hide(home: pathlib.Path, name: str, entity: str, yes: bool) -> int:
+    """`odata1c policy hide <база> <сущность> [--yes]` (задача 5 плана M2b, ADR-0015): закрыть
+    сущность целиком — конструктор поверх `hide_entity` (`gate/policy_edit.py`).
+
+    Порядок: имя сущности проверяется по индексу (если он есть), при промахе — отказ с
+    подсказкой похожих имён и код 1, файл не трогается; иначе печатается число и первые 10
+    дочерних (`IndexRepository.descendants`, Ruling 30 — сам запрет распространяется на них при
+    чтении политики, не здесь) и, без `--yes`, спрашивается подтверждение (`input()`; любой
+    ответ, кроме `y`/`д`, — отказ без записи). После записи — находки `check_policy` (тем же
+    форматом, что `policy check`) и строка итога."""
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    путь = _путь_политики_или_отказ(home, base.name)
+    if путь is None:
+        return 1
+
+    репозиторий = _открыть_индекс_для_политики(home, base.name)
+    try:
+        if репозиторий is not None and репозиторий.resolve_name(entity) is None:
+            подсказка = _похожие_сущности(репозиторий, entity)
+            print(f"сущность «{entity}» не найдена в индексе базы{подсказка}")
+            return 1
+
+        дочерние = репозиторий.descendants({entity}) if репозиторий is not None else set()
+        if репозиторий is not None:
+            перечень = ", ".join(sorted(дочерние)[:10])
+            хвост = f" и ещё {len(дочерние) - 10}" if len(дочерние) > 10 else ""
+            if дочерние:
+                print(f"дочерних сущностей: {len(дочерние)} ({перечень}{хвост})")
+            else:
+                print("дочерних сущностей: 0")
+
+        if not yes:
+            ответ = input(f"скрыть {entity} и {len(дочерние)} дочерних? [y/N] ").strip().lower()
+            if ответ not in ("y", "д"):
+                print("отменено")
+                return 1
+
+        изменено = hide_entity(путь, entity)
+        if not изменено:
+            print(f"сущность «{entity}» уже скрыта")
+            return 0
+
+        находки = check_policy(путь, репозиторий)
+        _напечатать_находки(находки)
+        print(f"скрыто: {entity} и {len(дочерние)} дочерних")
+        return 0
+    finally:
+        if репозиторий is not None:
+            репозиторий.close()
+
+
+def _cmd_policy_записать_класс(
+    home: pathlib.Path, name: str, field: str, cls: str, *, открытие: bool
+) -> int:
+    """Общая часть `policy open` (частный случай — класс всегда `keep`) и `policy set`
+    (произвольный класс): проверка класса, проверка поля по индексу, запись `set_field_class`,
+    находки `check_policy`, строка итога. `открытие` меняет только последнюю строку —
+    `открыто: <поле>` вместо `класс поля <поле>: <класс> (было: …)`."""
+    config = load_config(home)
+    base = Registry(config).get(name, SessionScope())
+    путь = _путь_политики_или_отказ(home, base.name)
+    if путь is None:
+        return 1
+
+    owner_data = parse_owner_file(путь)
+    ошибка_класса = _проверить_класс(cls, owner_data)
+    if ошибка_класса:
+        print(ошибка_класса)
+        return 1
+
+    репозиторий = _открыть_индекс_для_политики(home, base.name)
+    try:
+        ошибка_поля = _проверить_поле_по_индексу(репозиторий, field)
+        if ошибка_поля:
+            print(ошибка_поля)
+            return 1
+
+        прежнее = set_field_class(путь, field, cls)
+        находки = check_policy(путь, репозиторий)
+        _напечатать_находки(находки)
+        if открытие:
+            print(f"открыто: {field}")
+        else:
+            было = прежнее if прежнее is not None else "авторазметка"
+            print(f"класс поля {field}: {cls} (было: {было})")
+        return 0
+    finally:
+        if репозиторий is not None:
+            репозиторий.close()
+
+
+def cmd_policy_open(home: pathlib.Path, name: str, field: str) -> int:
+    """`odata1c policy open <база> <Сущность.Поле>` (задача 5 плана M2b, ADR-0015): сократить
+    `policy set ... keep` — конструктор поверх `set_field_class` (`gate/policy_edit.py`)."""
+    return _cmd_policy_записать_класс(home, name, field, "keep", открытие=True)
+
+
+def cmd_policy_set(home: pathlib.Path, name: str, field: str, cls: str) -> int:
+    """`odata1c policy set <база> <Сущность.Поле> <класс>` (задача 5 плана M2b, ADR-0015):
+    назначить полю произвольный класс — `CLASSES` (SPEC §6.4), `scan` или `custom:<имя>`
+    (раздел `custom` файла владельца) — конструктор поверх `set_field_class`."""
+    return _cmd_policy_записать_класс(home, name, field, cls, открытие=False)
 
 
 def cmd_daemon(home: pathlib.Path, foreground: bool) -> int:
