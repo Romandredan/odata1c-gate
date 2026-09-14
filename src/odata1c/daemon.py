@@ -466,7 +466,7 @@ def build_write_layer(service: ToolService) -> WriteLayer:
     запрос, смена ключа — перезапуск. Демон его не создаёт — это делают лаунчер и `odata1c init`.
     Нет ключа — подпись клиента не проверить: механизм `claude_code` не выдаётся никому, в
     журнал — предупреждение. Ни ключа, ни имени его файла в журнале нет."""
-    config = service._config
+    config = service.config
     ключ = read_launcher_key(config.home)
     if ключ is None:
         _log.warning(
@@ -1118,12 +1118,17 @@ async def _цикл_проверки_метаданных(service: ToolService, 
     Сначала пауза, потом проверка: сразу после старта индекс либо только что построен вручную,
     либо не нужен ещё никому, а вот занять собой холодный старт демона проверка вполне успела бы.
     `reindex_check_hours <= 0` — проверка выключена, задача не запускается вовсе (см. `serve`).
+
+    Состав баз — из `service.config`, то есть из `bases.yaml` на момент прохода (SPEC §3.1,
+    поправка 2026-09-14): цикл живёт часами, и захваченный при старте `config` звал бы реиндекс
+    для баз, которых владелец уже не держит, и молчал бы о заведённых. Период — наоборот, из
+    стартового `config`: он из `daemon.yaml`, а тот по-прежнему читается только при старте.
     """
     период = config.daemon.reindex_check_hours * 3600
     while True:
         await asyncio.sleep(период)
         try:
-            await check_metadata_once(service, config)
+            await check_metadata_once(service, service.config)
         except asyncio.CancelledError:
             raise
         except Exception:

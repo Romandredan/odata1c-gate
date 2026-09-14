@@ -62,16 +62,39 @@ class BaseState:
 class Registry:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
-        self._state: dict[str, BaseState] = {
-            name: BaseState(
+        self._state: dict[str, BaseState] = {}
+        self._пересобрать_состояние()
+
+    def replace_config(self, config: AppConfig) -> None:
+        """Принять перечитанный `bases.yaml` (SPEC §3.1, поправка 2026-09-14, ADR-0015): состав
+        баз и их настройки — из нового файла, состояние индексации баз, оставшихся под тем же
+        именем, — прежнее.
+
+        Состояние (`indexed`, `indexed_at`, `entity_count`, `last_error`) в `bases.yaml` не
+        описано: его наполняют реиндекс и фоновая проверка `$metadata`, и правка файла настроек —
+        не повод объявить проиндексированную базу непроиндексированной. У базы, которой в новом
+        файле нет, состояние уходит вместе с ней: вернись она позже, прежние отметки относились бы
+        к записи, которой в файле уже не было, — в том числе к другому адресу.
+        """
+        self._config = config
+        self._пересобрать_состояние()
+
+    def _пересобрать_состояние(self) -> None:
+        прежние = self._state
+        self._state = {}
+        for name, base in self._config.bases.items():
+            было = прежние.get(name)
+            self._state[name] = BaseState(
                 name=name,
                 label=base.label,
                 role=base.role,
                 gate_mode=base.gate.mode,
                 write=base.write,
+                indexed=было.indexed if было else False,
+                indexed_at=было.indexed_at if было else None,
+                entity_count=было.entity_count if было else None,
+                last_error=было.last_error if было else None,
             )
-            for name, base in config.bases.items()
-        }
 
     def visible(self, session: SessionScope) -> list[BaseState]:
         # Копии, а не живые объекты: BaseState общий для всех сессий, читающих реестр.

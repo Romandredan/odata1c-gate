@@ -101,6 +101,10 @@ class BaseGate:
         self.mode = base.gate.mode
         self._stamp: tuple | None = None
         self._masker: Masker | None = None
+        # Политику перечитали на ходу, и слой тулов ещё не сообщил об этом модели (SPEC §6.9,
+        # задача 6 плана M2b). Снимает флаг тот, кто добавил предупреждение в ответ, —
+        # `ToolService._предупредить_о_смене_политики`.
+        self.policy_changed = False
         self.refresh()
 
     def _отметка(self) -> tuple:
@@ -126,10 +130,18 @@ class BaseGate:
         отпечаток. Прежнее значение снято этим же гейтом секундой раньше, и если файловая система
         отдала обеим отметкам одно значение, обычный `refresh()` счёл бы новую политику прежней и
         оставил бы маскировщик на старых классах полей — то есть новое защищаемое поле ушло бы
-        модели открытым."""
+        модели открытым.
+
+        Перечитанная на ходу политика поднимает `policy_changed` — слой тулов сообщает об этом
+        модели строкой в `warnings` (SPEC §6.9, задача 6 плана M2b): состав закрытых полей мог
+        измениться, и ответы после правки отличаются от ответов до неё. Ни первое построение
+        гейта (сообщать не о чем — прежних ответов не было), ни `force=True` флага не поднимают:
+        `force` зовёт реиндекс, а он сам кладёт в ответ строку о пересборке авторазметки."""
         отметка = self._отметка()
         if not force and отметка == self._stamp and self._masker is not None:
             return
+        if not force and self._masker is not None:
+            self.policy_changed = True
         policy = load_policy(self._policy_path, self._auto_path)
         self._policy, self._stamp = policy, отметка
         self._masker = Masker(self._dictionary, policy, mode=self.mode, base=self._base.name)

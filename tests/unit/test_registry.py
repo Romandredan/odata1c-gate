@@ -163,3 +163,52 @@ def test_изоляция_скрытая_база_неразличима_от_н
     несуществующая_текст = str(несуществующая.value.args[0])
     скрытая_с_другим_именем = скрытая_текст.replace("buh", "нет_такой")
     assert скрытая_с_другим_именем == несуществующая_текст
+
+
+# ---------------------------------------------------------------------------------------------
+# replace_config: перечитанный bases.yaml без перезапуска демона (SPEC §3.1, ADR-0015)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_replace_config_сохраняет_состояние_индексации_и_обновляет_настройки():
+    """Состояние индекса не из `bases.yaml`: его наполняют реиндекс и фоновая проверка
+    `$metadata`, и правка файла настроек — не повод забыть, что база проиндексирована."""
+    registry = Registry(собрать("ut", "buh"))
+    registry.set_indexed("ut", "2026-09-14T10:00:00", 7224)
+    registry.set_error("buh", "не отвечает")
+
+    новая = собрать("ut", "buh")
+    новая.bases["ut"] = новая.bases["ut"].model_copy(update={"label": "УТ, рабочая", "write": True})
+    registry.replace_config(новая)
+
+    состояния = {с.name: с for с in registry.visible(SessionScope(None, None))}
+    assert состояния["ut"].indexed is True and состояния["ut"].entity_count == 7224
+    assert состояния["ut"].indexed_at == "2026-09-14T10:00:00"
+    assert (состояния["ut"].label, состояния["ut"].write) == ("УТ, рабочая", True)
+    assert состояния["buh"].last_error == "не отвечает"
+
+
+def test_replace_config_меняет_состав_баз():
+    registry = Registry(собрать("ut", "buh"))
+    registry.set_indexed("buh", "2026-09-14T10:00:00", 10)
+
+    registry.replace_config(собрать("ut", "zup"))
+
+    assert {с.name for с in registry.visible(SessionScope(None, None))} == {"ut", "zup"}
+    with pytest.raises(UnknownBase) as ошибка:
+        registry.get("buh", SessionScope(None, None))
+    assert ошибка.value.code == "base_unknown"
+    assert registry.get("zup", SessionScope(None, None)).name == "zup"
+
+
+def test_replace_config_не_тащит_состояние_вернувшейся_базы_из_прошлой_жизни():
+    """База, которую владелец убрал из файла и вернул, начинает с чистого состояния: прежняя
+    отметка индексации относилась к записи, которой в файле уже не было."""
+    registry = Registry(собрать("ut", "buh"))
+    registry.set_indexed("buh", "2026-09-14T10:00:00", 10)
+
+    registry.replace_config(собрать("ut"))
+    registry.replace_config(собрать("ut", "buh"))
+
+    состояние = {с.name: с for с in registry.visible(SessionScope(None, None))}["buh"]
+    assert состояние.indexed is False and состояние.entity_count is None
