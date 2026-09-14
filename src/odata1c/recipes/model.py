@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import importlib.resources
+import logging
 import pathlib
 import re
 from typing import Literal
@@ -26,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from odata1c.config.home import base_dir
 from odata1c.config.loader import format_validation_error
 from odata1c.config.models import BaseConfig
+
+_log = logging.getLogger(__name__)
 
 ParamType = Literal["datetime", "date", "guid", "string", "int", "decimal", "bool"]
 
@@ -448,15 +451,70 @@ def load_recipe_file(path: pathlib.Path) -> Recipe:
         ) from ошибка
 
 
-def load_library(home: pathlib.Path, config: str) -> dict[str, Recipe]:
-    """Все рецепты библиотеки конфигурации: имя файла (без `.yaml`) → рецепт, по алфавиту имени
-    файла. Каталога нет вовсе — пустой словарь, это не ошибка: библиотека необязательна, как и
-    файл рецептов базы. Без кэша — каталог маленький, а новый файл должен быть виден сразу же,
-    без перезапуска демона (та же причина, что у `ToolService._книга_рецептов`)."""
-    каталог = library_dir(home, config)
+def scan_library(
+    каталог: pathlib.Path,
+) -> tuple[dict[str, pathlib.Path], dict[str, list[pathlib.Path]], list[pathlib.Path]]:
+    """Кандидаты файлов библиотеки одного каталога — общая часть `load_library` и
+    `cli.cmd_recipe_check` (Ruling 79, ревью задачи 3): расширение приведено к нижнему регистру
+    ЯВНО, а не через `pathlib.Path.glob("*.yaml")` — тот на Windows (регистронезависимая ФС)
+    матчит и `.YAML`, а на Linux (регистрозависимая, туда целится CI задачи 9) — нет; при целевой
+    ОС Windows (SPEC §15) поведение должно быть одним и тем же на обеих, а не расходиться по ОС,
+    на которой запущен демон.
+
+    Возвращает три списка: (1) стем имени → путь, для файлов, у которых на этот стем ровно один
+    файл с расширением `.yaml`/`.YAML`/… (регистр расширения не важен); (2) стем → все пути,
+    если на этот стем таких файлов НЕСКОЛЬКО (`stock.yaml` и `stock.YAML` рядом — тоже дубликат
+    имени, даже с одинаковым стемом и просто разным регистром расширения); (3) файлы с
+    расширением `.yml` — демон их не читает нигде (ни здесь, ни `load_recipe_file`), но и не
+    должен пропускать молча: такой файл — рецепт, который владелец считает существующим, а он не
+    существует ни для одного слоя."""
+    по_стему: dict[str, list[pathlib.Path]] = {}
+    yml_файлы: list[pathlib.Path] = []
     if not каталог.is_dir():
-        return {}
-    return {файл.stem: load_recipe_file(файл) for файл in sorted(каталог.glob("*.yaml"))}
+        return {}, {}, []
+    for файл in sorted(каталог.iterdir()):
+        if not файл.is_file():
+            continue
+        расширение = файл.suffix.lower()
+        if расширение == ".yml":
+            yml_файлы.append(файл)
+        elif расширение == ".yaml":
+            по_стему.setdefault(файл.stem, []).append(файл)
+    кандидаты = {стем: пути[0] for стем, пути in по_стему.items() if len(пути) == 1}
+    дубликаты = {стем: пути for стем, пути in по_стему.items() if len(пути) > 1}
+    return кандидаты, дубликаты, yml_файлы
+
+
+def load_library(home: pathlib.Path, config: str) -> dict[str, Recipe]:
+    """Все рецепты библиотеки конфигурации: имя файла (без расширения) → рецепт, по алфавиту
+    имени. Каталога нет вовсе — пустой словарь, это не ошибка: библиотека необязательна, как и
+    файл рецептов базы. Без кэша — каталог маленький, а новый файл должен быть виден сразу же,
+    без перезапуска демона (та же причина, что у `ToolService._книга_рецептов`).
+
+    Один негодный файл или дубликат имени НЕ закрывает библиотеку целиком (Ruling 79, ревью
+    задачи 3, Major 2): до этой правки первый же `RecipeError` внутри включения словаря уходил
+    наверх через `load_layered` → `ToolService._книга_рецептов` → `_run`, где превращался в отказ
+    `config_invalid`, — и один файл с опечаткой в имени (например, `Stock.YAML` — на Windows его
+    матчил бы прежний `glob("*.yaml")`) выключал `odata1c_recipe` у ВСЕХ баз этой конфигурации и
+    всех сессий разом. Негодный файл рецепта утечки вызвать не может — каждый рецепт всё равно
+    идёт через гейт на исполнении, — поэтому мягкая деградация здесь безопасна. Пропущенный файл
+    попадает в журнал демона (WARNING, путь без содержимого файла — сообщение `RecipeError` и так
+    не содержит значений данных, SPEC §3.1); громкий канал для владельца и навыка —
+    `odata1c recipe check`, которая те же файлы и дубликаты печатает строкой `error`."""
+    кандидаты, дубликаты, _yml = scan_library(library_dir(home, config))
+    результат: dict[str, Recipe] = {}
+    for имя, файл in sorted(кандидаты.items()):
+        try:
+            результат[имя] = load_recipe_file(файл)
+        except RecipeError as ошибка:
+            _log.warning("рецепт библиотеки пропущен, файл не читается: %s (%s)", файл, ошибка.code)
+    for имя, файлы in sorted(дубликаты.items()):
+        _log.warning(
+            "рецепт библиотеки пропущен, дубликат имени «%s»: %s",
+            имя,
+            ", ".join(str(ф) for ф in файлы),
+        )
+    return результат
 
 
 def load_template(config: str) -> dict[str, Recipe]:

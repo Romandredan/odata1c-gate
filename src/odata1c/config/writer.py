@@ -72,6 +72,7 @@ def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
     password: {password}
     role: {role}
 {config_line}
+
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
     # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
     # timeout_s: 60                  # таймаут обычного запроса; виртуальные таблицы — 180

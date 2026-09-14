@@ -17,6 +17,7 @@ from odata1c.recipes.model import (
     load_library,
     load_recipe_file,
     recipes_path,
+    scan_library,
 )
 
 URL_UT = "http://localhost/ut/odata/standard.odata/"
@@ -162,3 +163,45 @@ def test_библиотека_перечитывается_без_кэша(tmp_p
 
     второй = load_library(home, "ut")
     assert set(второй) == {"stock", "debtors"}
+
+
+def test_load_library_пропускает_негодный_файл_рядом_с_исправным(tmp_path, caplog):
+    """Ruling 79 (ревью задачи 3, Major 2): до этой правки первый же негодный файл (здесь —
+    имя файла не по маске) уходил `RecipeError`-ом из включения словаря наверх и через
+    `load_layered` закрывал `odata1c_recipe` у ВСЕХ баз этой конфигурации разом. Негодный файл
+    пропускается молча для вызывающего (`load_library` не бросает исключение) со строкой в
+    журнале демона уровня WARNING — путь без содержимого файла."""
+    каталог = library_dir(tmp_path, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "Остатки.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+    (каталог / "partners.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+
+    with caplog.at_level("WARNING"):
+        библиотека = load_library(tmp_path, "ut")
+
+    assert set(библиотека) == {"partners"}
+    assert any("Остатки.yaml" in запись.message for запись in caplog.records)
+
+
+def test_scan_library_различает_кандидатов_и_yml(tmp_path):
+    каталог = library_dir(tmp_path, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "partners.yaml").write_text("entity: Catalog_Контрагенты\n", encoding="utf-8")
+    (каталог / "stock.yml").write_text("entity: Catalog_Контрагенты\n", encoding="utf-8")
+
+    кандидаты, дубликаты, yml_файлы = scan_library(каталог)
+
+    assert set(кандидаты) == {"partners"}
+    assert дубликаты == {}
+    assert [ф.name for ф in yml_файлы] == ["stock.yml"]
+
+
+def test_scan_library_каталога_нет_даёт_пустые_результаты(tmp_path):
+    кандидаты, дубликаты, yml_файлы = scan_library(library_dir(tmp_path, "ut"))
+    assert кандидаты == {}
+    assert дубликаты == {}
+    assert yml_файлы == []

@@ -26,7 +26,7 @@ from odata1c.client1c.errors import OdataError
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
-from odata1c.config.models import ИМЯ_БАЗЫ, BaseConfig
+from odata1c.config.models import ИМЯ_БАЗЫ, ИМЯ_КОНФИГУРАЦИИ, BaseConfig
 from odata1c.config.writer import (
     append_base,
     ensure_gate_secret,
@@ -57,8 +57,16 @@ from odata1c.index.edmx import EdmxError
 from odata1c.index.reindex import index_path, reindex
 from odata1c.index.repository import IndexCorruptError, IndexRepository
 from odata1c.launcher import run_launcher
-from odata1c.recipes.model import Recipe, RecipeError, library_dir, load_layered, load_recipe_file
+from odata1c.recipes.model import (
+    Recipe,
+    RecipeError,
+    library_dir,
+    load_layered,
+    load_recipe_file,
+    scan_library,
+)
 from odata1c.registry.registry import Registry, SessionScope
+from odata1c.tools.odata_query import orderby_fields
 
 # Ошибки старта лаунчера (odata1c mcp), которые cmd_mcp форматирует сама, в stderr — не через
 # общий перехват main() (тот пишет в stdout, а stdout команды mcp — канал JSON-RPC клиента;
@@ -523,8 +531,16 @@ def _напечатать_находки(находки: list[Finding]) -> None:
 # --- policy hide | open | set (задача 5 плана M2b, ADR-0015) --------------------------------
 
 
-def _похожие_сущности(repo: IndexRepository, query: str) -> str:
-    похожие = suggest_names(repo, query)
+def _похожие_сущности(
+    repo: IndexRepository, query: str, *, hidden: frozenset[str] = frozenset()
+) -> str:
+    """Подсказка «похожие имена» к промаху по сущности. `hidden` — сущности, которые здесь не
+    называть (Ruling 80, ревью задачи 3, `recipe check`: вывод команды навык кладёт в контекст
+    модели через Bash, design §4b, и подсказка не должна называть то, что владелец скрыл, — тот
+    же принцип, что Ruling 29 для ответов MCP, хотя формально это stdout CLI-команды, а не ответ
+    MCP). Умолчание — пустое множество: у `policy hide`/`policy set` фильтровать нечего, они и
+    так работают внутри самого файла политики, который эти имена перечисляет."""
+    похожие = [имя for имя in suggest_names(repo, query) if имя not in hidden]
     return f" (похожие имена: {', '.join(похожие)})" if похожие else ""
 
 
@@ -1071,83 +1087,165 @@ def _записать_базу_по_умолчанию(path: pathlib.Path, name:
     path.write_text(f"default: {name}\n{текст}", encoding="utf-8")
 
 
-def _индекс_для_конфигурации(home: pathlib.Path, config: str) -> IndexRepository | None:
-    """Индекс первой описанной базы с этим `config`, у которой он уже есть (`odata1c reindex`
-    выполнен), — для сверки имён `recipe check` по метаданным. Несколько баз одной конфигурации
-    — обычное дело (тестовая и боевая УТ), и достаточно любой проиндексированной: имена сущностей
-    и полей одной типовой конфигурации от конкретной базы не зависят. Ни одной с индексом — `None`
-    (в т. ч. если баз с этим `config` нет вовсе): `cmd_recipe_check` в этом случае предупреждает,
-    а не отказывает — библиотека рецептов не привязана к тому, описана ли уже хоть одна база."""
+def _индекс_для_конфигурации(home: pathlib.Path, config: str) -> tuple[IndexRepository, str] | None:
+    """Индекс и имя первой описанной базы с этим `config`, у которой индекс уже есть
+    (`odata1c reindex` выполнен), — для сверки имён `recipe check` по метаданным. Несколько баз
+    одной конфигурации — обычное дело (тестовая и боевая УТ), и достаточно любой
+    проиндексированной: имена сущностей и полей одной типовой конфигурации от конкретной базы не
+    зависят. Имя базы нужно и для политики (`_скрытые_для_recipe_check`, Ruling 80) — подсказки
+    `recipe check` не должны называть то, что скрыто именно у этой базы.
+
+    Ни одной с индексом — `None` (в т. ч. если баз с этим `config` нет вовсе): `cmd_recipe_check`
+    в этом случае предупреждает, а не отказывает — библиотека рецептов не привязана к тому,
+    описана ли уже хоть одна база."""
     for base in load_config(home).bases.values():
         if base.config != config:
             continue
         репозиторий = _открыть_индекс_для_политики(home, base.name)
         if репозиторий is not None:
-            return репозиторий
+            return репозиторий, base.name
     return None
 
 
+def _скрытые_для_recipe_check(
+    home: pathlib.Path, base_name: str, repo: IndexRepository
+) -> frozenset[str]:
+    """Полный набор скрытых сущностей (корни `entities.hide` из `policy.yaml` плюс их поддерево
+    по индексу — тот же состав, что `ToolService._скрытые`, только без гейта, которого у CLI нет)
+    базы, чей индекс `recipe check` использует для подсказок (Ruling 80, ревью задачи 3). Файла
+    политики нет или он не разбирается — пустое множество: `recipe check` — диагностика для
+    владельца, а не отказ, и молчаливо показать лишнее здесь безопаснее, чем уронить команду на
+    файле, который сама же чинит `odata1c policy …`."""
+    путь = policy_path(home, base_name)
+    if not путь.exists():
+        return frozenset()
+    try:
+        policy = load_policy(путь, auto_policy_path(home, base_name))
+    except PolicyError:
+        return frozenset()
+    корни = policy.hidden_entities()
+    if not корни:
+        return frozenset()
+    return frozenset(корни | repo.descendants(корни))
+
+
 def _проверить_рецепт_по_индексу(
-    repo: IndexRepository, путь: pathlib.Path, recipe: Recipe
+    repo: IndexRepository,
+    путь: pathlib.Path,
+    recipe: Recipe,
+    *,
+    hidden: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Находки `recipe check` по одному рецепту: сущность и поля (`select`, `orderby`, поля
     условий через `Recipe.param_field`) сверяются с индексом тем же способом, что и в
     `gate/policy_check.py` (`resolve_name`, `field_names`, `suggest_names`,
     `difflib.get_close_matches`) — два разных разбора одного и того же вопроса расходятся, урок
-    Ruling 20 из `recipes/render.py`."""
+    Ruling 20 из `recipes/render.py`.
+
+    Ruling 78 (ревью задачи 3, Major 1): имена сверяются ТАК ЖЕ, как их понимает `query`, а не
+    сырой строкой рецепта. `orderby` — список полей через запятую с необязательным `asc`/`desc`
+    у каждого (`orderby_fields`, `tools/odata_query.py` — тот же разбор, что применяет
+    `_проверить_сортировку` при исполнении рецепта), а не одна строка целиком: «Description desc»
+    ни с одним полем индекса не совпадёт никогда, и рабочий рецепт получал бы ложный `error`.
+    Поле через связанный объект (`Партнер/Наименование`) не разбирается по навигациям индекса
+    здесь — путь может вести через навигацию, составное поле или табличную часть, которых один
+    уровень `field_names` не видит, а `policy_check` (тот же способ проверки, что и у сущности и
+    прочих полей) такого разбора не делает вовсе; вместо ошибки — `warning: путь не проверен`.
+    Ложный `error` на рабочем рецепте недопустим, ложноотрицательный `warning` — приемлем.
+
+    `hidden` — сущности, скрытые владельцем у базы, чей индекс используется (Ruling 80): подсказка
+    «похожие имена» на промахе их не называет."""
     строки: list[str] = []
     каноническое = repo.resolve_name(recipe.entity)
     if каноническое is None:
         строки.append(
             f"error: {путь}: сущность «{recipe.entity}» не найдена в индексе базы"
-            f"{_похожие_сущности(repo, recipe.entity)}"
+            f"{_похожие_сущности(repo, recipe.entity, hidden=hidden)}"
         )
         return строки  # поля сверять не с чем без канонического имени сущности
 
     поля_индекса = repo.field_names(каноническое)
-    поля_рецепта = set(recipe.select)
+    поля_рецепта: set[str] = set(recipe.select)
     if recipe.orderby:
-        поля_рецепта.add(recipe.orderby)
+        поля_рецепта.update(orderby_fields(recipe.orderby))
     for имя_параметра in recipe.params:
         поле = recipe.param_field(имя_параметра)
         if поле:
             поля_рецепта.add(поле)
 
     for поле in sorted(поля_рецепта):
-        if поле not in поля_индекса:
-            похожие_поля = difflib.get_close_matches(поле, поля_индекса, n=3)
-            подсказка = f" (похожие поля: {', '.join(похожие_поля)})" if похожие_поля else ""
-            строки.append(
-                f"error: {путь}: поле «{поле}» не найдено у сущности «{recipe.entity}»{подсказка}"
-            )
+        if "/" in поле:
+            строки.append(f"warning: {путь}: путь не проверен: «{поле}»")
+            continue
+        if поле in поля_индекса:
+            continue
+        похожие_поля = difflib.get_close_matches(поле, поля_индекса, n=3)
+        подсказка = f" (похожие поля: {', '.join(похожие_поля)})" if похожие_поля else ""
+        строки.append(
+            f"error: {путь}: поле «{поле}» не найдено у сущности «{recipe.entity}»{подсказка}"
+        )
     return строки
 
 
 def cmd_recipe_check(home: pathlib.Path, config: str) -> int:
-    """`odata1c recipe check <config>` (M3 задача 3): каждый файл библиотеки рецептов
-    (`recipes/<config>/*.yaml`) читается через `load_recipe_file`; ошибка чтения (YAML, обёртка
-    книги вместо одного рецепта, неверное имя файла, поле рецепта) — строка `error` с путём файла.
+    """`odata1c recipe check <config>` (M3 задача 3, доправлено ревью, раунд 1 — Ruling 79/80):
+    каждый файл библиотеки рецептов (`recipes/<config>/*.yaml`, регистр расширения — без разницы,
+    `scan_library`) читается через `load_recipe_file`; ошибка чтения (YAML, обёртка книги вместо
+    одного рецепта, неверное имя файла, поле рецепта) — строка `error` c путём (путь уже внутри
+    `ошибка.message`, второй раз не печатается — Minor 1). Два файла на одно имя рецепта (в т. ч.
+    отличающиеся только регистром расширения, `stock.yaml` и `stock.YAML`) — тоже `error`, файл
+    `.yml` — `warning`: демон это расширение не читает нигде. Каталога нет или в нём вовсе нет
+    файлов-кандидатов — `warning: библиотека пуста`. Имя `<config>` проверяется той же маской,
+    что поле `config` (`ИМЯ_КОНФИГУРАЦИИ`) — раньше сырой аргумент шёл прямо в `library_dir`, и
+    `recipe check ../..` (или абсолютный путь) увели бы просмотр за пределы домашнего каталога.
+
     Имена сущностей и полей сверяются по индексу первой проиндексированной базы с этим `config`
     (`_индекс_для_конфигурации`); индекса ни у одной такой базы нет — одна строка `warning`, а не
-    отказ: библиотека рецептов существует независимо от того, добавлена ли уже база.
+    отказ: библиотека рецептов существует независимо от того, добавлена ли уже база. Подсказки
+    «похожие имена» не называют сущности, скрытые владельцем у ЭТОЙ базы (Ruling 80): вывод команды
+    навык кладёт в контекст модели через Bash (design §4b).
 
     Код возврата — 1, только если есть хоть одна `error`; один `warning` без единой `error`
     возврату не мешает (тот же принцип, что у `policy check`)."""
+    if not ИМЯ_КОНФИГУРАЦИИ.match(config):
+        print(
+            f"error: «{config}» не подходит как имя конфигурации: строчная латинская буква в "
+            "начале, дальше строчные латинские буквы, цифры и подчёркивание, до 32 символов"
+        )
+        return 1
+
+    каталог = library_dir(home, config)
+    кандидаты, дубликаты, yml_файлы = scan_library(каталог)
+
     строки: list[str] = []
     рецепты: list[tuple[pathlib.Path, Recipe]] = []
-    for путь in sorted(library_dir(home, config).glob("*.yaml")):
+    for путь in sorted(кандидаты.values()):
         try:
             рецепты.append((путь, load_recipe_file(путь)))
         except RecipeError as ошибка:
-            строки.append(f"error: {путь}: {ошибка.message}")
+            строки.append(f"error: {ошибка.message}")
 
-    репозиторий = _индекс_для_конфигурации(home, config)
-    if репозиторий is None:
+    for имя, файлы in sorted(дубликаты.items()):
+        перечень = ", ".join(str(файл) for файл in файлы)
+        строки.append(f"error: {каталог}: дубликат имени «{имя}»: {перечень}")
+
+    for файл in yml_файлы:
+        строки.append(f"warning: {файл}: расширение .yml не читается, переименуйте в .yaml")
+
+    if not кандидаты and not дубликаты and not yml_файлы:
+        строки.append(f"warning: библиотека пуста: {каталог}")
+
+    найдено = _индекс_для_конфигурации(home, config)
+    if найдено is None:
         строки.append(f"warning: имена не проверены: индекса базы с config={config} нет")
     else:
+        репозиторий, base_name = найдено
         try:
+            скрытые = _скрытые_для_recipe_check(home, base_name, репозиторий)
             for путь, рецепт in рецепты:
-                строки.extend(_проверить_рецепт_по_индексу(репозиторий, путь, рецепт))
+                строки.extend(
+                    _проверить_рецепт_по_индексу(репозиторий, путь, рецепт, hidden=скрытые)
+                )
         finally:
             репозиторий.close()
 

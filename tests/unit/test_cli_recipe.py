@@ -10,12 +10,14 @@
 
 import pathlib
 
+import pytest
+
 from odata1c.cli import main
 from odata1c.config.loader import load_config
 from odata1c.index.edmx import parse_edmx
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
-from odata1c.recipes.model import library_dir
+from odata1c.recipes.model import RecipeError, library_dir, load_recipe_file
 
 URL_UT = "http://localhost/ut/odata/standard.odata/"
 BASES_UT = f"""
@@ -96,7 +98,9 @@ def test_recipe_check_чистый_на_шаблоне_ut(tmp_path, capsys, edmx
     assert "замечаний нет" in вывод
 
 
-def test_recipe_check_ошибка_файла_с_путём(tmp_path, capsys):
+def test_recipe_check_ошибка_файла_печатает_сообщение_один_раз(tmp_path, capsys):
+    """Minor 1 ревью задачи 3: `load_recipe_file` уже кладёт путь файла в `RecipeError.message` —
+    `cmd_recipe_check` не должен приписывать его ещё раз (`error: <путь>: <путь>: …»)."""
     home = _домашний_с_базой(tmp_path)
     каталог = library_dir(home, "ut")
     каталог.mkdir(parents=True)
@@ -105,12 +109,16 @@ def test_recipe_check_ошибка_файла_с_путём(tmp_path, capsys):
         "entity: Catalog_Контрагенты\nparams:\n  q: { type: string }\nselect: ['{q}']\n",
         encoding="utf-8",
     )
+    with pytest.raises(RecipeError) as отказ:
+        load_recipe_file(путь)
+    ожидаемая_строка = f"error: {отказ.value.message}"
 
     код = main(["recipe", "check", "ut", "--home", str(home)])
-    вывод = capsys.readouterr().out
+    строки = capsys.readouterr().out.strip("\n").splitlines()
 
     assert код == 1
-    assert f"error: {путь}" in вывод
+    assert ожидаемая_строка in строки
+    assert строки[строки.index(ожидаемая_строка)].count(str(путь)) == 1
 
 
 def test_recipe_check_без_индекса_warning(tmp_path, capsys):
@@ -148,6 +156,215 @@ def test_recipe_check_неизвестная_сущность_error(tmp_path, ca
     assert "не найдена в индексе" in вывод
     assert "похожие имена" in вывод
     assert "Catalog_Контрагенты" in вывод
+
+
+# --- Ruling 78 (ревью задачи 3, Major 1): orderby и путь через связь -------------------------
+
+
+def test_recipe_check_orderby_с_направлением_не_ошибка(tmp_path, capsys, edmx_ut_real):
+    """`orderby: Description desc` — рабочий синтаксис (`odata_query.orderby_fields` разбирает
+    его так же на исполнении рецепта), а не сырая строка, которая ни с одним полем индекса не
+    совпадёт никогда."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "partners.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key, Description]\norderby: Description desc\n",
+        encoding="utf-8",
+    )
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "замечаний нет" in вывод
+
+
+def test_recipe_check_orderby_список_полей_не_ошибка(tmp_path, capsys, edmx_ut_real):
+    """`orderby` списком через запятую — тоже штатный синтаксис."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "partners.yaml").write_text(
+        "entity: Catalog_Контрагенты\n"
+        "select: [Ref_Key, Description, ИНН]\n"
+        "orderby: Description, ИНН desc\n",
+        encoding="utf-8",
+    )
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "замечаний нет" in вывод
+
+
+def test_recipe_check_путь_через_связь_предупреждение_не_ошибка(tmp_path, capsys, edmx_ut_real):
+    """Поле через связанный объект (`Партнер/Наименование`) не разбирается по навигациям индекса
+    здесь — `warning: путь не проверен», а не ложный `error` на рабочем рецепте."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "partners.yaml").write_text(
+        "entity: Catalog_Контрагенты\n"
+        "params:\n"
+        "  name: { type: string, required: true }\n"
+        "filter: substringof({name}, Партнер/Наименование)\n"
+        "select: [Ref_Key]\n",
+        encoding="utf-8",
+    )
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "warning" in вывод
+    assert "путь не проверен" in вывод
+    assert "Партнер/Наименование" in вывод
+    assert "error" not in вывод
+
+
+# --- Ruling 79 (ревью задачи 3, Major 2): изоляция негодных файлов библиотеки -----------------
+
+
+def test_recipe_check_негодный_файл_не_мешает_проверить_остальные(tmp_path, capsys, edmx_ut_real):
+    """Один негодный файл (здесь — неверное имя) не должен останавливать проверку остальных."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "Остатки.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+    (каталог / "partners.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "Остатки.yaml" in вывод
+    assert "не годится как имя рецепта" in вывод
+    assert "partners.yaml" not in вывод
+
+
+def test_recipe_check_yml_расширение_даёт_warning(tmp_path, capsys):
+    """`.yml` — расширение, которое демон не читает нигде, но и не должен пропускать молча."""
+    home = _домашний_с_базой(tmp_path)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "stock.yml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "warning" in вывод
+    assert "расширение .yml не читается" in вывод
+    assert "stock.yml" in вывод
+
+
+def test_recipe_check_пустая_библиотека_warning(tmp_path, capsys):
+    """Каталога библиотеки нет вовсе — `warning: библиотека пуста», а не тихое «замечаний нет»
+    (в отличие от «замечаний нет» пустая библиотека — это повод проверить путь/config)."""
+    home = _домашний_с_базой(tmp_path)
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "библиотека пуста" in вывод
+
+
+def test_recipe_check_дубликат_имени_из_за_регистра_расширения(tmp_path, capsys, edmx_ut_real):
+    """Два файла на один стем, отличающиеся только регистром расширения (`stock.yaml` /
+    `stock.YAML`), — дубликат имени, `error`. На регистронезависимой ФС (Windows, macOS по
+    умолчанию) такие два файла физически не сосуществуют — ОС делает их одним файлом, и сценарий
+    пропускается, если создать оба не удалось."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "stock.yaml").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+    (каталог / "stock.YAML").write_text(
+        "entity: Catalog_Контрагенты\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+    if len(list(каталог.iterdir())) < 2:
+        pytest.skip("файловая система нечувствительна к регистру расширений — сценарий недостижим")
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "дубликат имени" in вывод
+    assert "stock" in вывод
+
+
+def test_recipe_check_неверное_имя_конфигурации_error(tmp_path, capsys):
+    """Аргумент `<config>` проверяется той же маской, что поле `config` (защита в глубину —
+    `recipe check ../..` не должен уводить просмотр за пределы домашнего каталога)."""
+    home = tmp_path / "home"
+    main(["init", "--home", str(home)])
+
+    код = main(["recipe", "check", "../etc", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "не подходит как имя конфигурации" in вывод
+
+
+# --- Ruling 80 (ревью задачи 3): подсказки не называют скрытые сущности -----------------------
+
+
+def _рецепт_с_опечаткой_в_сущности(home: pathlib.Path) -> None:
+    каталог = library_dir(home, "ut")
+    каталог.mkdir(parents=True)
+    (каталог / "missing.yaml").write_text(
+        "entity: Catalog_НетТакой\nselect: [Ref_Key]\n", encoding="utf-8"
+    )
+
+
+def test_recipe_check_подсказка_называет_видимую_сущность(tmp_path, capsys, edmx_ut_real):
+    """Контроль к следующему тесту: без правила `hide` подсказка «похожие имена» называет
+    Catalog_Контрагенты — иначе следующий тест ничего не доказывает."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    _рецепт_с_опечаткой_в_сущности(home)
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "Catalog_Контрагенты" in вывод
+
+
+def test_recipe_check_подсказка_не_называет_скрытую_сущность(tmp_path, capsys, edmx_ut_real):
+    """Ruling 80: вывод `recipe check` может попасть в контекст модели (навык запускает его
+    через Bash) — подсказка «похожие имена» не должна называть сущность, скрытую владельцем у
+    базы, чей индекс используется."""
+    home = _домашний_с_базой(tmp_path)
+    _построить_индекс(home, edmx_ut_real)
+    путь_политики = home / "bases" / "ut" / "policy.yaml"
+    путь_политики.parent.mkdir(parents=True, exist_ok=True)
+    путь_политики.write_text(
+        "version: 2\nscan_free_text: true\nentities:\n  Catalog_Контрагенты: {hide: true}\n",
+        encoding="utf-8",
+    )
+    _рецепт_с_опечаткой_в_сущности(home)
+
+    код = main(["recipe", "check", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "Catalog_Контрагенты" not in вывод
 
 
 # --- recipe list ----------------------------------------------------------------------------
