@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ИМЯ_БАЗЫ = re.compile(r"^[a-z0-9_]{1,32}$")
 ОКОНЧАНИЕ_URL = "/odata/standard.odata/"
 
+# Имя конфигурации для библиотеки рецептов (`recipes/<config>/`, ADR-0011, поправка 2026-09-14):
+# буква в начале — та же форма, что у имени рецепта (`recipes/model.py::ИМЯ_РЕЦЕПТА`), только
+# короче (32 символа, как у имени базы) — это имя каталога, а не имя файла.
+ИМЯ_КОНФИГУРАЦИИ = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
 GateMode = Literal["off", "identifiers", "identifiers+names"]
 Role = Literal["prod", "test", "dev"]
 
@@ -67,6 +72,12 @@ class BaseConfig(BaseModel):
     permissions: Permissions = Field(default_factory=Permissions)
     gate: GateSettings = Field(default_factory=GateSettings)
     recipes: str | None = None
+    # Конфигурация для библиотеки рецептов (recipes/<config>/, ADR-0011, поправка 2026-09-14):
+    # какой каталог ~/.claude/odata1c/recipes/ и какой шаблон пакета (templates/recipes/
+    # <config>.yaml) видит эта база нижними слоями recipes.model.load_layered. Не путать с
+    # `recipes` (путь к собственному файлу рецептов базы, верхний слой) — `config` называет общую
+    # библиотеку, `recipes` — файл одной базы.
+    config: str | None = None
 
     # Оба валидатора называют поле и правило, но НЕ повторяют полученное значение (находка 3
     # ревью задачи 6 плана M2b). Текст `ValidationError` доходит до модели: `bases.yaml`
@@ -82,6 +93,16 @@ class BaseConfig(BaseModel):
             raise ValueError(
                 "имя базы не подходит: допустимы строчные латинские буквы, "
                 "цифры и подчёркивание, до 32 символов"
+            )
+        return value
+
+    @field_validator("config")
+    @classmethod
+    def _проверить_конфигурацию(cls, value: str | None) -> str | None:
+        if value is not None and not ИМЯ_КОНФИГУРАЦИИ.match(value):
+            raise ValueError(
+                "config не подходит: строчная латинская буква в начале, дальше строчные "
+                "латинские буквы, цифры и подчёркивание, до 32 символов"
             )
         return value
 

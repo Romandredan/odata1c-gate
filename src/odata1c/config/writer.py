@@ -71,7 +71,7 @@ def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
     user: {user}
     password: {password}
     role: {role}
-
+{config_line}
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
     # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
     # timeout_s: 60                  # таймаут обычного запроса; виртуальные таблицы — 180
@@ -116,6 +116,19 @@ def render_base(name: str, values: dict) -> str:
         if write
         else "    # write: false                 # разрешить пишущие тулы"
     )
+    # Библиотека рецептов конфигурации (ADR-0011, поправка 2026-09-14, design §4b): значение
+    # приходит от `base add --recipes <config>`, а не читается отдельным полем формы. Команда
+    # по-прежнему копирует шаблон в recipes.yaml (design §4b, строка 130) — этой строкой она
+    # ДОПОЛНИТЕЛЬНО называет конфигурацию, чтобы библиотеку и живой шаблон пакета база видела
+    # сама, нижними слоями `recipes.model.load_layered`, без повторного копирования при их правке.
+    config = values.get("config")
+    config_line = (
+        f"    config: {config}                # библиотека рецептов: recipes/{config}/ и "
+        "шаблон пакета"
+        if config
+        else "    # config: ut                   # конфигурация для библиотеки рецептов "
+        "(recipes/<config>/): ut | bp | zup | своя"
+    )
     return ШАБЛОН_ЗАПИСИ.format(
         name=name,
         label=_скаляр(values.get("label", name)),
@@ -124,6 +137,7 @@ def render_base(name: str, values: dict) -> str:
         password=_скаляр(values.get("password", "")),
         role=values.get("role", "prod"),
         write_line=write_line,
+        config_line=config_line,
     )
 
 
