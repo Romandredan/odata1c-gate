@@ -4,11 +4,14 @@ import json
 
 import pytest
 
+from odata1c.gate import contact_info
+from odata1c.gate.contact_info import EntityShape
 from odata1c.gate.dictionary import Dictionary
 from odata1c.gate.masking import (
     ПРЕДУПРЕЖДЕНИЕ_ВНЕ_ИНДЕКСА,
     ПРЕДУПРЕЖДЕНИЕ_СКРЫТОЙ_СВЯЗИ,
     Masker,
+    inbound_path_class,
 )
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
@@ -1473,3 +1476,32 @@ def test_m5_первый_проход_не_снимает_замену_ранн�
     )
 
     assert набор.replacements == 1
+
+
+# --- M3b §3.7: класс входного пути — прямым юнитом ---------------------------------------------
+
+
+def _политика_без_ручных_правил(tmp_path):
+    """Политика без раздела `fields`: ручных правил владельца нет, и класс пути определяет только
+    строение сущности, в которую путь приходит."""
+    путь = tmp_path / "policy-путь.yaml"
+    путь.write_text("version: 2\n", encoding="utf-8")
+    return load_policy(путь)
+
+
+def test_класс_пути_через_табличную_часть_контактной_информации(tmp_path):
+    """Ruling 37 прямым тестом, а не через `Unmasker.filter`: рефакторинг обходчика `$orderby`
+    не должен превратить отказ в разрешение молча."""
+    строение = {
+        "Catalog_Контрагенты": EntityShape(fields=frozenset({"Description"}), navigations={}),
+        "Catalog_Контрагенты_КонтактнаяИнформация": EntityShape(
+            fields=frozenset({"Тип", "Представление", "Значение"})
+        ),
+    }
+    класс = inbound_path_class(
+        _политика_без_ручных_правил(tmp_path),
+        "Catalog_Контрагенты",
+        "КонтактнаяИнформация/Представление",
+        shape=строение.get,
+    )
+    assert класс == contact_info.КЛАСС_НА_ВХОДЕ
