@@ -193,13 +193,17 @@ def _версия(номер: int) -> str:
     return base64.b64encode(номер.to_bytes(8, "big")).decode()
 
 
-_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
 def _путь(request: httpx.Request) -> str:
     """Путь запроса после `standard.odata/`, раскодированный: так его строит шлюз."""
     сырой = urllib.parse.unquote(request.url.raw_path.decode("ascii"))
     return сырой.split("standard.odata/", 1)[1].split("?", 1)[0]
+
+
+# Форма GUID вообще (не только v4, как у `_GUID` ниже — тот проверяет форму `pending_id`/
+# `commit_id`, а значения полей ключа записи регистра бывают любым GUID, что 1С отдала).
+_ЛЮБОЙ_GUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def _литерал_поля_регистра(значение) -> str:
@@ -207,7 +211,7 @@ def _литерал_поля_регистра(значение) -> str:
     несут тесты этого файла (GUID, `datetime'…'`, строка, число): тем же видом, что строит
     `odata1c.tools.odata_query.odata_literal`, но без обращения к индексу за типом поля —
     фиктивной 1С тип поля неоткуда взять, только форма значения."""
-    if isinstance(значение, str) and _GUID.fullmatch(значение):
+    if isinstance(значение, str) and _ЛЮБОЙ_GUID.fullmatch(значение):
         return f"guid'{значение}'"
     if isinstance(значение, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", значение):
         return f"datetime'{значение}'"

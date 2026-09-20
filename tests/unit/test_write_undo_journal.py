@@ -441,6 +441,34 @@ async def test_откат_create_записи_регистра_с_флагом_d
     await среда.tools.aclose()
 
 
+async def test_откат_delete_record_создаёт_запись_из_before(среда, одинс):
+    """Обратное направление: откат `delete_record` — обычный `create` из полей `before_json`
+    журнала (записи сейчас нет — «до» несёт то, что было удалено), нужен только `write: true`
+    (не `independent_register_delete`: воссоздание — не физическое удаление)."""
+    одинс.регистр_ключи[КУРСЫ] = ["Period", "Валюта_Key"]
+    записать_в_журнал(
+        среда.путь_журнала,
+        commit_id="c-удаление",
+        entity=КУРСЫ,
+        op="delete_record",
+        key=КЛЮЧ_КУРСА,
+        request={"method": "DELETE", "path": ПУТЬ_КУРСА, "json": None},
+        before={**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1},
+        after=None,
+    )
+
+    подготовка = await подготовить_откат(среда, "c-удаление")
+    к.нет_реальных_значений(json.dumps(подготовка, ensure_ascii=False))
+    assert подготовка["undo_op"] == "create"
+
+    откат = await выполнено(среда, подготовка["pending_id"])
+
+    assert откат["op"] == "create"
+    assert одинс.post.call_count == 1
+    assert json.loads(одинс.тела_записи[-1]) == {**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1}
+    assert одинс.объекты[ПУТЬ_КУРСА]["Курс"] == 90.5
+
+
 async def test_откат_прочего_действия_undo_unsupported(среда, одинс):
     записать_в_журнал(
         среда.путь_журнала,

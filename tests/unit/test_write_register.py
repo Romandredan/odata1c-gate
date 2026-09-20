@@ -202,6 +202,20 @@ async def test_delete_record_на_объекте_params_invalid(среда, од
 
     assert отказ["code"] == "params_invalid"
     assert "odata1c_mark_for_deletion" in отказ["hint"]
+
+
+async def test_delete_record_без_флага_permission_denied(среда, одинс):
+    """`WriteService.delete_record` напрямую (не через `_форма_отката`): база `ut` без
+    `independent_register_delete` — `permission_denied` до GET, ни одного обращения к 1С."""
+    отказ = к.ошибка(
+        await среда.запись.delete_record(
+            SessionScope(), "s1", base="ut", entity=КУРСЫ, key=КЛЮЧ_КУРСА
+        )
+    )
+
+    assert отказ["code"] == "permission_denied"
+    assert "independent_register_delete" in отказ["hint"]
+    assert одинс.get.call_count == 0 and одинс.записей == 0
     assert одинс.get.call_count == 0 and одинс.записей == 0
 
 
