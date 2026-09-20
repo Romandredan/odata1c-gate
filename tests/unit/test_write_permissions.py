@@ -1,17 +1,20 @@
 """Разрешения записи: строгий порядок проверок SPEC §7.1 (инвариант 4 — до pending-операции).
 
 Порядок (первый отказ побеждает): 1) сущность скрыта гейтом → `entity_hidden`; 2) база только для
-чтения → `base_read_only`; 3) регистр (любой, Ruling 60) и флаги операций
-(`post_documents`/`mark_deletion`) → `permission_denied`; 4) виртуальная таблица — отказ всегда →
-`permission_denied`; 5) `deny_entities`/`allow_entities` → `permission_denied`; 6) поле из
-`deny_fields` → `field_write_denied`.
+чтения → `base_read_only`; 3) регистр, подчинённый регистратору (Ruling 57), и флаги операций
+(`post_documents`/`mark_deletion`/`independent_register_delete`) → `permission_denied`; 4)
+виртуальная таблица — отказ всегда → `permission_denied`; 5) `deny_entities`/`allow_entities` →
+`permission_denied`; 6) поле из `deny_fields` → `field_write_denied`.
 
 Ruling 57 (2026-09-13, находка раунда 3 задачи 6) сузил Ruling 39: регистр шаг 3 узнаёт по виду
 сущности (`kind`), а не по `is_records` — основной набор `AccumulationRegister_X` (ключ
-`Recorder`) проходил мимо флага. Запись в зависимый регистр в первой поставке отклоняется при
-любом `register_direct_write`; независимый регистр сведений тогда ещё писался по одному
-`write: true`. Ruling 60 (И-3 итогового ревью M2) закрыл и его: запись регистров не проверена на
-живой 1С, а POST по существующему ключу регистра сведений может заместить запись без «до» в журнале.
+`Recorder`) проходил мимо флага. Запись в зависимый регистр (или основной набор/`…_RecordType`
+любого регистра) отклоняется при любом `register_direct_write` — движения формирует проведение
+документа. Ruling 60 (И-3 итогового ревью M2) закрыл до отдельной поставки и независимый регистр
+сведений; M3b (задача 7, проба P9, `docs/probes/P9-write-forms.md`) открывает его: `create`/`update`
+идут по одному `write: true`, `delete_record` (физическое удаление, единственное такое во всём
+шлюзе) — ещё и по `independent_register_delete`, `mark_for_deletion` записи регистра — не запрет
+разрешений, а неверный запрос (`params_invalid`, нет пометки удаления вовсе).
 """
 
 from __future__ import annotations
@@ -113,13 +116,6 @@ def test_на_роли_dev_по_умолчанию_разрешено():
 
 
 РЕГИСТРЫ = [
-    # Ruling 60: независимый регистр сведений — тоже отказ (прежде писался по `write: true`).
-    pytest.param(
-        сущность(
-            "InformationRegister_КурсыВалют", "InformationRegister", is_independent_register=True
-        ),
-        id="сведений-независимый",
-    ),
     # Основной набор (ключ `Recorder`): у него `is_records=False` — прежний шаг 3 его не видел.
     pytest.param(
         сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister"),
@@ -157,23 +153,79 @@ def test_на_роли_dev_по_умолчанию_разрешено():
 
 
 @pytest.mark.parametrize("флаг", [False, True], ids=["без-флага", "с-флагом"])
-@pytest.mark.parametrize("op", ["create", "update", "mark_for_deletion"])
+@pytest.mark.parametrize("op", ["create", "update", "mark_for_deletion", "delete_record"])
 @pytest.mark.parametrize("e", РЕГИСТРЫ)
-def test_Ruling_57_60_регистр_отклоняется_при_любом_флаге(e, op, флаг):
+def test_Ruling_57_регистр_с_регистратором_отклоняется_при_любом_флаге(e, op, флаг):
     """Ruling 57: регистр узнаётся по виду сущности; запись в регистр, подчинённый регистратору,
-    в первой поставке не поддерживается ни при каком `register_direct_write` — движения
-    формирует проведение документа. POST набора с `Recorder` мог бы переписать движения документа,
-    а проба P8 этого не проверяла. Ruling 60: то же для независимого регистра сведений — POST по
-    существующему ключу мог бы заместить запись, а «до» у `create` нет."""
+    не поддерживается ни при каком `register_direct_write` — движения формирует проведение
+    документа. POST набора с `Recorder` мог бы переписать движения документа, а проба P8 этого не
+    проверяла. M3b (задача 7) не меняет это правило: открыт только независимый регистр сведений
+    (`test_независимому_регистру_хватает_write_true` и соседние ниже)."""
     b = база(
-        permissions=Permissions(register_direct_write=флаг, mark_deletion=True, post_documents=True)
+        permissions=Permissions(
+            register_direct_write=флаг,
+            mark_deletion=True,
+            post_documents=True,
+            independent_register_delete=флаг,
+        )
     )
     with pytest.raises(WriteError) as инфо:
         проверить(b, e, op)
     assert инфо.value.code == "permission_denied"
     assert e.name in инфо.value.message
-    assert "первой поставке не поддерживается" in инфо.value.hint
+    assert "не поддерживается" in инфо.value.hint
     assert "odata1c_action" in инфо.value.hint and "Post" in инфо.value.hint
+
+
+# --- M3b задача 7: независимый регистр сведений открыт (Ruling 60 закрыт этой поставкой) -------
+
+
+def _независимый_регистр(name: str = "InformationRegister_КурсыВалют") -> EntityDescription:
+    return сущность(name, "InformationRegister", is_independent_register=True)
+
+
+@pytest.mark.parametrize("операция", ["create", "update"])
+def test_независимому_регистру_хватает_write_true(операция):
+    """Ruling 60 закрывал запись ЛЮБОГО регистра «до отдельной поставки». M3b открывает ровно
+    независимый регистр сведений: ему хватает `write: true`, как и говорил SPEC §7.1 до Ruling 60
+    — без `register_direct_write` и без `independent_register_delete`."""
+    b = база(
+        permissions=Permissions(register_direct_write=False, independent_register_delete=False)
+    )
+    проверить(b, _независимый_регистр(), операция)
+
+
+def test_delete_record_требует_флага_independent_register_delete():
+    b = база(permissions=Permissions(independent_register_delete=False))
+    with pytest.raises(WriteError) as отказ:
+        проверить(b, _независимый_регистр(), "delete_record")
+    assert отказ.value.code == "permission_denied"
+    assert "independent_register_delete" in отказ.value.hint
+
+
+def test_delete_record_с_флагом_разрешён():
+    b = база(permissions=Permissions(independent_register_delete=True))
+    проверить(b, _независимый_регистр(), "delete_record")
+
+
+def test_mark_for_deletion_независимого_регистра_params_invalid_не_permission_denied():
+    """У записи регистра нет `DeletionMark` вовсе: это не запрет по разрешениям, а неверный
+    запрос — код обязан отличаться от `permission_denied` и подсказывать `odata1c_delete_record`."""
+    with pytest.raises(WriteError) as отказ:
+        проверить(база(), _независимый_регистр(), "mark_for_deletion")
+    assert отказ.value.code == "params_invalid"
+    assert "odata1c_delete_record" in отказ.value.hint
+
+
+def test_delete_record_на_зависимом_регистре_permission_denied():
+    """Регистр с регистратором закрыт для `delete_record` так же, как для остальных операций
+    (Ruling 57 не меняется этой поставкой) — даже когда `independent_register_delete` включён."""
+    b = база(permissions=Permissions(register_direct_write=True, independent_register_delete=True))
+    e = сущность("AccumulationRegister_ТоварыНаСкладах", "AccumulationRegister", is_records=True)
+    with pytest.raises(WriteError) as отказ:
+        проверить(b, e, "delete_record")
+    assert отказ.value.code == "permission_denied"
+    assert "не поддерживается" in отказ.value.hint
 
 
 # --- каждый код отказа -----------------------------------------------------------------------
