@@ -1,18 +1,20 @@
 # odata1c: все базы 1С этой машины. Файл закрыт правами текущего пользователя ОС.
-# Пароли хранятся здесь открытым текстом (см. SPEC §3.4) либо `password: keyring`.
+# Пароли хранятся здесь открытым текстом либо `password: keyring`.
 
 # default: ut                          # база по умолчанию, если тул вызван без `base`
 
 bases:
   # ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
   #   label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
-  #   url: https://1c.corp.local/ut/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
-  #   user: odata_claude               # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
-  #   password: "…"                    # пароль ИБ; `keyring` = взять из хранилища ОС — нужна установка
-  #                                     # с extra keyring (uv tool install "odata1c-gate[keyring]"),
-  #                                     # секрет кладётся командой пакета keyring:
-  #                                     # keyring set odata1c/base <имя базы>
-  #   role: prod                       # prod | test | dev — профиль умолчаний, см. §3.2
+  #   url: https://server/base/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
+  #   user: odata_user                 # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
+  #   password: qwerty123              # пароль ИБ, без кавычек; нужны кавычки, только если в пароле есть #,
+  #                                     # двоеточие с пробелом, он начинается со спецсимвола или похож на
+  #                                     # число — odata1c base add расставит их сама; `keyring` = взять из
+  #                                     # хранилища ОС — нужна установка с extra keyring
+  #                                     # (uv tool install "odata1c-gate[keyring]"), секрет кладётся командой
+  #                                     # пакета keyring: keyring set odata1c/base <имя базы>
+  #   role: prod                       # prod | test | dev — профиль умолчаний
   #   config: ut                       # конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя
 
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
@@ -29,7 +31,7 @@ bases:
     #   mark_deletion: true          # PATCH DeletionMark у объектов
     #   independent_register_delete: false   # DELETE записи независимого регистра сведений
     #                                         # (odata1c_delete_record); прочих регистров не касается
-    #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта (Ruling 57)
+    #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
@@ -37,10 +39,10 @@ bases:
 
     # --- гейт: скрывать ли (умолчание роли prod: identifiers+names) ---
     # gate:
-    #   mode: identifiers+names      # off | identifiers | identifiers+names, см. SPEC §6.2
+    #   mode: identifiers+names      # off | identifiers | identifiers+names
     #                                # что именно скрывать и что открыть: bases/ut/policy.yaml
 
-    # --- рецепты (SPEC §8, ADR-0011, поправка 2026-09-14) ---
+    # --- рецепты ---
     # config задаёт библиотеку конфигурации (recipes/<config>/, см. выше) и шаблон пакета — оба
     # подставляются сами, без копирования файла; recipes ниже — СОБСТВЕННЫЙ файл базы, верхний
     # слой поверх них (odata1c base add --recipes создаёт его копией шаблона, как и прежде — сам
@@ -49,14 +51,14 @@ bases:
 
   # buh:
   #   label: БП 3.0, боевая
-  #   url: https://1c.corp.local/buh/odata/standard.odata/
-  #   user: odata_claude
-  #   password: "…"
+  #   url: https://server/base/odata/standard.odata/
+  #   user: odata_user
+  #   password: qwerty123
   #   role: prod
 
   # ut_test:
   #   label: копия УТ для отладки
-  #   url: http://localhost/ut_test/odata/standard.odata/
-  #   user: Администратор
-  #   password: ""
+  #   url: https://server/base/odata/standard.odata/
+  #   user: odata_user
+  #   password: qwerty123
   #   role: dev                      # гейт выключен, запись разрешена

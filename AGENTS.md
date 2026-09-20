@@ -154,8 +154,8 @@ Ruling 57). Открытый литерал в поле класса `contact`/`
   `Consequences`. ADR-0001 отменён ADR-0013 — всегда проверяйте статус в frontmatter.
 - `README.md` — описание проекта для внешнего читателя: зачем шлюз, что видит модель и чего не
   видит, установка плагином, первые пять минут, ограничения, карта документов и дерева каталогов.
-- `docs/install.md` — установка на Windows и Linux, обновление, `doctor`, типовые сбои и раздел
-  для сопровождающего (выпуск версии, trusted publishing на PyPI, прогон evals).
+- `docs/install.md` — установка на Windows и Linux, обновление, `doctor`, типовые сбои; раздел для
+  сопровождающего (выпуск версии, trusted publishing на PyPI, прогон evals) — в `CONTRIBUTING.md`.
 - `CHANGELOG.md` — что вошло в выпуск; формат Keep a Changelog, нумерация семантическая.
 - `src/odata1c/` — пакет дистрибутива `odata1c-gate` (SPEC §11.1). Подпакеты названы по таблице
   модулей SPEC §2.2: `config`, `registry`, `client1c`, `index`, `gate`, `write`, `recipes`,
