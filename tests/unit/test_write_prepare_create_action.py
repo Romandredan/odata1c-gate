@@ -1707,7 +1707,9 @@ async def test_Н6_3_полный_metadata_строки_табличных_ча�
 
     assert "pending_id" in ответ, ответ
     операция = await стор.take(ответ["pending_id"], "sess-1")
-    assert операция.request["json"][часть] == [строка]
+    # Ruling 104 (проба P9-7): строку без `LineNumber` шлюз нумерует сам — без номера 1С отвечает
+    # HTTP 500 уже после подтверждения.
+    assert операция.request["json"][часть] == [{"LineNumber": 1, **строка}]
     assert not одинс.обращались
 
 

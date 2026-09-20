@@ -127,7 +127,10 @@ def _строки_для_сравнения(строки: list[dict] | None) -> 
     строки_к_сравнению = [
         {поле: строка.get(поле) for поле in ПОЛЯ_ЧАСТИ} for строка in (строки or [])
     ]
-    return sorted(строки_к_сравнению, key=lambda строка: строка.get("LineNumber") or 0)
+    for строка in строки_к_сравнению:
+        # 1С отдаёт `LineNumber` строкой, шлюзу он отправляется целым — сравниваем как текст.
+        строка["LineNumber"] = str(строка.get("LineNumber"))
+    return sorted(строки_к_сравнению, key=lambda строка: строка["LineNumber"])
 
 
 def _добавить_базу_без_удаления_регистра(дом: pathlib.Path, рабочий: pathlib.Path) -> None:
