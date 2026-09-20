@@ -193,10 +193,34 @@ def _версия(номер: int) -> str:
     return base64.b64encode(номер.to_bytes(8, "big")).decode()
 
 
+_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 def _путь(request: httpx.Request) -> str:
     """Путь запроса после `standard.odata/`, раскодированный: так его строит шлюз."""
     сырой = urllib.parse.unquote(request.url.raw_path.decode("ascii"))
     return сырой.split("standard.odata/", 1)[1].split("?", 1)[0]
+
+
+def _литерал_поля_регистра(значение) -> str:
+    """Литерал OData значения поля ключа записи регистра — упрощённо, только формы, которые
+    несут тесты этого файла (GUID, `datetime'…'`, строка, число): тем же видом, что строит
+    `odata1c.tools.odata_query.odata_literal`, но без обращения к индексу за типом поля —
+    фиктивной 1С тип поля неоткуда взять, только форма значения."""
+    if isinstance(значение, str) and _GUID.fullmatch(значение):
+        return f"guid'{значение}'"
+    if isinstance(значение, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", значение):
+        return f"datetime'{значение}'"
+    if isinstance(значение, str):
+        return f"'{значение}'"
+    return str(значение)
+
+
+def _адрес_записи_регистра(путь: str, поля_ключа: list[str], тело: dict) -> str:
+    """Путь новой записи независимого регистра сведений — тем же построением, что `build_get`:
+    `Набор(Поле1=литерал1,Поле2=литерал2)` по полям ключа, взятым из отправленного тела (P9-1)."""
+    части = ",".join(f"{поле}={_литерал_поля_регистра(тело[поле])}" for поле in поля_ключа)
+    return f"{путь}({части})"
 
 
 class Одинс:
@@ -206,7 +230,11 @@ class Одинс:
     - PATCH сливает тело с объектом и растит `DataVersion` (P8: растёт на любой записи) и отдаёт
       объект целиком;
     - POST на набор — создание (201, объект целиком с новым `Ref_Key`, P8), POST на `…/Post` и
-      `…/Unpost` — действие (200, пустое тело, P8);
+      `…/Unpost` — действие (200, пустое тело, P8); POST на набор БЕЗ `Ref_Key` в ответе (запись
+      независимого регистра сведений, M3b задача 7) — 201, объект как прислан, путь строится по
+      полям ключа тела (тем же приёмом, что `build_get`, только с сериализованными значениями);
+    - DELETE — физическое удаление по пути (M3b задача 7, `odata1c_delete_record`): 204, если
+      объект был, иначе 404 «Экземпляр не найден» (P9-4);
     - `отказ` — ответ 1С на запись вместо выполнения; `перед_записью` — вызов в момент
       пишущего запроса (журнал «до» и падающий посреди запроса клиент)."""
 
@@ -218,12 +246,17 @@ class Одинс:
         self.тела_записи: list[bytes] = []
         self.заголовки_записи: list[httpx.Headers] = []
         self._счётчик = 100
+        # Поля ключа независимого регистра сведений (M3b задача 7): `путь набора → [поля]`.
+        # `create` регистра не несёт `Ref_Key` — путь новой записи строится по полям ключа ТЕЛА,
+        # тем же приёмом, что `build_get` строит путь для последующего GET/PATCH/DELETE. Без
+        # регистрации здесь путь считался бы обычным объектом и получил бы случайный `guid`.
+        self.регистр_ключи: dict[str, list[str]] = {}
         self.get = router.get(url__regex=r".*standard\.odata/[^?]+").mock(side_effect=self._get)
         self.patch = router.patch(url__regex=r".*").mock(side_effect=self._patch)
         self.post = router.post(url__regex=r".*").mock(side_effect=self._post)
+        self.delete = router.delete(url__regex=r".*").mock(side_effect=self._delete)
         отказ = httpx.Response(500, json={})
         self.put = router.put(url__regex=r".*").mock(return_value=отказ)
-        self.delete = router.delete(url__regex=r".*").mock(return_value=отказ)
 
     # -- состояние ------------------------------------------------------------------------
 
@@ -285,20 +318,45 @@ class Одинс:
                 self.объекты[объект]["Posted"] = проведён
                 self._растить(объект)
                 return httpx.Response(200, content=b"")
+        тело_запроса = json.loads(request.content)
+        поля_ключа = self.регистр_ключи.get(путь)
+        if поля_ключа is not None:
+            # Запись независимого регистра сведений: ключ — поля тела, не `Ref_Key` (P9-1).
+            адрес = _адрес_записи_регистра(путь, поля_ключа, тело_запроса)
+            self.объекты[адрес] = dict(тело_запроса)
+            return httpx.Response(201, json=тело_запроса)
         ссылка = str(uuid.uuid4())
         тело = {
             "Ref_Key": ссылка,
             "DataVersion": _версия(1),
             "DeletionMark": False,
             "Code": "000000042",
-            **json.loads(request.content),
+            **тело_запроса,
         }
         self.объекты[f"{путь}(guid'{ссылка}')"] = тело
         return httpx.Response(201, json=тело)
 
+    def _delete(self, request: httpx.Request) -> httpx.Response:
+        отказ = self._запись(request)
+        if отказ is not None:
+            return отказ
+        путь = _путь(request)
+        if путь not in self.объекты:
+            return httpx.Response(
+                404,
+                json={"odata.error": {"code": "9", "message": {"value": "Экземпляр не найден"}}},
+            )
+        del self.объекты[путь]
+        return httpx.Response(204, content=b"")
+
     @property
     def записей(self) -> int:
-        return self.patch.call_count + self.post.call_count + self.put.call_count
+        return (
+            self.patch.call_count
+            + self.post.call_count
+            + self.put.call_count
+            + self.delete.call_count
+        )
 
 
 @pytest.fixture
@@ -1746,37 +1804,63 @@ async def test_Н2_1_сбой_до_сборки_страховки_не_выда
     assert await выполнить(среда, подготовка["pending_id"]) == текст
 
 
-@pytest.mark.parametrize(
-    ("операция", "data"),
-    [
-        pytest.param("create", {"ИНН": ИНН, "Комментарий": "odata1c-приёмка"}, id="create"),
-        pytest.param("update", {"Комментарий": "стал"}, id="update"),
-    ],
-)
-async def test_Ruling_60_запись_регистра_не_готовится_commit_не_до_чего(
-    среда_синт, одинс, операция, data
-):
-    """Ruling 60: запись регистра сведений в первой поставке не готовится — ни `create` с ключом
-    открытым литералом, ни `update` по ключу-токену. Прежние тесты этого места (Н2-2, Н2-3,
-    страховочный ответ отмены с ключом регистра) сторожили механику `commit` записи регистра:
-    ключ из ответа POST маской без записи в словарь, словарь учится из GET «после», ключ-токен
-    без ложного `guard_replaced`. Код этой механики остаётся для поставки, которая запись
-    регистров откроет; её юнит-часть — `_ключ_созданного` и `_отпечаток` выше."""
+async def test_create_записи_регистра_готовится_с_ключом_открытым_литералом(среда_синт, одинс):
+    """M3b задача 7 (Ruling 60 закрыт этой поставкой): `create` записи регистра сведений с ключом
+    открытым литералом (модель прислала ИНН сама — Ruling 47, литерал `create` не отклоняет) —
+    готовится, `record_exists` проверяет GET-ом до 1С (Ruling 105); механика `commit` (ключ из
+    ответа POST маской без записи в словарь, словарь учится из GET «после») — юнит-часть
+    `_ключ_созданного` и `_отпечаток` выше, сквозной сценарий — тесты ниже и
+    `tests/integration/test_write_end_to_end.py`."""
     среда = среда_синт
-    if операция == "create":
-        ответ = await среда.запись.create(
-            SessionScope(), "s1", base="ut", entity=РЕГИСТР_ИНН, data=data
+    одинс.get.mock(
+        return_value=httpx.Response(
+            404, json={"odata.error": {"code": "9", "message": {"value": "нет"}}}
         )
-    else:
-        ключ = {"ИНН": токен(среда.tools, ИНН, entity=РЕГИСТР_ИНН)}
-        ответ = await среда.запись.update(
-            SessionScope(), "s1", base="ut", entity=РЕГИСТР_ИНН, key=ключ, data=data
+    )
+
+    ответ = json.loads(
+        await среда.запись.create(
+            SessionScope(),
+            "s1",
+            base="ut",
+            entity=РЕГИСТР_ИНН,
+            data={"ИНН": ИНН, "Комментарий": "odata1c-приёмка"},
         )
+    )
 
-    отказ = ошибка(ответ)
+    assert "pending_id" in ответ
+    операция = await среда.стор.take(ответ["pending_id"], "s1")
+    assert операция.request == {
+        "method": "POST",
+        "path": РЕГИСТР_ИНН,
+        "json": {"ИНН": ИНН, "Комментарий": "odata1c-приёмка"},
+    }
+    assert одинс.get.call_count == 1 and одинс.записей == 0
 
-    assert отказ["code"] == "permission_denied" and РЕГИСТР_ИНН in отказ["message"]
-    assert одинс.записей == 0 and одинс.get.call_count == 0
+
+async def test_update_записи_регистра_готовится_по_ключу_токеном(среда_синт, одинс):
+    """M3b задача 7 (Ruling 60 закрыт этой поставкой): `update` записи регистра сведений по
+    ключу-токену — читает текущее состояние и готовит PATCH, тем же приёмом, что у
+    справочника/документа."""
+    среда = среда_синт
+    ток = токен(среда.tools, ИНН, entity=РЕГИСТР_ИНН)
+    одинс.положить(f"{РЕГИСТР_ИНН}(ИНН='{ИНН}')", {"ИНН": ИНН, "Комментарий": "было"})
+
+    ответ = json.loads(
+        await среда.запись.update(
+            SessionScope(),
+            "s1",
+            base="ut",
+            entity=РЕГИСТР_ИНН,
+            key={"ИНН": ток},
+            data={"Комментарий": "стал"},
+        )
+    )
+
+    assert "pending_id" in ответ
+    операция = await среда.стор.take(ответ["pending_id"], "s1")
+    assert операция.request["json"] == {"Комментарий": "стал"}
+    assert одинс.get.call_count == 1 and одинс.записей == 0
 
 
 async def test_Н2_4_отказ_deny_и_trust_не_закрепляет_механизм(среда, одинс):

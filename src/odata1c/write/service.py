@@ -408,6 +408,107 @@ class WriteService:
             проверить_тело=проверить_тело,
         )
 
+    async def delete_record(
+        self,
+        scope: SessionScope,
+        session_id: str,
+        *,
+        base: str | None,
+        entity: str,
+        key,
+    ) -> str:
+        """Физическое удаление записи независимого регистра сведений (SPEC §7.1, §7.3, проект
+        M3b §5.4) → `pending_id`. В 1С не пишет — только GET текущей записи; выполнение —
+        `odata1c_commit` после подтверждения пользователя.
+
+        Единственный тул шлюза, который физически удаляет что-либо: у объектов удаления нет вовсе
+        (только пометка, `odata1c_mark_for_deletion`), а запись зависимого регистра снимается
+        проведением или распроведением документа-регистратора (Ruling 57 этой поставкой не
+        меняется). Сущность не независимый регистр сведений — `params_invalid` (для объекта
+        отказ называет `odata1c_mark_for_deletion`); флаг `independent_register_delete` выключен
+        — `permission_denied` раньше этого места (шаг 3 `check_write`)."""
+        tools = self._tools
+
+        async def тело(base_config, гейт, репозиторий, раскрытое):
+            описание = tools._resolve_entity(репозиторий, гейт, entity)
+            скрытые = tools._скрытые(репозиторий, гейт)
+            check_write(base_config, описание, "delete_record", hidden=скрытые.__contains__)
+            if not описание.is_independent_register:
+                raise _отказ(
+                    f"«{описание.name}» — не запись независимого регистра сведений: "
+                    "физическое удаление доступно только для них",
+                    hint="объект удаляется пометкой — odata1c_mark_for_deletion",
+                )
+            строение = tools._строение(репозиторий)
+            реальный_ключ = гейт.inbound_key(
+                key, entity=описание.name, revealed=раскрытое, shape=строение
+            )
+            представление = _поля_представления(описание)
+            spec = build_get(
+                описание,
+                реальный_ключ,
+                describe=репозиторий.describe,
+                limits=tools._config.daemon.limits,
+                select=_все_поля_записи(описание),
+            )
+            клиент = tools._client_for(base_config)
+            try:
+                сырой = await клиент.get(spec.path, spec.params, scrub=гейт.scrubber(раскрытое))
+            except OdataError as ошибка:
+                tools._уточнить_404(ошибка)
+                raise
+            [текущее] = items_of(сырой)[0]
+
+            маска = гейт.mask(
+                strip_service(текущее),
+                entity=описание.name,
+                resolve=tools._навигации(репозиторий),
+                shape=строение,
+                hidden=скрытые.__contains__,
+                revealed=раскрытое,
+            )
+            объект = {поле: маска.data.get(поле) for поле in представление if поле in текущее}
+
+            операция = PendingOp(
+                pending_id=_новый_номер(),
+                commit_id=_новый_номер(),
+                session_id=session_id,
+                base=base_config.name,
+                role=base_config.role,
+                op="delete_record",
+                entity=описание.name,
+                key=_ключ_операции(реальный_ключ),
+                request={"method": "DELETE", "path": spec.path, "json": None},
+                preview={
+                    "entity": описание.name,
+                    "op": "delete_record",
+                    "key": key,
+                    "object": объект,
+                    "before": маска.data,
+                    "after": "записи не будет",
+                },
+                data_version=_отпечаток(описание, текущее, раскрытое),
+                created_at=self._clock(),
+                expires_at=self._store.deadline(),
+                revealed=раскрытое.carry(),
+            )
+            await self._store.put(операция)
+            return {
+                "pending_id": операция.pending_id,
+                "base": base_config.name,
+                "role": base_config.role,
+                "entity": описание.name,
+                "op": "delete_record",
+                "key": key,
+                "object": объект,
+                "preview": {"before": маска.data, "after": "записи не будет"},
+                "expires_in_s": round(self._store.remaining(операция.expires_at)),
+                "next": СЛЕДУЮЩИЙ_ШАГ,
+                "warnings": list(dict.fromkeys(маска.warnings)),
+            }
+
+        return await tools._run(scope, base, тело)
+
     async def _подготовить(
         self,
         scope: SessionScope,
@@ -712,6 +813,46 @@ class WriteService:
                 for строка, реальная in zip(данные[имя], реальное[имя], strict=True):
                     _проверить_раскрытые_даты(описание_строки, строка, реальная)
 
+            # M3b задача 7 (проект §5.4, проба P9-2): создание записи независимого регистра
+            # сведений — единственный `create`, у которого есть смысл спросить 1С «а такая запись
+            # уже есть?» до POST. P9-2 показала, что повторный POST тем же ключом 1С отклоняет
+            # сама (HTTP 400, ни замещения, ни дубля), но отказ 1С понятнее и происходит раньше —
+            # до траты диалога подтверждения на операцию, которая всё равно не выполнится
+            # (Ruling 105). Окно между этим GET и `commit` признаётся: другая сессия может
+            # создать запись между ними, и тогда исход решает 1С на `commit`.
+            предупреждения: list[str] = []
+            if описание.is_independent_register:
+                ключ_из_тела = {
+                    поле: реальное[поле] for поле in описание.key_fields if поле in реальное
+                }
+                spec_ключа = build_get(
+                    описание,
+                    ключ_из_тела,
+                    describe=репозиторий.describe,
+                    limits=tools._config.daemon.limits,
+                    select=list(описание.key_fields),
+                )
+                клиент = tools._client_for(base_config)
+                try:
+                    await клиент.get(
+                        spec_ключа.path, spec_ключа.params, scrub=гейт.scrubber(раскрытое)
+                    )
+                except OdataError as ошибка:
+                    if ошибка.code != "object_not_found":
+                        tools._уточнить_404(ошибка)
+                        raise
+                else:
+                    raise WriteError(
+                        "record_exists",
+                        f"запись регистра «{описание.name}» с таким ключом уже есть",
+                        hint="измените её odata1c_update с этим ключом",
+                    )
+                if not base_config.permissions.independent_register_delete:
+                    предупреждения.append(
+                        "откат создания записи регистра недоступен без разрешения "
+                        "independent_register_delete"
+                    )
+
             # Ruling 44: объект называется представлением из данных модели — у нового объекта
             # других данных нет, а маска значения модели запрещена (Ruling 45). Литерал модели —
             # пометкой и здесь (Ruling 62, 63).
@@ -755,7 +896,7 @@ class WriteService:
                 "preview": превью,
                 "expires_in_s": round(self._store.remaining(операция.expires_at)),
                 "next": СЛЕДУЮЩИЙ_ШАГ,
-                "warnings": [],
+                "warnings": предупреждения,
             }
 
         return await tools._run(scope, base, тело)
@@ -1188,7 +1329,7 @@ class WriteService:
                     "покажет его текущее состояние",
                 )
         метод = операция.request.get("method")
-        if метод not in ("PATCH", "POST"):
+        if метод not in ("PATCH", "POST", "DELETE"):
             raise WriteError("internal", "неизвестный метод записи в операции", _СООБЩИТЕ)
         поиск = _как_найти(операция, _поля_представления(описание))
 
@@ -1218,6 +1359,12 @@ class WriteService:
                     ответ = await клиент.patch(
                         операция.request["path"], операция.request["json"], scrub=запись_прохода
                     )
+                elif метод == "DELETE":
+                    # delete_record (проект M3b §5.4) и откат create записи регистра: у ответа
+                    # нет тела (Client1C.delete → None, P9-4 — 204), ниже это учитывает
+                    # `_после_записи`, не перечитывая «после» для delete_record.
+                    await клиент.delete(операция.request["path"], scrub=запись_прохода)
+                    ответ = {}
                 else:
                     # `json` действия — `None`: `Client1C.post` тогда не шлёт ни тела, ни
                     # `Content-Type`, как в пробе P8 (решение 5 контролёра).
@@ -1362,7 +1509,11 @@ class WriteService:
         )
 
         после = None
-        if ключ is None:
+        if операция.op == "delete_record":
+            # Проект M3b §5.4: запись физически удалена — перечитывать нечего, и 1С честно
+            # ответила бы 404 (P9-4); это не сбой, поэтому предупреждения здесь нет.
+            pass
+        elif ключ is None:
             предупреждения.append(
                 "1С не вернула ключ созданного объекта: запись выполнена, но перечитать объект "
                 "не по чему — найдите его чтением (odata1c_query)"
@@ -1675,6 +1826,69 @@ class WriteService:
                 revealed=раскрытое,
             )
 
+        # M3b задача 7: откат `delete_record` — воссоздание записи (`откат.op == "create"`), а не
+        # PATCH по текущему состоянию: текущего состояния НЕТ (запись физически удалена, GET дал
+        # бы 404 — P9-4), сравнивать «до» не с чем. Ветка — раньше общего пути ниже, который эту
+        # GET делает безусловно; после неё функция возвращает свой ответ и не продолжает.
+        if откат.op == "create":
+            ключ_журнала = запись.key
+            ключ_ответа = _ключ_без_гейта(ключ_журнала)
+            if ключ_ответа is None and isinstance(ключ_журнала, dict):
+                ключ_ответа = маска(ключ_журнала).data
+                _запомнить_раскрытое(ключ_ответа, ключ_журнала, раскрытое)
+            станет_маска = маска(откат.тело)
+            _запомнить_раскрытое(станет_маска.data, откат.тело, раскрытое)
+            объект = {
+                поле: станет_маска.data.get(поле) for поле in представление if поле in откат.тело
+            }
+            превью = body_preview(станет_маска.data)
+            предупреждения = list(станет_маска.warnings)
+            if not base_config.permissions.independent_register_delete:
+                предупреждения.append(
+                    "откат создания записи регистра недоступен без разрешения "
+                    "independent_register_delete"
+                )
+            операция = PendingOp(
+                pending_id=_новый_номер(),
+                commit_id=_новый_номер(),
+                session_id=session_id,
+                base=base_config.name,
+                role=base_config.role,
+                op="create",
+                entity=описание.name,
+                key=None,
+                request={"method": "POST", "path": описание.name, "json": откат.тело},
+                write_fields=поля_разрешений,
+                preview={
+                    "entity": описание.name,
+                    "op": "create",
+                    "key": ключ_ответа,
+                    "object": объект,
+                    "body": превью,
+                },
+                data_version=None,
+                created_at=self._clock(),
+                expires_at=self._store.deadline(),
+                undo_of=запись.commit_id,
+                revealed=раскрытое.carry(),
+            )
+            await self._store.put(операция)
+            return {
+                "pending_id": операция.pending_id,
+                "base": base_config.name,
+                "role": base_config.role,
+                "entity": описание.name,
+                "op": "undo",
+                "undo_of": запись.commit_id,
+                "undo_op": "create",
+                "key": ключ_ответа,
+                "object": объект,
+                "preview": превью,
+                "expires_in_s": round(self._store.remaining(операция.expires_at)),
+                "next": СЛЕДУЮЩИЙ_ШАГ,
+                "warnings": list(dict.fromkeys(предупреждения)),
+            }
+
         # Ключ из журнала — реальные значения (у записи регистра — значения измерений). Модель
         # его не присылала, поэтому ответ несёт маску, а ранний проход этого вызова и `commit`
         # обязаны знать его значения: эхо ключа в ошибке 1С (404 повторяет путь) иначе прошло
@@ -1724,6 +1938,24 @@ class WriteService:
                 "key": ключ_ответа,
                 **превью,
                 "summary": итог,
+            }
+        elif откат.op == "delete_record":
+            # M3b задача 7: откат `create` записи регистра — физическое удаление тем же путём,
+            # что прямой `delete_record` (запись ещё существует — GET выше её нашёл; отпечаток
+            # ниже сверит `commit` перед DELETE, как у прямого удаления).
+            к_маске = strip_service(текущее)
+            было = маска(к_маске)
+            объект = {поле: было.data.get(поле) for поле in представление if поле in к_маске}
+            превью = {"before": было.data, "after": "записи не будет"}
+            итог = None
+            запрос = {"method": "DELETE", "path": spec.path, "json": None}
+            превью_операции = {
+                "entity": описание.name,
+                "op": "delete_record",
+                "key": ключ_ответа,
+                "object": объект,
+                "before": было.data,
+                "after": "записи не будет",
             }
         else:
             прежнее_целиком = откат.тело
@@ -3217,6 +3449,11 @@ def _текст_подтверждения(операция: PendingOp) -> str:
         строки.append(f"Объект: {_показ(превью['object'])}")
     if "action" in превью:
         строки.append(f"Действие: {превью['action']}")
+    if превью.get("op") == "delete_record":
+        # Проект M3b §5.4: физическое удаление, «было → станет» одним полем сюда не ложится —
+        # запись целиком в токенах и фиксированный итог («после» у удалённой записи нет).
+        строки.append(f"Удаляется запись: {_показ(превью.get('before'))}")
+        строки.append("Станет: записи не будет")
     for строка in превью.get("changes", ()):
         строки.append(
             f"• {строка['field']}: {_показ(строка['before'])} → {_показ(строка['after'])}"
@@ -3362,9 +3599,12 @@ def _проверить_исход(запись: JournalEntry, последне�
 
 
 def _форма_отката(запись: JournalEntry, описание: EntityDescription) -> _Откат:
-    """Таблица SPEC §7.6. Решение 2 контролёра: у созданной записи регистра пометки удаления нет,
-    а удаление записей (`delete_record`) вне плана — такой откат не поддерживается. Обратное
-    действие выводится из пути запроса (`…/Post` ↔ `…/Unpost`), по которому запись и ушла.
+    """Таблица SPEC §7.6. Решение 2 контролёра: у созданной записи регистра пометки удаления нет
+    вовсе — откат `create` независимого регистра сведений строит физическое удаление
+    (`delete_record`, задача 7 M3b), а откат `delete_record` — обратное создание (`create`) из
+    «до» журнала; и то и другое требует своего разрешения (флаг проверяет `check_write` по
+    `откат.op`, а не эта функция). Обратное действие выводится из пути запроса (`…/Post` ↔
+    `…/Unpost`), по которому запись и ушла.
 
     Имена полей в отказах — поля исходного тела, проверенного по индексу при подготовке; поле,
     которого в индексе больше нет, не называется (Ruling 53).
@@ -3401,22 +3641,44 @@ def _форма_отката(запись: JournalEntry, описание: Entit
             тело={"DeletionMark": прежняя if isinstance(прежняя, bool) else not пометка},
         )
     if запись.op == "create":
-        if описание.is_tabular_part or not any(
-            поле["name"] == "DeletionMark" for поле in описание.fields
-        ):
-            raise _нельзя(
-                "у созданного объекта нет пометки удаления (запись регистра), а удаление "
-                "записей регистров в этой поставке не поддерживается — откатить создание нечем",
-                hint="запись регистра можно изменить (odata1c_update, если разрешено); удалить её "
-                "может пользователь в 1С",
-            )
         if not isinstance(запись.key, dict) or not запись.key:
             raise _нельзя(
                 "ключ созданного объекта в журнале не записан — откатывать не по чему",
                 hint="найдите объект выборкой odata1c_query и пометьте его на удаление "
                 "(odata1c_mark_for_deletion)",
             )
+        if описание.is_independent_register:
+            # M3b задача 7: откат создания записи регистра — физическое удаление тем же тулом,
+            # что и прямое (`delete_record`); разрешение (`independent_register_delete`)
+            # перепроверяет `check_write` вызывающего по `откат.op`, здесь оно не проверяется.
+            return _Откат("delete_record")
+        if описание.is_tabular_part or not any(
+            поле["name"] == "DeletionMark" for поле in описание.fields
+        ):
+            raise _нельзя(
+                "у созданного объекта нет пометки удаления, и это не запись независимого "
+                "регистра сведений — откатить создание нечем",
+                hint="удалить объект может пользователь в 1С",
+            )
         return _Откат("mark_for_deletion", тело={"DeletionMark": True})
+    if запись.op == "delete_record":
+        # Обратное — воссоздать запись из «до» журнала (реальные значения, как их ушли бы в 1С
+        # на PATCH/POST): полный набор полей записи, а не разница, — записи для сравнения нет.
+        до = запись.before
+        if not isinstance(до, dict) or not до:
+            raise _нельзя(
+                "в журнале нет содержимого удалённой записи — откат не строится",
+                hint="запись потеряна, восстановить откатом нечем",
+            )
+        поля = {поле["name"] for поле in описание.fields}
+        тело_записи = {поле: значение for поле, значение in до.items() if поле in поля}
+        if not тело_записи:
+            raise _нельзя(
+                "поля этой записи больше не описаны в индексе базы — откат не строится",
+                hint="обновите индекс (odata1c_reindex) или создайте запись заново "
+                "(odata1c_create)",
+            )
+        return _Откат("create", тело=тело_записи)
     if запись.op == "action":
         # Откат возвращает состояние проведения ДО коммита, а не делает противоположное действие
         # (Н8-1 ревью): повторное проведение проведённого документа (задача 6 его разрешает)
