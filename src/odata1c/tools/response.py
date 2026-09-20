@@ -83,7 +83,8 @@ def items_of(raw: dict) -> tuple[list, int | None]:
     всего = raw.get("odata.count")
     if isinstance(всего, str):
         всего = всего.strip()
-        всего = int(всего) if всего.isdigit() else None
+        # `isdigit` шире `int`: «²» — цифра, но не число; арабско-индийские цифры `int` прочёл бы.
+        всего = int(всего) if всего.isascii() and всего.isdigit() else None
     return записи, всего
 
 

@@ -1203,6 +1203,10 @@ class Dictionary:
         разобран = parse_token(token)
         if разобран is None or разобран[0] not in НУМЕРУЕМЫЕ:
             return
+        if ЗАГЛУШКА_ТОКЕНА in text:
+            # NUL в самих данных 1С дал бы прогон заглушек любой длины в обход отсева GUID ниже;
+            # `name_variants_of` отбрасывает такие написания по той же причине.
+            return
         if blank_tokens(text, guids=False) != blank_tokens(text):
             return
         ключ = normalize_text_with_map(blank_tokens(text))[0].strip()
@@ -1211,6 +1215,11 @@ class Dictionary:
         отрезки = [кусок.strip() for кусок in ключ.split(ЗАГЛУШКА_ТОКЕНА)]
         литеральный = max(отрезки, key=len)
         if len(литеральный) < МИНИМАЛЬНАЯ_ДЛИНА_ВАРИАНТА or not _годится_в_поиск(литеральный):
+            return
+        if not _годится_в_поиск(ключ):
+            # Годен обязан быть и целый ключ: иначе `_ключи_названий` отсеет его на чтении, а
+            # `_токены_с_устаревшими_ключами` сочтёт следом прежней версии и пересоберёт все
+            # варианты токена при следующем открытии словаря (повторное ревью задачи 3).
             return
         with self._connection:
             курсор = self._connection.execute(
