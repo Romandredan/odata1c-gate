@@ -27,8 +27,8 @@ bases:
     # permissions:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов
-    #   independent_register_delete: false   # зарезервирован: тула удаления записей регистров в
-    #                                         # поставке нет, флаг ни на что не влияет (Ruling 100)
+    #   independent_register_delete: false   # DELETE записи независимого регистра сведений
+    #                                         # (odata1c_delete_record); прочих регистров не касается
     #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта (Ruling 57)
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]

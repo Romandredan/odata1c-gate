@@ -1,4 +1,5 @@
-"""Тулы записи в демоне (план M2, задача 9): семь тулов, сессия, подтверждение по клиенту.
+"""Тулы записи в демоне (план M2, задача 9; `odata1c_delete_record` — M3b задача 7): восемь
+тулов, сессия, подтверждение по клиенту.
 
 После этой задачи запись доступна модели, и ошибка здесь — запись в 1С без подтверждения
 пользователя. Поэтому проверяется в первую очередь выбор механизма подтверждения:
@@ -65,6 +66,7 @@ from odata1c.write.journal import Journal
     "odata1c_create",
     "odata1c_update",
     "odata1c_mark_for_deletion",
+    "odata1c_delete_record",
     "odata1c_action",
     "odata1c_undo",
 }
@@ -182,7 +184,7 @@ def ошибка(текст: str) -> dict:
 # ---------------------------------------------------------------------------------------------
 
 
-async def test_семь_тулов_записи_объявлены_с_аннотациями(демон):
+async def test_восемь_тулов_записи_объявлены_с_аннотациями(демон):
     async with клиент(демон) as кл:
         тулы = {т.name: т for т in (await кл.сессия.list_tools()).tools}
 
@@ -346,6 +348,7 @@ async def test_claude_code_без_подписи_с_elicitation_демон_сп�
     "odata1c_create": {"entity": КОНТРАГЕНТЫ, "data": {"Description": "x"}},
     "odata1c_update": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА, "data": {"Description": "x"}},
     "odata1c_mark_for_deletion": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА},
+    "odata1c_delete_record": {"entity": к.КУРСЫ, "key": к.КЛЮЧ_КУРСА},
     "odata1c_action": {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА, "name": "Post"},
     "odata1c_undo": {"commit_id": "c0"},
     "odata1c_commit": {"pending_id": "p0"},
@@ -687,6 +690,23 @@ async def test_create_mark_action_доходят_до_сервиса(демон,
     for ответ in (создание, пометка, действие):
         assert "pending_id" in ответ, ответ
         assert (ответ["base"], ответ["role"]) == ("ut", "prod")
+    assert одинс.записей == 0
+
+
+async def test_odata1c_delete_record_доходит_до_сервиса(демон, одинс):
+    """M3b задача 7: тул объявлен, его имя есть в перечне тулов сервера (проверено также
+    `test_восемь_тулов_записи_объявлены_с_аннотациями`), и для сущности, не являющейся записью
+    независимого регистра сведений, отвечает `params_invalid` с подсказкой на
+    `odata1c_mark_for_deletion` — так же, как метод сервиса напрямую (test_write_register)."""
+    async with клиент(демон, ответ=ДА) as кл:
+        тулы = {т.name for т in (await кл.сессия.list_tools()).tools}
+        отказ = ошибка(
+            await кл.вызвать("odata1c_delete_record", {"entity": КОНТРАГЕНТЫ, "key": ССЫЛКА})
+        )
+
+    assert "odata1c_delete_record" in тулы
+    assert отказ["code"] == "params_invalid"
+    assert "odata1c_mark_for_deletion" in отказ["hint"]
     assert одинс.записей == 0
 
 

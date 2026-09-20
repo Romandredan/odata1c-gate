@@ -592,9 +592,10 @@ def build_server(
     `odata1c_find_entity`, `odata1c_describe_entity`, `odata1c_query`, `odata1c_get`,
     `odata1c_info`, `odata1c_reindex`, `odata1c_raw_get`, `odata1c_recipe`), ресурсы
     (`odata1c://cheatsheet`, `odata1c://policy/{base}`, `odata1c://index/{base}`,
-    `odata1c://recipes/{base}`) и промпт `explore`; тулы записи (план M2, задача 9) —
-    `odata1c_create`, `odata1c_update`, `odata1c_mark_for_deletion`, `odata1c_action`,
-    `odata1c_commit`, `odata1c_undo`, `odata1c_journal`.
+    `odata1c://recipes/{base}`) и промпт `explore`; тулы записи (план M2, задача 9;
+    `odata1c_delete_record` — M3b задача 7) — `odata1c_create`, `odata1c_update`,
+    `odata1c_mark_for_deletion`, `odata1c_delete_record`, `odata1c_action`, `odata1c_commit`,
+    `odata1c_undo`, `odata1c_journal`.
 
     Каждый тул — тонкая обёртка: разобрать область видимости из `ctx.headers`, передать аргументы
     методу `ToolService`/`WriteService`, вернуть его результат как есть. Методы сервисов сами не
@@ -930,6 +931,31 @@ def build_server(
             ctx,
             lambda область, ключ: запись.mark_for_deletion(
                 область, ключ, base=base, entity=entity, key=key, mark=mark
+            ),
+        )
+
+    @server.tool(
+        name="odata1c_delete_record",
+        description=(
+            "Подготовить физическое УДАЛЕНИЕ записи независимого регистра сведений: entity, "
+            "key — полный ключ (все измерения, у периодического ещё Period). В 1С ничего не "
+            "пишет: превью («было» — запись в токенах, «станет» — записи не будет) → pending_id, "
+            "выполняет odata1c_commit после явного согласия пользователя в следующем сообщении. "
+            "Единственный тул с физическим удалением: у объектов удаления нет, только пометка "
+            "(odata1c_mark_for_deletion); запись зависимого регистра снимается проведением или "
+            "распроведением документа. Требует разрешения permissions.independent_register_delete."
+        ),
+        annotations=аннотации_подготовки,
+        meta=мета,
+        structured_output=False,
+    )
+    async def odata1c_delete_record(
+        ctx: Context, entity: str, key: str | dict, base: str | None = None
+    ) -> str:
+        return await подготовить(
+            ctx,
+            lambda область, ключ: запись.delete_record(
+                область, ключ, base=base, entity=entity, key=key
             ),
         )
 
