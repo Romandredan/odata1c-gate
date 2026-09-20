@@ -164,7 +164,9 @@ Ruling 57). Открытый литерал в поле класса `contact`/`
 - `plugin/` — плагин Claude Code по SPEC §11.2: `.claude-plugin/plugin.json` (манифест),
   `.mcp.json` (MCP-сервер шлюза с закреплённой версией пакета), `skills/odata1c/SKILL.md`
   (методика работы модели), `skills/odata1c-policy/SKILL.md` (конструктор политики, ADR-0015),
-  `skills/odata1c-recipe/SKILL.md` (свернуть запрос в рецепт), `hooks/hooks.json` и
+  `skills/odata1c-recipe/SKILL.md` (свернуть запрос в рецепт), `skills/odata1c-setup/SKILL.md`
+  (подключить базу вместе с пользователем: одна команда терминала, остальное делает модель;
+  пароль модель не видит), `hooks/hooks.json` и
   `hooks/pretooluse.py` (хук `PreToolUse`), `agents/odata1c-investigator.md` (следователь только
   чтением), `evals/` (дела `claude plugin eval`).
 - `.claude-plugin/marketplace.json` — маркетплейс с одним плагином `odata1c`, источник `./plugin`;
@@ -198,7 +200,7 @@ Ruling 57). Открытый литерал в поле класса `contact`/`
 2. **Лаунчер** `odata1c mcp` — тонкий stdio-процесс на сессию без логики: создаёт домашний
    каталог (`~/.claude/odata1c/`), поднимает демон при необходимости, проксирует MCP.
 
-Плюс плагин Claude Code `plugin/` (три навыка, хук `PreToolUse`, агент, дела evals) и маркетплейс
+Плюс плагин Claude Code `plugin/` (четыре навыка, хук `PreToolUse`, агент, дела evals) и маркетплейс
 `.claude-plugin/marketplace.json` в том же репозитории.
 
 ## Технологический стек (ADR-0008)
