@@ -3,7 +3,7 @@
 Формат — по [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), нумерация —
 [семантическая](https://semver.org/lang/ru/). Даты в формате ГГГГ-ММ-ДД.
 
-## Не выпущено
+## 0.2.0 — 2026-09-21
 
 Хвосты записи (2026-09-20): проба `docs/probes/P9-write-forms.md`, приёмка на живой базе
 `docs/probes/M3b-live-check.md`.
