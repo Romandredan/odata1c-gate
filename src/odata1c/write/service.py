@@ -844,7 +844,12 @@ class WriteService:
                         spec_ключа.path, spec_ключа.params, scrub=гейт.scrubber(раскрытое)
                     )
                 except OdataError as ошибка:
-                    if ошибка.code != "object_not_found":
+                    # I-3 (страховка, ревью хвостов M3b): `map_error` даёт `object_not_found`
+                    # только при 404 С кодом платформы «9» — проба P9-4 видела «GET 404» без
+                    # него, и тогда код выходил `entity_unknown` («структура базы могла
+                    # измениться»), хотя сущность только что нашёл `_resolve_entity` по индексу.
+                    # Любой 404 по адресу УЖЕ известного регистра читается как «записи нет».
+                    if ошибка.code not in ("object_not_found", "entity_unknown"):
                         tools._уточнить_404(ошибка)
                         raise
                 else:
