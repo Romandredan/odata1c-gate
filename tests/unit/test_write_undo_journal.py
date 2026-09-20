@@ -609,6 +609,93 @@ async def test_откат_delete_record_создаёт_запись_из_before(
     assert одинс.объекты[ПУТЬ_КУРСА]["Курс"] == 90.5
 
 
+async def test_M1_подсказка_неизвестного_исхода_отката_delete_record_не_odata1c_create(
+    среда, одинс
+):
+    """Minor 1 ревью хвостов M3b: подсказка `commit_outcome_unknown` на пути «откат
+    delete_record» — `PendingOp.op == "create"`, как у прямого `odata1c_create`, но модель звала
+    `odata1c_undo` — не должна ссылаться на «ваш вызов odata1c_create»; вместо выборки по
+    представлению — чтение по ключу (`odata1c_get`), который откату известен из журнала."""
+    одинс.регистр_ключи[КУРСЫ] = ["Period", "Валюта_Key"]
+    записать_в_журнал(
+        среда.путь_журнала,
+        commit_id="c-удаление",
+        entity=КУРСЫ,
+        op="delete_record",
+        key=КЛЮЧ_КУРСА,
+        request={"method": "DELETE", "path": ПУТЬ_КУРСА, "json": None},
+        before={**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1},
+        after=None,
+    )
+    подготовка = await подготовить_откат(среда, "c-удаление")
+
+    def таймаут(_request):
+        raise httpx.ReadTimeout("1С думает")
+
+    одинс.перед_записью = таймаут
+
+    отказ = к.ошибка(await к.выполнить(среда, подготовка["pending_id"]))
+
+    assert отказ["code"] == "commit_outcome_unknown"
+    assert "odata1c_create" not in отказ["hint"]
+    assert "odata1c_get" in отказ["hint"]
+
+
+async def test_M1_подсказка_неизвестного_исхода_отката_create_регистра_по_ключу(
+    дом, tmp_path, одинс
+):
+    """Тот же minor, другое направление: откат `create` записи регистра (`PendingOp.op ==
+    "delete_record"`, как у прямого `odata1c_delete_record`) — подсказка неизвестного исхода и
+    так не называла `odata1c_create` (регресс: остаётся чтением по ключу)."""
+    assert "independent_register_delete: true" in BASES_РЕГИСТР_УДАЛЕНИЕ
+    среда = пересоздать(дом, tmp_path / "journal.sqlite", BASES_РЕГИСТР_УДАЛЕНИЕ)
+    одинс.положить(ПУТЬ_КУРСА, {**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1})
+    записать_в_журнал(
+        среда.путь_журнала,
+        commit_id="c-курс",
+        entity=КУРСЫ,
+        op="create",
+        key=КЛЮЧ_КУРСА,
+        request={"method": "POST", "path": КУРСЫ, "json": {**КЛЮЧ_КУРСА, "Курс": 90.5}},
+        after={**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1},
+    )
+    подготовка = await подготовить_откат(среда, "c-курс")
+
+    def таймаут(_request):
+        raise httpx.ReadTimeout("1С думает")
+
+    одинс.перед_записью = таймаут
+
+    отказ = к.ошибка(await к.выполнить(среда, подготовка["pending_id"]))
+    await среда.tools.aclose()
+
+    assert отказ["code"] == "commit_outcome_unknown"
+    assert "odata1c_create" not in отказ["hint"]
+    assert "odata1c_get" in отказ["hint"]
+
+
+async def test_M2_ключ_создания_регистра_не_в_журнале_подсказывает_delete_record(среда, одинс):
+    """Minor 2 ревью хвостов M3b: у записи независимого регистра нет пометки удаления вовсе
+    (Ruling 60) — отказ «ключ созданного объекта не записан» (обрыв демона до `close_commit`)
+    подсказывал `odata1c_mark_for_deletion`, которого у регистра нет. Для регистра — своя
+    подсказка, `odata1c_delete_record`."""
+    записать_в_журнал(
+        среда.путь_журнала,
+        commit_id="c-без-ключа",
+        entity=КУРСЫ,
+        op="create",
+        key=None,
+        request={"method": "POST", "path": КУРСЫ, "json": {**КЛЮЧ_КУРСА, "Курс": 90.5}},
+        after={**КЛЮЧ_КУРСА, "Курс": 90.5, "Кратность": 1},
+    )
+
+    отказ = к.ошибка(await откатить(среда, "c-без-ключа"))
+
+    assert отказ["code"] == "undo_unsupported"
+    assert "odata1c_delete_record" in отказ["hint"]
+    assert "odata1c_mark_for_deletion" not in отказ["hint"]
+
+
 async def test_откат_прочего_действия_undo_unsupported(среда, одинс):
     записать_в_журнал(
         среда.путь_журнала,
