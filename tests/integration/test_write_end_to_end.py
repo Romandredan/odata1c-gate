@@ -96,11 +96,20 @@ def _значимый_предок_теста() -> str | None:
     return значимый_предок(_предки_текущего() or [])
 
 
-def _дом(tmp_path, порт_1с: int, *, ключ: bool = True, заверить_родителя: bool = True):
+def _дом(
+    tmp_path,
+    порт_1с: int,
+    *,
+    ключ: bool = True,
+    заверить_родителя: bool = True,
+    permissions: str = "",
+):
     """Дом, как после `odata1c init`: с ключом лаунчера (`ключ=False` — дом, где init был до
     Ruling 59: демон, поднятый на нём, ключа не находит). `заверить_родителя=True` добавляет
     значимого предка pytest в `claude_code_parents`, чтобы лаунчер заверил `claude-code` по
-    родителю (Ruling 61); `False` — родитель лаунчера (pytest) не Claude Code, имя не заверено."""
+    родителю (Ruling 61); `False` — родитель лаунчера (pytest) не Claude Code, имя не заверено.
+    `permissions` — необязательный блок `permissions:` базы `ut` (M3b задача 7 —
+    `independent_register_delete`), уже с нужным отступом, включая перевод строки в конце."""
     home = tmp_path / "home"
     ensure_home(home)
     ensure_gate_secret(home / "daemon.yaml")
@@ -123,7 +132,7 @@ def _дом(tmp_path, порт_1с: int, *, ключ: bool = True, завери�
         "    user: u\n"
         "    password: p\n"
         "    role: prod\n"
-        "    write: true\n",
+        "    write: true\n" + permissions,
         encoding="utf-8",
     )
     config = load_config(home)
@@ -626,3 +635,102 @@ async def test_демон_без_ключа_не_выдаёт_claude_code_и_п�
     журнал = (home / "logs" / "daemon.log").read_text(encoding="utf-8")
     assert "ключ лаунчера" in журнал
     assert LAUNCHER_KEY_FILE not in журнал and ключ.hex() not in журнал
+
+
+# ---------------------------------------------------------------------------------------------
+# Независимый регистр сведений сквозь лаунчер (M3b задача 7, проект §5.4)
+# ---------------------------------------------------------------------------------------------
+
+КУРСЫ = "InformationRegister_КурсыВалют"
+ВАЛЮТА_KEY = "22222222-2222-2222-2222-222222222222"
+ПЕРИОД = "2026-01-01T00:00:00"
+ПУТЬ_КУРСА = f"{КУРСЫ}(Period=datetime'{ПЕРИОД}',Валюта_Key=guid'{ВАЛЮТА_KEY}')"
+
+
+async def test_независимый_регистр_create_update_delete_record_undo_сквозь_лаунчер(tmp_path):
+    """M3b задача 7 (проект §5.4): цепочка на независимом регистре сведений (периодический —
+    `Period` в ключе, живая проверка на нём не нужна — это записанная граница приёмки) сквозь
+    настоящий лаунчер и демон: `create` → `commit` → повторный `create` тем же ключом
+    (`record_exists`, ни одного POST в 1С) → `update` → `commit` → `undo` → `commit` →
+    `delete_record` → `commit` → `undo` (воссоздание) → `commit` → `undo` исходного `create`
+    (`delete_record`) → `commit`."""
+    объекты = ОбъектыЗаписи({}, независимые_регистры={КУРСЫ: ["Period", "Валюта_Key"]})
+    async with запущенная(объекты=объекты) as порт_1с:
+        home = _дом(
+            tmp_path,
+            порт_1с,
+            permissions="    permissions:\n      independent_register_delete: true\n",
+        )
+        async with _демон(home) as порт:
+            await asyncio.wait_for(_сценарий_регистра(home, порт, объекты), ПРЕДЕЛ_СЦЕНАРИЯ_С)
+
+
+async def _сценарий_регистра(home, порт: int, объекты: ОбъектыЗаписи) -> None:
+    async with через_лаунчер(home, порт, имя="t9-клиент", ответ=ДА) as кл:
+        данные = {"Period": ПЕРИОД, "Валюта_Key": ВАЛЮТА_KEY, "Курс": 91.25, "Кратность": 1}
+
+        создание = await кл.json("odata1c_create", {"entity": КУРСЫ, "data": данные})
+        assert "pending_id" in создание, создание
+        коммит1 = await кл.json("odata1c_commit", {"pending_id": создание["pending_id"]})
+        assert "commit_id" in коммит1, коммит1
+        assert объекты.записи == [("POST", КУРСЫ, данные)]
+        assert объекты.объекты[ПУТЬ_КУРСА]["Курс"] == 91.25
+
+        # Тем же ключом второй раз — record_exists, POST в 1С не уходит.
+        повтор = await кл.json("odata1c_create", {"entity": КУРСЫ, "data": данные})
+        assert "error" in повтор and повтор["error"]["code"] == "record_exists"
+        assert len([з for з in объекты.записи if з[0] == "POST"]) == 1
+
+        изменение = await кл.json(
+            "odata1c_update",
+            {
+                "entity": КУРСЫ,
+                "key": {"Period": ПЕРИОД, "Валюта_Key": ВАЛЮТА_KEY},
+                "data": {"Курс": 92.5},
+            },
+        )
+        assert "pending_id" in изменение, изменение
+        коммит2 = await кл.json("odata1c_commit", {"pending_id": изменение["pending_id"]})
+        assert "commit_id" in коммит2, коммит2
+        assert объекты.объекты[ПУТЬ_КУРСА]["Курс"] == 92.5
+
+        # Откат update: курс возвращается к прежнему значению.
+        откат_update = await кл.json("odata1c_undo", {"commit_id": коммит2["commit_id"]})
+        assert "pending_id" in откат_update, откат_update
+        коммит3 = await кл.json("odata1c_commit", {"pending_id": откат_update["pending_id"]})
+        assert "commit_id" in коммит3, коммит3
+        assert объекты.объекты[ПУТЬ_КУРСА]["Курс"] == 91.25
+
+        # Физическое удаление записи.
+        удаление = await кл.json(
+            "odata1c_delete_record",
+            {"entity": КУРСЫ, "key": {"Period": ПЕРИОД, "Валюта_Key": ВАЛЮТА_KEY}},
+        )
+        assert "pending_id" in удаление, удаление
+        assert удаление["preview"]["after"] == "записи не будет"
+        коммит4 = await кл.json("odata1c_commit", {"pending_id": удаление["pending_id"]})
+        assert "commit_id" in коммит4, коммит4
+        assert ПУТЬ_КУРСА not in объекты.объекты
+
+        # Откат delete_record: запись создаётся заново тем же телом.
+        откат_delete = await кл.json("odata1c_undo", {"commit_id": коммит4["commit_id"]})
+        assert откат_delete["undo_op"] == "create"
+        коммит5 = await кл.json("odata1c_commit", {"pending_id": откат_delete["pending_id"]})
+        assert "commit_id" in коммит5, коммит5
+        assert ПУТЬ_КУРСА in объекты.объекты and объекты.объекты[ПУТЬ_КУРСА]["Курс"] == 91.25
+
+        # Откат исходного create — физическое удаление (запись сейчас снова есть).
+        откат_create = await кл.json("odata1c_undo", {"commit_id": коммит1["commit_id"]})
+        assert откат_create["undo_op"] == "delete_record"
+        коммит6 = await кл.json("odata1c_commit", {"pending_id": откат_create["pending_id"]})
+        assert "commit_id" in коммит6, коммит6
+        assert ПУТЬ_КУРСА not in объекты.объекты
+
+        for текст in (
+            json.dumps(создание, ensure_ascii=False),
+            json.dumps(коммит1, ensure_ascii=False),
+            json.dumps(изменение, ensure_ascii=False),
+            json.dumps(коммит2, ensure_ascii=False),
+            json.dumps(удаление, ensure_ascii=False),
+        ):
+            assert "guard_replaced" not in текст
