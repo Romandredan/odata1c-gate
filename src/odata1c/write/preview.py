@@ -13,9 +13,15 @@
 Три формы по операциям: `update` — разница «было → станет» (`diff_preview`), `create` — тело в
 показе вызывающего (`body_preview`: «было» у нового объекта нет, и строка `before: None` читалась
 бы как «поле было пустым»), `action` — действие и признак проведения до и после (`action_preview`).
+
+Четвёртая — `rows_preview` (проект M3b §5.2): табличная часть в теле `update` заменяется целиком, и
+разница «было → станет» по одному значению поля здесь не подходит — нужна разница построчно по
+`LineNumber` (`rows_diff.RowsDiff`, вычисляет вызывающий на уже показанных/маскированных строках).
 """
 
 from __future__ import annotations
+
+from odata1c.write.rows_diff import RowsDiff
 
 
 def diff_preview(before_masked: dict, after_as_sent: dict) -> list[dict]:
@@ -56,6 +62,24 @@ def action_preview(name: str, объект: dict, posted_before, posted_after: b
         "object": объект,
         "action": name,
         "posted": {"before": posted_before, "after": posted_after},
+    }
+
+
+def rows_preview(имя: str, diff: RowsDiff) -> dict:
+    """Строка превью `update` для табличной части, вместо `{"field", "before", "after"}` —
+    `{"field", "rows", "summary"}`: одно значение поля разницу построчно не несёт. `rows` — тело
+    `RowsDiff` как словарь (`changed`/`added`/`removed`/`before_count`/`after_count`), `summary` —
+    короткая строка счёта для текста подтверждения, как у пометки удаления (`да_нет`)."""
+    return {
+        "field": имя,
+        "rows": {
+            "changed": diff.changed,
+            "added": diff.added,
+            "removed": diff.removed,
+            "before_count": diff.before_count,
+            "after_count": diff.after_count,
+        },
+        "summary": f"строк было {diff.before_count}, станет {diff.after_count}",
     }
 
 
