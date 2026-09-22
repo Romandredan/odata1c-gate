@@ -77,24 +77,17 @@ claude plugin validate plugin/         # манифест плагина, нав
 uv run python tools/bump_version.py <версия>
 ```
 
-**`main` двигается только выпусками.** Маркетплейс отдаёт плагин из ветки по умолчанию, а
-`plugin/.mcp.json` закрепляет версию дистрибутива на PyPI: любая правка `main` немедленно
-доходит до всех, кто поставил плагин. Поэтому в `main` попадает только коммит выпуска с тегом
-`v<версия>`, а рабочая ветка между выпусками живёт с версией `X.Y.Z.devN` во всех четырёх
-местах (`odata1c --version` тогда честно говорит, что это не выпуск). `claude plugin validate`
-версию с суффиксом `.devN` принимает.
+**`main` двигается только выпусками.** Маркетплейс отдаёт плагин из ветки по умолчанию (она
+обязана быть `main`), а `plugin/.mcp.json` закрепляет версию дистрибутива на PyPI: любая правка
+`main` немедленно доходит до всех, кто поставил плагин. Рабочая ветка между выпусками живёт с
+версией `X.Y.Z.devN` во всех четырёх местах (`odata1c --version` тогда честно говорит, что это не
+выпуск). `claude plugin validate` версию с суффиксом `.devN` принимает.
 
-```text
-uv run python tools/bump_version.py 0.1.0
-uv run pytest -q
-git commit -m "release: 0.1.0"
-git tag v0.1.0
-git push origin main --tags
-```
-
-Перед тегом — запись в [CHANGELOG.md](CHANGELOG.md) с датой выпуска. Тег `v<версия>` запускает
-`.github/workflows/publish.yml`: `uv build`, публикация на PyPI через trusted publishing и
-приложение колеса и sdist к GitHub Release. Токенов PyPI в репозитории нет.
+Порядок выпуска, нумерация, шаблон описания и откат — [docs/RELEASING.md](docs/RELEASING.md).
+Главное из него: тег уходит раньше `main`, и `main` сдвигается на коммит выпуска только после того,
+как версия появилась на PyPI. Тег `v<версия>` запускает `.github/workflows/publish.yml`:
+`uv build`, публикация на PyPI через trusted publishing и выпуск на GitHub с колесом и sdist.
+Токенов PyPI в репозитории нет.
 
 ## Trusted publishing на pypi.org
 

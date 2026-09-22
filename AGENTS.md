@@ -158,6 +158,8 @@ Ruling 57). Открытый литерал в поле класса `contact`/`
 - `docs/install.md` — установка на Windows и Linux, обновление, `doctor`, типовые сбои; раздел для
   сопровождающего (выпуск версии, trusted publishing на PyPI, прогон evals) — в `CONTRIBUTING.md`.
 - `CHANGELOG.md` — что вошло в выпуск; формат Keep a Changelog, нумерация семантическая.
+- `docs/RELEASING.md` — порядок выпуска: нумерация, чеклист (тег раньше `main`, `main` — только
+  после появления версии на PyPI), шаблон описания выпуска на GitHub, откат.
 - `src/odata1c/` — пакет дистрибутива `odata1c-gate` (SPEC §11.1). Подпакеты названы по таблице
   модулей SPEC §2.2: `config`, `registry`, `client1c`, `index`, `gate`, `write`, `recipes`,
   `tools`; плюс `templates/` — файлы-шаблоны в поставке (конфигурация, рецепты УТ/БП/ЗУП). Модули
