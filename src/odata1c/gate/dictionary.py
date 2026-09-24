@@ -109,6 +109,8 @@ CREATE INDEX IF NOT EXISTS idx_variants_field ON variants(base, entity, field);
     "corr": 20,
     "bic": 9,
     "snils": 11,
+    # Регистрационный номер страхователя: десять цифр у ФСС и СФР, двенадцать у ПФР.
+    "sfr": 10,
     "card": 13,
     "iban": 15,
     "phone": 7,
