@@ -62,8 +62,9 @@
 
    `base add <имя> --role prod|test|dev [--recipes ut|bp|zup]` спрашивает четыре вещи подряд:
 
-   - адрес публикации OData (оканчивается на `/odata/standard.odata/`, например
-     `https://server/base/odata/standard.odata/`);
+   - адрес публикации 1С — тот же, по которому открывается веб-клиент, например
+     `https://server/base`; окончание `/odata/standard.odata/` шлюз допишет сам, язык веб-клиента
+     (`/ru_RU/`) отрежет;
    - подпись базы для модели — по ней она выбирает базу среди нескольких;
    - пользователя 1С (заводится отдельный, с правами только на нужное чтение, например
      `odata_user`);
@@ -86,7 +87,7 @@
    bases:
      ut_test:
        label: УТ 11, тестовая
-       url: https://server/base/odata/standard.odata/
+       url: https://server/base
        user: odata_user
        password: qwerty123
        role: test

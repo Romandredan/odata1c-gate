@@ -291,6 +291,34 @@ def test_base_add_пароль_не_попадает_в_вывод(tmp_path, mon
     assert config.bases["ut"].password == "секретный_пароль_только_для_теста"
 
 
+def test_base_add_пишет_корень_публикации_и_печатает_адрес_odata(tmp_path, monkeypatch, capsys):
+    """Ruling 106: владелец вводит адрес из браузера, в bases.yaml ложится корень публикации,
+    а хвост стандартного интерфейса OData достраивает шлюз."""
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch, url="https://server/base/ru_RU/")
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "адрес OData: https://server/base/odata/standard.odata/" in вывод
+    текст = (home / "bases.yaml").read_text(encoding="utf-8")
+    assert "url: https://server/base\n" in текст
+    assert load_config(home).bases["ut"].url == "https://server/base/odata/standard.odata/"
+
+
+def test_base_add_отклоняет_адрес_до_вопроса_о_пароле(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    monkeypatch.setattr("builtins.input", lambda *_: "server/base")
+    monkeypatch.setattr("getpass.getpass", lambda *_: pytest.fail("пароль спрошен зря"))
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод and "http" in вывод
+
+
 def test_base_add_создаёт_файл_политики_владельца_из_шаблона(tmp_path, monkeypatch, capsys):
     """ADR-0015, задача 3: `base add` создаёт `bases/<имя>/policy.yaml` из шаблона, шапка
     которого называет настоящую базу, а не образец `{{base}}`. Повторное обеспечение (например,

@@ -6,7 +6,7 @@
 bases:
   # ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
   #   label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
-  #   url: https://server/base/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
+  #   url: https://server/base       # адрес публикации 1С, как в браузере; /odata/standard.odata/ шлюз допишет сам
   #   user: odata_user                 # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
   #   password: qwerty123              # пароль ИБ, без кавычек; нужны кавычки, только если в пароле есть #,
   #                                     # двоеточие с пробелом, он начинается со спецсимвола или похож на
@@ -51,14 +51,14 @@ bases:
 
   # buh:
   #   label: БП 3.0, боевая
-  #   url: https://server/base/odata/standard.odata/
+  #   url: https://server/base
   #   user: odata_user
   #   password: qwerty123
   #   role: prod
 
   # ut_test:
   #   label: копия УТ для отладки
-  #   url: https://server/base/odata/standard.odata/
+  #   url: https://server/base
   #   user: odata_user
   #   password: qwerty123
   #   role: dev                      # гейт выключен, запись разрешена

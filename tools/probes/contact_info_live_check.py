@@ -58,6 +58,8 @@ from lxml import etree
 from mcp import StdioServerParameters, stdio_client
 from mcp.client.session import ClientSession
 
+from odata1c.config.models import адрес_odata
+
 БАЗА = "trade_dev"
 ПОРТ = 7191
 ПОРТ_ПРОКСИ = 7192
@@ -1277,7 +1279,7 @@ async def main() -> int:
 
     рабочий = pathlib.Path(аргументы.home)
     настройки = yaml.safe_load((рабочий / "bases.yaml").read_text(encoding="utf-8"))["bases"][БАЗА]
-    адрес = настройки["url"].rstrip("/") + "/"
+    адрес = адрес_odata(настройки["url"])
     сырой = httpx.Client(auth=(настройки["user"], настройки["password"]), timeout=120)
 
     прокси = СчётчикЗапросов(адрес) if нужен("оракул") or нужен("оракул_пути") else None

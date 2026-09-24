@@ -26,7 +26,13 @@ from odata1c.client1c.errors import OdataError
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
-from odata1c.config.models import ИМЯ_БАЗЫ, ИМЯ_КОНФИГУРАЦИИ, BaseConfig
+from odata1c.config.models import (
+    ИМЯ_БАЗЫ,
+    ИМЯ_КОНФИГУРАЦИИ,
+    BaseConfig,
+    адрес_odata,
+    корень_публикации,
+)
 from odata1c.config.writer import (
     append_base,
     ensure_gate_secret,
@@ -969,7 +975,14 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
             hint="поправьте существующую запись вручную или выберите другое имя",
         )
     print(f"добавляю базу «{name}» с ролью {role}")
-    url = input("адрес (оканчивается на /odata/standard.odata/): ").strip()
+    url = input("адрес публикации 1С, как в браузере (например https://server/base): ").strip()
+    try:
+        # В файл идёт корень публикации, хвост OData достраивает сам шлюз (Ruling 106); адрес
+        # проверяется до вопросов о пользователе и пароле, чтобы не вводить их зря.
+        url = корень_публикации(url)
+    except ValueError as ошибка:
+        raise ConfigError(f"база «{name}» описана неверно: {ошибка}") from ошибка
+    print(f"адрес OData: {_без_учётных_данных(адрес_odata(url))}")
     values = {
         "label": input("подпись для модели: ").strip() or name,
         "url": url,

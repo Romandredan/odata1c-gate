@@ -277,7 +277,8 @@ CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base l
    `bases.yaml` и `daemon.yaml` и закрывает их правами текущего пользователя. Другой каталог —
    ключ `--home <путь>` (он есть у всех команд) или переменная окружения `ODATA1C_HOME`.
 2. **База.** `uv run odata1c base add trade_dev --role dev --recipes ut` спрашивает адрес
-   публикации (оканчивается на `/odata/standard.odata/`), подпись, пользователя и пароль 1С и
+   публикации (как в браузере, `https://server/base`; хвост `/odata/standard.odata/` шлюз
+   достраивает сам, Ruling 106), подпись, пользователя и пароль 1С и
    дописывает запись в `bases.yaml`. Роль задаёт умолчания: `prod` — гейт `identifiers+names`
    и только чтение, `test` — `identifiers`, `dev` — гейт выключен (`off`) и запись разрешена;
    явные поля записи умолчания роли перекрывают. `--recipes ut|bp|zup` кладёт в базу шаблон
