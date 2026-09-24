@@ -4,7 +4,7 @@ name: ci
 
 on:
   push:
-    branches: [main, m0-probes]
+    branches: [main, dev]
   pull_request:
 
 # Читать код — единственное, что нужно прогону. Выпуск (`publish.yml`) права запрашивает сам.
