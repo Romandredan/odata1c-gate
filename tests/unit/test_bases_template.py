@@ -5,8 +5,26 @@
 import importlib.resources
 import re
 
+import pytest
+
 from odata1c.cli import main
 from odata1c.config.loader import load_config
+from odata1c.config.writer import КОЛОНКА_КОММЕНТАРИЯ, render_base
+
+# Комментарий справа от поля (в том числе закомментированного) или строка-продолжение такого
+# комментария: слева от `# ` — поле со значением либо одни решётки и пробелы.
+_КОММЕНТАРИЙ_ПОЛЯ = re.compile(
+    r"^(?P<code>#?\s*(?:#\s+)?[\w\-]+:(?:.*?\S)?)\s{2,}# |^(?P<cont>\s*#?(?:\s+#)?)\s{12,}# "
+)
+
+
+def _колонки(текст: str) -> set[int]:
+    колонки = set()
+    for строка in текст.splitlines():
+        м = _КОММЕНТАРИЙ_ПОЛЯ.match(строка)
+        if м:
+            колонки.add(м.end() - 2)
+    return колонки
 
 
 def _шаблон() -> str:
@@ -61,3 +79,18 @@ def test_шапка_шаблона_говорит_что_гейт_задаётс
     шапка = _шаблон().partition("bases:\n")[0]
     assert "для каждой базы" in шапка
     assert "--gate" in шапка
+
+
+def test_комментарии_шаблона_в_одной_колонке():
+    """Замечание владельца: длинные строки (`label` примера, `independent_register_delete`) не
+    должны сдвигать колонку комментариев. В шаблоне она на две позиции правее, чем в записи
+    `base add`: после снятия `# ` с примера колонки совпадают."""
+    assert _колонки(_шаблон()) == {КОЛОНКА_КОММЕНТАРИЯ + 2}
+
+
+@pytest.mark.parametrize("роль", ["prod", "test", "dev"])
+@pytest.mark.parametrize("гейт", [None, "identifiers+names"])
+def test_комментарии_записи_base_add_в_одной_колонке(роль, гейт):
+    значения = {"label": "УТ", "url": "https://server/ut", "user": "u", "password": "p"}
+    значения |= {"role": роль, "config": "ut"} | ({"gate": {"mode": гейт}} if гейт else {})
+    assert _колонки(render_base("trade_dev", значения)) == {КОЛОНКА_КОММЕНТАРИЯ}

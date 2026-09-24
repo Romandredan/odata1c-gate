@@ -89,27 +89,27 @@ def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
 {config_line}
 
     # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
-    # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
-    # timeout_s: 60                  # таймаут обычного запроса; виртуальные таблицы — 180
-    # concurrency: 2                 # одновременных запросов к этой базе от всех сессий
-    # ib_session: true               # держать сеанс 1С (IBSession) между запросами
+    # verify_tls: true                       # true | false | путь к CA-сертификату (PEM)
+    # timeout_s: 60                          # таймаут обычного запроса; виртуальные таблицы — 180
+    # concurrency: 2                         # одновременных запросов к этой базе от всех сессий
+    # ib_session: true                       # держать сеанс 1С (IBSession) между запросами
 
     # --- запись этой базы (умолчание роли {role}) ---
 {write_line}
     # permissions:
-    #   post_documents: true         # действия Post/Unpost из $metadata
-    #   mark_deletion: true          # PATCH DeletionMark у объектов
+    #   post_documents: true                 # действия Post/Unpost из $metadata
+    #   mark_deletion: true                  # PATCH DeletionMark у объектов
 {register_delete_line}
-    #   allow_entities: []           # если не пусто — запись только в эти сущности
-    #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
-    #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
+    #   allow_entities: []                   # если не пусто — запись только в эти сущности
+    #   deny_entities: []                    # запрет записи в сущности: [Catalog_Пользователи]
+    #   deny_fields: []                      # запрет записи в поля: [Catalog_Контрагенты.ИНН]
 {commit_limit_line}
 
     # --- гейт этой базы: скрывать ли (умолчание роли {role}: {role_gate}) ---
 {gate_lines}
 
-    # --- рецепты ---
-    # recipes: bases/{name}/recipes.yaml   # путь относительно домашнего каталога
+    # --- рецепты: собственный файл базы, путь относительно домашнего каталога ---
+{recipes_line}
 """
 
 
@@ -122,9 +122,16 @@ def _скаляр(value: str) -> str:
     return строка[len("значение: ") :].rstrip("\n")
 
 
+# Колонка комментариев записи базы — та же, что у постоянных строк `ШАБЛОН_ЗАПИСИ`. В шаблоне
+# `bases.example.yaml` она на две позиции правее (47): пример там закомментирован целиком, и после
+# снятия `# ` колонки совпадают.
+КОЛОНКА_КОММЕНТАРИЯ = 45
+
+
 def _с_комментарием(код: str, комментарий: str) -> str:
-    """Строка записи с комментарием в той же колонке, что у соседних строк шаблона."""
-    return f"{код}{' ' * max(37 - len(код), 3)}# {комментарий}"
+    """Строка записи с комментарием в колонке `КОЛОНКА_КОММЕНТАРИЯ`; строка длиннее колонки
+    отделяется от комментария тремя пробелами."""
+    return f"{код}{' ' * max(КОЛОНКА_КОММЕНТАРИЯ - len(код), 3)}# {комментарий}"
 
 
 def render_base(name: str, values: dict) -> str:
@@ -172,12 +179,18 @@ def render_base(name: str, values: dict) -> str:
     # сама, нижними слоями `recipes.model.load_layered`, без повторного копирования при их правке.
     config = values.get("config")
     config_line = (
-        f"    config: {config}                # библиотека рецептов: recipes/{config}/ и "
-        "шаблон пакета"
+        _с_комментарием(
+            f"    config: {config}", f"библиотека рецептов: recipes/{config}/ и шаблон пакета"
+        )
         if config
-        else "    # config: ut                   # конфигурация для библиотеки рецептов "
-        "(recipes/<config>/): ut | bp | zup | своя"
+        else _с_комментарием(
+            "    # config: ut",
+            "конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя",
+        )
     )
+    # Путь содержит имя базы любой длины — комментария справа у строки нет, пояснение в заголовке
+    # раздела: иначе длинное имя сдвинуло бы колонку комментариев.
+    recipes_line = f"    # recipes: bases/{name}/recipes.yaml"
     return ШАБЛОН_ЗАПИСИ.format(
         name=name,
         label=_скаляр(values.get("label", name)),
@@ -191,6 +204,7 @@ def render_base(name: str, values: dict) -> str:
         commit_limit_line=commit_limit_line,
         gate_lines=gate_lines,
         config_line=config_line,
+        recipes_line=recipes_line,
     )
 
 
