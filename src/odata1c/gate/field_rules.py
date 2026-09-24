@@ -235,7 +235,8 @@ def classify_field(
     `rules` — действующий каталог правил базы (поставка и владелец, `rules.load_rules`); без него
     — каталог поставки. `names_for` по умолчанию — справочники людей и организаций каталога.
     `strict` — сущность индексу не известна (строгий режим, Ruling 18): правило `fields` каталога
-    действует по имени поля у любой сущности (`RuleCatalog.field_rule_any_entity`)."""
+    действует и на сущность, чьё имя после канонизации совпадает с именем правила
+    (`RuleCatalog.field_rule_canonical`: точка в конце, невидимый символ, регистр)."""
     if edm_type not in СТРОКОВЫЕ_ТИПЫ:
         return None
     if field in ("Ref_Key", "Code", "Number", "DataVersion") or field.endswith("_Type"):
@@ -253,7 +254,7 @@ def classify_field(
     каталог = rules if rules is not None else package_rules()
     правило = каталог.field_rule(entity, field)
     if правило is None and strict:
-        правило = каталог.field_rule_any_entity(field)
+        правило = каталог.field_rule_canonical(entity, field)
     if правило is None:
         правило = каталог.name_rule(field)
     if правило is not None:
