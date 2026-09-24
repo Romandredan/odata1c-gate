@@ -239,7 +239,12 @@ def classify_field(
         return None
 
     # Счёт учёта в плане счетов — не банковский счёт (SPEC §6.4, оговорка про chartofaccounts).
-    if entity.startswith("ChartOfAccounts") and re.fullmatch(r"account|счет", field, re.IGNORECASE):
+    # То же у регистра бухгалтерии: `Account` его записей и виртуальных таблиц — навигация к плану
+    # счетов (приёмка рецептов БП, 2026-09-25: отбор `Account/Code eq '51'` отклонялся как путь
+    # через банковский счёт). `AccountDr`, `BalancedAccount` правилом `^account$` не ловятся и так.
+    if entity.startswith(("ChartOfAccounts", "AccountingRegister")) and re.fullmatch(
+        r"account|счет", field, re.IGNORECASE
+    ):
         return None
 
     каталог = rules if rules is not None else package_rules()

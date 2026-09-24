@@ -56,6 +56,21 @@ def test_счета_из_плана_счетов_не_реквизит():
 
 
 @pytest.mark.parametrize(
+    "сущность",
+    [
+        "AccountingRegister_Хозрасчетный_Balance",
+        "AccountingRegister_Хозрасчетный_BalanceAndTurnovers",
+        "AccountingRegister_Хозрасчетный_RecordType",
+    ],
+)
+def test_счёт_регистра_бухгалтерии_не_банковский(сущность):
+    """`Account` регистра бухгалтерии — навигация к плану счетов: путь `Account/Code` в отборе
+    не должен отклоняться как путь через банковский счёт (приёмка рецептов БП)."""
+    assert класс(сущность, "Account") is None
+    assert класс("Document_Прочее", "Account") == "acc"
+
+
+@pytest.mark.parametrize(
     "поле",
     [
         "СуммаДокумента",

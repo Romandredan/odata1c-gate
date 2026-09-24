@@ -190,6 +190,23 @@ def остановить_демон(дом: pathlib.Path) -> None:
         check=False,
     )
     time.sleep(1.5)
+    if sys.platform == "win32":
+        # Лаунчер на Windows поднимает демон планировщиком заданий, а если тот не ответил за
+        # отведённое время — ещё и CreateProcess; опоздавший первый остаётся жить с удалённым
+        # временным домом и держит порт следующему прогону. Добиваются процессы, в командной
+        # строке которых стоит путь этого временного дома, — и только они.
+        шаблон = str(дом).replace("'", "''")
+        subprocess.run(  # noqa: S603 — фиксированная команда, путь временного дома
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
+                f"'*{шаблон}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+            ],
+            capture_output=True,
+            check=False,
+        )
 
 
 @contextlib.asynccontextmanager

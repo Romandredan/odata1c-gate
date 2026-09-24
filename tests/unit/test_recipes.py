@@ -687,11 +687,12 @@ async def test_без_файла_рецептов_подсказка_того_ж
 
 async def test_config_без_файла_и_без_рецептов_говорит_файла_нет(дом):
     """Находка advisor-ревью M3 задачи 3: у базы задан `config`, чьи шаблон и библиотека пусты
-    (`bp` — пакетный шаблон без единого рецепта, SPEC design §10), а собственного `recipes.yaml`
-    нет вовсе (`layered` при этом не `None`: слой `config` есть) — подсказка должна называть
-    ФАКТ («нет файла рецептов»), а не выдумывать несуществующий файл пустым."""
+    (`zup` — пакетный шаблон без единого рецепта, SPEC design §10; шаблон `bp` заполнен
+    2026-09-25), а собственного `recipes.yaml` нет вовсе (`layered` при этом не `None`: слой
+    `config` есть) — подсказка должна называть ФАКТ («нет файла рецептов»), а не выдумывать
+    несуществующий файл пустым."""
     (дом / "bases.yaml").write_text(
-        BASES_YAML.replace("role: prod", "role: prod\n    config: bp", 1), encoding="utf-8"
+        BASES_YAML.replace("role: prod", "role: prod\n    config: zup", 1), encoding="utf-8"
     )
     (дом / "bases" / "ut" / "recipes.yaml").unlink()
 
@@ -1121,3 +1122,13 @@ def test_выражение_отбора_виртуальной_таблицы_�
         )
     assert отказ.value.code == "config_invalid"
     assert "Condition" in отказ.value.message
+
+
+@pytest.mark.parametrize(("конфигурация", "не_меньше"), [("ut", 6), ("bp", 8), ("zup", 0)])
+def test_шаблоны_рецептов_поставки_разбираются(конфигурация, не_меньше):
+    """Шаблон пакета с ошибкой разметки ломает книгу рецептов каждой базы этой конфигурации
+    (`config_invalid` на любом вызове `odata1c_recipe`): запятая в описании параметра внутри
+    `{…}` YAML разбивает значение — так было в первой редакции `bp.yaml`."""
+    from odata1c.recipes.model import load_template
+
+    assert len(load_template(конфигурация)) >= не_меньше

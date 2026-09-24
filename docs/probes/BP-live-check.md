@@ -50,11 +50,24 @@
 данных не проверены — только на метаданных (`docs/probes/BP-recon.md`) и в юнит-тестах. Их
 проверка — на базе с кадровыми данными (ЗУП или БП с зарплатой).
 
+## Рецепты БП
+
+Шаблон `src/odata1c/templates/recipes/bp.yaml` (Ruling 110) проверен пробой
+`tools/probes/bp_recipes_check.py`: временный дом, у записи базы `config: bp` и нет собственного
+файла рецептов, так что книга — ровно шаблон пакета. Все восемь рецептов применимы и выполнились
+без ошибок: `account_balance` (62.01 — 180 строк), `trial_balance` (60.01 — 200, предел
+выборки), `debtors` (63), `payables` (112), `money_bank` (1), `money_cash` (1), `sales` (200),
+`purchases` (200). Первая редакция шаблона не разбиралась (запятая в описании параметра внутри
+`{…}`) — теперь каждый шаблон поставки проверяет юнит-тест. Отбор по коду счёта `Account/Code`
+до правки классификатора шлюз отклонял (`filter_syntax`): навигацию `Account` регистра
+бухгалтерии он принимал за банковский счёт.
+
 ## Воспроизведение
 
     uv run python tools/probes/class_diff.py --save build/classes-before.json   # на коде до правок
     uv run python tools/probes/bp_live_check.py --classes-before build/classes-before.json \
         --out build/bp-live-full.json
+    uv run python tools/probes/bp_recipes_check.py
     # положительный контроль — из рабочей копии dev:
     uv run --directory <dev> python <ветка>/tools/probes/bp_live_check.py \
         --checks-from <ветка>/build/bp-live-full.json
