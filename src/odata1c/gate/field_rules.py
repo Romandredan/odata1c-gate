@@ -224,6 +224,7 @@ def classify_field(
     *,
     names_for: set[str] | None = None,
     rules: RuleCatalog | None = None,
+    strict: bool = False,
 ) -> tuple[str, str] | None:
     """Класс строкового поля по имени — вход авторазметки (SPEC §4.3) и запасной путь
     маскировщика и обратной подмены. Порядок: служебное поле → правило каталога на поле одной
@@ -232,7 +233,9 @@ def classify_field(
     сущности). Правило каталога `scan` — «по имени не классифицировать», то есть `None`.
 
     `rules` — действующий каталог правил базы (поставка и владелец, `rules.load_rules`); без него
-    — каталог поставки. `names_for` по умолчанию — справочники людей и организаций каталога."""
+    — каталог поставки. `names_for` по умолчанию — справочники людей и организаций каталога.
+    `strict` — сущность индексу не известна (строгий режим, Ruling 18): правило `fields` каталога
+    действует по имени поля у любой сущности (`RuleCatalog.field_rule_any_entity`)."""
     if edm_type not in СТРОКОВЫЕ_ТИПЫ:
         return None
     if field in ("Ref_Key", "Code", "Number", "DataVersion") or field.endswith("_Type"):
@@ -248,7 +251,11 @@ def classify_field(
         return None
 
     каталог = rules if rules is not None else package_rules()
-    правило = каталог.field_rule(entity, field) or каталог.name_rule(field)
+    правило = каталог.field_rule(entity, field)
+    if правило is None and strict:
+        правило = каталог.field_rule_any_entity(field)
+    if правило is None:
+        правило = каталог.name_rule(field)
     if правило is not None:
         return None if правило == БЕЗ_КЛАССА else (правило, "auto")
 

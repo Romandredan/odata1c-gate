@@ -149,6 +149,7 @@ def _базовый_класс_поля_политики(
             "Edm.String",
             names_for={entity} if strict else set(),
             rules=policy.rules,
+            strict=strict,
         )
         if найдено is not None:
             класс = найдено[0]

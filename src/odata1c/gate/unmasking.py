@@ -1356,7 +1356,7 @@ class Unmasker:
         # классификации не подлежат; явный класс из политики (`field_class`) по-прежнему главный.
         if класс is None and not _ссылочный_ключ(сегмент):
             найдено = classify_field(
-                entity, сегмент, "Edm.String", names_for=set(), rules=self._rules
+                entity, сегмент, "Edm.String", names_for=set(), rules=self._rules, strict=strict
             )
             класс = найдено[0] if найдено is not None else None
         if класс is not None:

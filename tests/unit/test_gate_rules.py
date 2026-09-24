@@ -100,6 +100,119 @@ def test_scan_поставки_снимает_только_названия_и_�
     assert not нарушения, нарушения
 
 
+def test_scan_поставки_не_снимает_слой_1_у_справочников_людей_и_организаций():
+    """Ревью атакующим, находка 7: `names: <поле названия>: scan` снял бы `Description`/ФИО
+    у справочников людей и организаций — проверка на нейтральной сущности этого не видит."""
+    from odata1c.gate.rules import RuleCatalog
+
+    каталог = package_rules()
+    без_scan = RuleCatalog(people=каталог.people, orgs=каталог.orgs)
+    # Слой 1 — класс, который поле получает только внутри справочника людей или организаций;
+    # исключения слоя 2 (`ДолжностьРуководителя`, `ЮрФизЛицо`) дают класс в любой сущности и
+    # сняты намеренно.
+    нарушения = [
+        (сущность, имя)
+        for имя, правило in каталог.names.items()
+        if правило == "scan"
+        and classify_field("Document_Прочее", имя, "Edm.String", rules=без_scan) is None
+        for сущность in sorted(каталог.names_for)
+        if (найдено := classify_field(сущность, имя, "Edm.String", rules=без_scan)) is not None
+        and найдено[0] in ("person", "org")
+    ]
+    assert not нарушения, нарушения
+
+
+def test_строгий_режим_применяет_правила_fields_к_любой_сущности():
+    """Ревью атакующим, находка 2: `raw_get` с именем, которого индекс не знает
+    (`…ДокументыФизическихЛиц.` с точкой), идёт строгим режимом — правило `fields`, привязанное
+    к точному имени сущности, там действует по имени поля."""
+    искажённое = "InformationRegister_ДокументыФизическихЛиц."
+    assert classify_field(искажённое, "Номер", "Edm.String") is None
+    assert classify_field(искажённое, "Номер", "Edm.String", strict=True) == ("doc", "auto")
+    assert classify_field(искажённое, "Представление", "Edm.String", strict=True)[0] == "doc"
+
+
+def test_пустой_каталог_поставки_ошибка(monkeypatch):
+    """Ревью атакующим, находка 3: без файлов каталога поставки защита не должна молча
+    ослабнуть — пустой каталог поставки останавливает загрузку ошибкой."""
+    from odata1c.gate import rules
+
+    monkeypatch.setattr(rules, "_файлы_поставки", lambda: [])
+    rules._слой_поставки.cache_clear()
+    try:
+        with pytest.raises(PolicyError, match="каталог правил поставки пуст"):
+            rules._слой_поставки()
+    finally:
+        monkeypatch.undo()
+        rules._слой_поставки.cache_clear()
+        assert rules._слой_поставки()
+
+
+async def test_негодный_каталог_владельца_закрывает_тулы_policy_invalid(tmp_path, edmx_ut_real):
+    """Ревью атакующим, находка 8: код отказа проверен сквозь `ToolService`, а не только
+    исключением конструктора гейта. В тексте отказа — путь, ключ правила и причина; данных 1С
+    в каталоге нет, и повторять из него нечего, кроме имён полей."""
+    import json
+
+    from odata1c.cli import main
+    from odata1c.config.loader import load_config
+    from odata1c.gate.service import refresh_policy
+    from odata1c.index.edmx import parse_edmx
+    from odata1c.index.reindex import index_path
+    from odata1c.index.repository import IndexRepository
+    from odata1c.registry.registry import SessionScope
+    from odata1c.tools.service import ToolService
+
+    дом = tmp_path / "home"
+    main(["init", "--home", str(дом)])
+    (дом / "bases.yaml").write_text(
+        "default: ut\nbases:\n  ut:\n    label: УТ\n"
+        "    url: http://localhost/ut/odata/standard.odata/\n    user: u\n    password: p\n"
+        "    role: prod\n",
+        encoding="utf-8",
+    )
+    хранилище = IndexRepository(index_path(дом, "ut"))
+    хранилище.write(parse_edmx(edmx_ut_real))
+    хранилище.close()
+    refresh_policy(дом, load_config(дом).bases["ut"])
+    (дом / "gate").mkdir()
+    (дом / "gate" / "доработки.yaml").write_text(
+        "names:\n  СекретноеПолеВладельца: keep\n", encoding="utf-8"
+    )
+    служба = ToolService(load_config(дом))
+    try:
+        ответ = json.loads(
+            await служба.query(
+                SessionScope(), base="ut", entity="Catalog_Контрагенты", select=["Ref_Key"]
+            )
+        )
+    finally:
+        await служба.aclose()
+    assert ответ["error"]["code"] == "policy_invalid"
+    assert "keep каталогу не доступен" in ответ["error"]["message"]
+
+
+def test_нечитаемый_файл_владельца_ошибка_политики(tmp_path):
+    (tmp_path / "gate").mkdir()
+    (tmp_path / "gate" / "моё.yaml").write_bytes(b"names:\n  \xff\xfe: doc\n")
+    with pytest.raises(PolicyError, match="не читается как UTF-8"):
+        load_rules(tmp_path)
+
+
+def test_мусорные_токены_снятых_полей_не_ищутся_в_тексте(tmp_path):
+    """Ревью атакующим, находка 6: токен person, выданный до правки полю `СотрудникПол`
+    («Мужской»), не должен заменять это слово в любом тексте ответа."""
+    словарь = Dictionary(tmp_path / "словарь.db", СЕКРЕТ)
+    try:
+        словарь.token_for("person", "Мужской", base="bp", entity="E", field="СотрудникПол")
+        словарь.token_for("person", "Иванов Иван", base="bp", entity="E", field="Сотрудник")
+        варианты = словарь.name_variants()
+    finally:
+        словарь.close()
+    assert "мужской" not in варианты
+    assert "иванов иван" in варианты
+
+
 def test_имена_раздела_names_без_учёта_регистра():
     разобрано = parse_rules_text("names: {СерияПаспорта: doc}", "x.yaml")
     assert разобрано["names"] == {"серияпаспорта": "doc"}
@@ -303,3 +416,45 @@ def test_негодный_каталог_владельца_останавлив
     (дом / "gate" / "доработки.yaml").write_text("names:\n  ап_Поле: keep\n", encoding="utf-8")
     with pytest.raises(PolicyError, match="keep каталогу не доступен"):
         _гейт(tmp_path, дом)
+
+
+# --- страж и короткие значения doc (ревью атакующим, находка 1) ----------------------------
+
+
+@pytest.fixture
+def страж(tmp_path):
+    from odata1c.gate.guard import Guard
+
+    словарь = Dictionary(tmp_path / "словарь.db", СЕКРЕТ)
+    for значение in ("260826", "000123"):
+        словарь.token_for(
+            "doc",
+            значение,
+            base="bp",
+            entity="InformationRegister_ДокументыФизическихЛиц",
+            field="Номер",
+        )
+    словарь.token_for("doc", "45 03 123456", base="bp", entity="E", field="НомерПаспорта")
+    yield Guard(словарь)
+    словарь.close()
+
+
+def test_короткий_номер_документа_не_портит_номера_и_даты(страж):
+    import json
+
+    текст = json.dumps(
+        {"Number": "0000-000123", "Date": "2026-08-26T19:30:11", "Code": "00-000123"},
+        ensure_ascii=False,
+    )
+    assert страж.check(текст, mode="identifiers").text == текст
+
+
+def test_короткий_номер_документа_целой_серией_закрывается(страж):
+    итог = страж.check('{"Комментарий": "паспорт № 260826"}', mode="identifiers")
+    assert "260826" not in итог.text
+    assert "[[doc:" in итог.text
+
+
+def test_серия_и_номер_паспорта_ищутся_и_внутри_текста(страж):
+    итог = страж.check('{"Комментарий": "паспорт 4503123456, выдан"}', mode="identifiers")
+    assert "4503123456" not in итог.text
