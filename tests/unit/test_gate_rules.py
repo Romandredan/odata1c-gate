@@ -68,6 +68,38 @@ def test_ошибка_разбора_не_повторяет_содержимо�
     assert "СекретноеИмя" not in str(ошибка.value)
 
 
+def test_scan_поставки_снимает_только_названия_и_адреса():
+    """Правило каталога проверяется раньше правил реквизитов, и `scan` на поле с ИНН оставил бы
+    его одному детектору (10-значный ИНН без слова «ИНН» рядом тот не ловит). Каталог поставки
+    вправе снимать `scan` только ложные ФИО, названия и адреса."""
+    from odata1c.gate.rules import RuleCatalog
+
+    пустой = RuleCatalog()
+    каталог = package_rules()
+    нарушения = []
+    for имя, правило in каталог.names.items():
+        if правило != "scan":
+            continue
+        без_каталога = classify_field("Document_Прочее", имя, "Edm.String", rules=пустой)
+        if без_каталога is not None and без_каталога[0] not in ("person", "org", "addr"):
+            нарушения.append((имя, без_каталога[0]))
+    for ключ, правило in каталог.fields.items():
+        сущность, _, поле = ключ.rpartition(".")
+        без_каталога = classify_field(сущность, поле, "Edm.String", rules=пустой)
+        if (
+            правило == "scan"
+            and без_каталога is not None
+            and без_каталога[0]
+            not in (
+                "person",
+                "org",
+                "addr",
+            )
+        ):
+            нарушения.append((ключ, без_каталога[0]))
+    assert not нарушения, нарушения
+
+
 def test_имена_раздела_names_без_учёта_регистра():
     разобрано = parse_rules_text("names: {СерияПаспорта: doc}", "x.yaml")
     assert разобрано["names"] == {"серияпаспорта": "doc"}
