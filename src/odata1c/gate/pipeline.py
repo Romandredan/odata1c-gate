@@ -26,6 +26,7 @@ from odata1c.gate.masking import (
 )
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
+from odata1c.gate.rules import load_rules, owner_rules_stamp
 from odata1c.gate.tokens import find_tokens, is_partial_token, parse_token
 from odata1c.gate.unmasking import (
     GateError,
@@ -126,8 +127,12 @@ class BaseGate:
         guard: Guard,
         policy_path: pathlib.Path,
         auto_path: pathlib.Path | None = None,
+        home: pathlib.Path | None = None,
     ) -> None:
         self._base = base
+        # Домашний каталог — ради каталога правил владельца (`<дом>/gate/*.yaml`, ADR-0016); без
+        # него гейт работает по каталогу поставки.
+        self._home = pathlib.Path(home) if home else None
         self._dictionary = dictionary
         self._guard = guard
         self._policy_path = pathlib.Path(policy_path)
@@ -143,12 +148,13 @@ class BaseGate:
 
     def _отметка(self) -> tuple:
         """Отпечаток обоих файлов политики (ADR-0015): владелец правит `policy.yaml`, реиндекс —
-        `policy.auto.yaml`, и перемена любого из них требует пересборки `Masker`."""
+        `policy.auto.yaml`, и перемена любого из них требует пересборки `Masker`. Третья часть —
+        каталог правил владельца (ADR-0016): им пользуются запасные пути классификации."""
 
         def одна(путь: pathlib.Path | None):
             return (путь.stat().st_mtime, путь.stat().st_size) if путь and путь.exists() else None
 
-        return (одна(self._policy_path), одна(self._auto_path))
+        return (одна(self._policy_path), одна(self._auto_path), owner_rules_stamp(self._home))
 
     def refresh(self, *, force: bool = False) -> None:
         """Перечитать политику, если один из файлов изменился с прошлого раза. Политику
@@ -176,7 +182,7 @@ class BaseGate:
             return
         if not force and self._masker is not None:
             self.policy_changed = True
-        policy = load_policy(self._policy_path, self._auto_path)
+        policy = load_policy(self._policy_path, self._auto_path, rules=load_rules(self._home))
         self._policy, self._stamp = policy, отметка
         self._masker = Masker(self._dictionary, policy, mode=self.mode, base=self._base.name)
 
@@ -195,6 +201,7 @@ class BaseGate:
             ),
             path_class=lambda entity, path: inbound_path_class(policy, entity, path, shape=shape),
             shape=shape,
+            rules=policy.rules,
         )
 
     def is_hidden(self, entity: str) -> bool:

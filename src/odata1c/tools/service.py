@@ -696,6 +696,7 @@ class ToolService:
                 guard=self._guard,
                 policy_path=policy_path(self._config.home, base.name),
                 auto_path=auto_policy_path(self._config.home, base.name),
+                home=self._config.home,
             )
             if self._кэшировать(base):
                 self._gates[base.name] = гейт

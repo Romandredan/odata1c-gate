@@ -20,6 +20,7 @@ from odata1c.gate.policy import (
     read_auto,
     strip_auto_section,
 )
+from odata1c.gate.rules import load_rules
 from odata1c.index.reindex import index_path
 from odata1c.index.repository import IndexRepository
 
@@ -52,11 +53,13 @@ def owner_names_for(home: pathlib.Path, base_name: str) -> set[str] | None:
 
 
 def classifier_for(home: pathlib.Path, base: BaseConfig):
-    """Функция-классификатор для reindex: подставляет список названий этой базы (SPEC §6.5)."""
+    """Функция-классификатор для reindex: подставляет список названий этой базы (SPEC §6.5) и
+    каталог правил сущностей дома (ADR-0016)."""
     список = owner_names_for(home, base.name)
+    каталог = load_rules(home)
 
     def классификатор(entity: str, field: str, edm_type: str):
-        return classify_field(entity, field, edm_type, names_for=список)
+        return classify_field(entity, field, edm_type, names_for=список, rules=каталог)
 
     return классификатор
 
@@ -88,7 +91,9 @@ def refresh_policy(home: pathlib.Path, base: BaseConfig) -> list[dict]:
 
     хранилище = IndexRepository(index_path(home, base.name))
     try:
-        собранное = generate_policy(хранилище, names_for=owner_names_for(home, base.name))
+        собранное = generate_policy(
+            хранилище, names_for=owner_names_for(home, base.name), rules=load_rules(home)
+        )
     finally:
         хранилище.close()
 

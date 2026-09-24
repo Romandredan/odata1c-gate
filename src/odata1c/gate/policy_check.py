@@ -19,7 +19,6 @@ import difflib
 import pathlib
 from typing import Literal
 
-from odata1c.gate.field_rules import DEFAULT_NAMES_FOR
 from odata1c.gate.policy import Policy, parse_owner_file
 from odata1c.gate.tokens import CLASSES
 from odata1c.index.repository import IndexRepository
@@ -347,7 +346,7 @@ def render_effective(
     if names_visible:
         if имена_названий is None:
             часть = (
-                f"# названия скрываются у: {', '.join(sorted(DEFAULT_NAMES_FOR))}"
+                f"# названия скрываются у: {', '.join(sorted(policy.rules.names_for))}"
                 f"{_ПОМЕТКА_ВСТРОЕННЫЙ_СПИСОК}"
             )
         else:

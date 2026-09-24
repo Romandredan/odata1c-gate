@@ -23,7 +23,9 @@ import re
 
 import yaml
 
-from odata1c.gate.field_rules import СУЩНОСТИ_ФИЗЛИЦ, classify_field
+from odata1c.gate.errors import PolicyError
+from odata1c.gate.field_rules import classify_field
+from odata1c.gate.rules import RuleCatalog, package_rules
 
 ОТКРЫТЫЕ_ПО_УМОЛЧАНИЮ = ("corr", "bic")
 
@@ -41,18 +43,6 @@ from odata1c.gate.field_rules import СУЩНОСТИ_ФИЗЛИЦ, classify_fie
 МАРШРУТ_ДОКУМЕНТА = re.compile(r"^Document_.+_Маршрут")
 
 
-class PolicyError(Exception):
-    """Ошибка политики базы: неверная разметка `policy.yaml`, раздел неожиданного типа,
-    недопустимое регулярное выражение своего класса. Тот же протокол атрибутов (code, hint), что
-    у `odata1c.config.loader.ConfigError` и `odata1c.index.repository.IndexCorruptError` — CLI и
-    демон различают причину отказа одинаково."""
-
-    def __init__(self, message: str, code: str = "policy_invalid", hint: str = "") -> None:
-        super().__init__(message)
-        self.code = code
-        self.hint = hint
-
-
 @dataclasses.dataclass(slots=True)
 class Policy:
     scan_free_text: bool = True
@@ -62,6 +52,10 @@ class Policy:
     _auto: dict = dataclasses.field(default_factory=dict)
     _custom: dict = dataclasses.field(default_factory=dict)
     _names_for: list | None = None
+    # Действующий каталог правил сущностей базы (ADR-0016): поставка и каталог владельца. Им
+    # пользуются запасные пути классификации маскировщика и обратной подмены — те же правила,
+    # что у авторазметки, которую строил реиндекс.
+    rules: RuleCatalog = dataclasses.field(default_factory=package_rules)
 
     def sensitivity_of(self, entity: str, field: str) -> str | None:
         ключ = f"{entity}.{field}"
@@ -181,7 +175,12 @@ class Policy:
         return dict(self._auto)
 
 
-def load_policy(path: pathlib.Path, auto_path: pathlib.Path | None = None) -> Policy:
+def load_policy(
+    path: pathlib.Path,
+    auto_path: pathlib.Path | None = None,
+    *,
+    rules: RuleCatalog | None = None,
+) -> Policy:
     """Собрать действующую политику базы (ADR-0015): правила владельца (`path`, `policy.yaml`)
     поверх авторазметки (`auto_path`, `policy.auto.yaml`, см. `read_auto`).
 
@@ -211,6 +210,7 @@ def load_policy(path: pathlib.Path, auto_path: pathlib.Path | None = None) -> Po
         _auto=_auto,
         _custom=данные.get("custom") or {},
         _names_for=данные.get("names_for"),
+        rules=rules if rules is not None else package_rules(),
     )
 
 
@@ -265,7 +265,7 @@ def redact_policy(text: str, hidden: set[str]) -> str:
     if hidden and isinstance(адрес, dict) and isinstance(адрес.get("mask_for"), list):
         # Не вычёркивание по одному, а замена целиком — и ВСЕГДА, когда у базы есть скрытые
         # (раунд правок 2 по `stop()` и журналу, пункт 4; поправка ревьюера раунда 5). Список в
-        # сгенерированной политике — имена из `СУЩНОСТИ_ФИЗЛИЦ`, одинаковые у всех баз:
+        # сгенерированной политике — имена каталога правил (ADR-0016), общие для всех баз:
         # дыра в известном эталоне называет скрытое имя так же точно, как само имя. Замена только
         # при пересечении со скрытыми сама сообщала бы, что скрыто одно из них. Тип поля —
         # список — сохранён: разбирающий ресурс не должен споткнуться о смену формы.
@@ -473,8 +473,12 @@ def parse_owner_file(path: pathlib.Path) -> dict:
     return данные
 
 
-def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
-    """Собрать секцию auto по индексу: классификация каждого строкового поля (SPEC §4.3 п. 3)."""
+def generate_policy(
+    index, *, names_for: set[str] | None = None, rules: RuleCatalog | None = None
+) -> dict:
+    """Собрать секцию auto по индексу: классификация каждого строкового поля (SPEC §4.3 п. 3)
+    по каталогу правил базы (`rules`, ADR-0016; без него — каталог поставки)."""
+    каталог = rules if rules is not None else package_rules()
     авто: dict[str, str] = {}
     for имя_сущности in sorted(index.entity_names()):
         описание = index.describe(имя_сущности)
@@ -482,7 +486,7 @@ def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
             continue
         for поле in описание.fields:
             решение = classify_field(
-                имя_сущности, поле["name"], поле["edm_type"], names_for=names_for
+                имя_сущности, поле["name"], поле["edm_type"], names_for=names_for, rules=каталог
             )
             if решение:
                 авто[f"{имя_сущности}.{поле['name']}"] = решение[0]
@@ -493,9 +497,10 @@ def generate_policy(index, *, names_for: set[str] | None = None) -> dict:
             "corr": "keep",
             "bic": "keep",
             # Адрес — персональные данные только у сущностей физлиц (SPEC §6.9): склад, магазин,
-            # банк защиты не требуют. Список сущностей — та же константа, что определяет класс
-            # person слоя 1 (SPEC §6.5), не дублируется здесь отдельно.
-            "addr": {"mask_for": sorted(СУЩНОСТИ_ФИЗЛИЦ)},
+            # банк защиты не требуют. Список — справочники людей каталога (те же, что определяют
+            # класс person слоя 1, SPEC §6.5) и сущности, чьи адреса принадлежат физлицам
+            # (`addr_mask_for` каталога, ADR-0016).
+            "addr": {"mask_for": sorted(каталог.people | каталог.addr_mask_for)},
         },
         "entities": {},
         "fields": {},
