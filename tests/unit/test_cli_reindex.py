@@ -10,8 +10,8 @@ import httpx
 import respx
 
 from odata1c.cli import main
-from odata1c.gate.field_rules import СУЩНОСТИ_ФИЗЛИЦ
 from odata1c.gate.policy import load_policy
+from odata1c.gate.rules import package_rules
 from odata1c.gate.service import auto_policy_path
 
 URL = "http://localhost/ut/odata/standard.odata/"
@@ -58,9 +58,11 @@ def test_reindex_строит_индекс_на_базе_без_индекса(t
     assert путь_политики.exists()
     assert f"создан файл политики владельца: {путь_политики}" in вывод
     # Шаблон не переопределяет defaults.addr — авторазметка сама решает, каким справочникам
-    # людей маскировать адрес (Ruling 36); слияние (merge_defaults) не должно его потерять.
+    # людей маскировать адрес (Ruling 36) и у каких сущностей адреса принадлежат физлицам
+    # (каталог правил, ADR-0016); слияние (merge_defaults) не должно его потерять.
     политика = load_policy(путь_политики, auto_policy_path(home, "ut"))
-    assert политика._defaults["addr"]["mask_for"] == sorted(СУЩНОСТИ_ФИЗЛИЦ)
+    каталог = package_rules()
+    assert политика._defaults["addr"]["mask_for"] == sorted(каталог.people | каталог.addr_mask_for)
 
 
 @respx.mock

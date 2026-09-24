@@ -187,3 +187,87 @@ def test_номер_пфр_в_двух_написаниях_один_токен(
         словарь.close()
     assert с_дефисами == подряд
     assert с_дефисами.startswith("[[sfr:")
+
+
+# --- адрес физлица по имени поля (policy.АДРЕС_ФИЗЛИЦА) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "поле",
+    [
+        "АдресПроживания",
+        "АдресПроживанияУлица",
+        "АдресРегистрацииПоМестуЖительства",
+        "АдресФактическогоПроживания",
+        "АдресМестаПроживания",
+        "АдресПоПрописке",
+        "АдресЗарубежом",
+        "ПредставительАдресМестаЖительства",
+        "МестоРождения",
+    ],
+)
+def test_адрес_физлица_по_имени_поля_закрыт_вне_mask_for(tmp_path, поле):
+    политика = load_policy(tmp_path / "policy.yaml")
+    политика._defaults = {"addr": {"mask_for": ["Catalog_ФизическиеЛица"]}}
+    assert политика.addr_masked("Document_СведенияДляОплатыОтпускаСФР", поле)
+
+
+@pytest.mark.parametrize("поле", ["АдресРегистрацииУстройства", "АдресЮридический", "Адрес"])
+def test_прочие_адреса_вне_mask_for_открыты(tmp_path, поле):
+    политика = load_policy(tmp_path / "policy.yaml")
+    политика._defaults = {"addr": {"mask_for": ["Catalog_ФизическиеЛица"]}}
+    assert not политика.addr_masked("Catalog_Контрагенты", поле)
+
+
+# --- каталог владельца в гейте базы -------------------------------------------------------
+
+
+def _гейт(tmp_path, дом):
+    from odata1c.config.models import BaseConfig, GateSettings
+    from odata1c.gate.guard import Guard
+    from odata1c.gate.pipeline import BaseGate
+
+    (tmp_path / "policy.yaml").write_text("version: 2\n", encoding="utf-8")
+    словарь = Dictionary(tmp_path / "словарь.db", СЕКРЕТ)
+    try:
+        гейт = BaseGate(
+            base=BaseConfig(
+                name="bp",
+                label="bp",
+                url="http://host/base/odata/standard.odata/",
+                user="agent",
+                gate=GateSettings(mode="identifiers+names"),
+            ),
+            dictionary=словарь,
+            guard=Guard(словарь),
+            policy_path=tmp_path / "policy.yaml",
+            home=дом,
+        )
+    except Exception:
+        словарь.close()
+        raise
+    return гейт, словарь
+
+
+def test_гейт_базы_видит_каталог_владельца_и_перечитывает_его(tmp_path):
+    дом = tmp_path / "дом"
+    дом.mkdir()
+    гейт, словарь = _гейт(tmp_path, дом)
+    try:
+        assert гейт._policy.rules is package_rules()
+        (дом / "gate").mkdir()
+        (дом / "gate" / "доработки.yaml").write_text(
+            "names:\n  ап_ПаспортСтрокой: doc\n", encoding="utf-8"
+        )
+        гейт.refresh()
+        assert гейт._policy.rules.name_rule("ап_ПаспортСтрокой") == "doc"
+    finally:
+        словарь.close()
+
+
+def test_негодный_каталог_владельца_останавливает_гейт_ошибкой_политики(tmp_path):
+    дом = tmp_path / "дом"
+    (дом / "gate").mkdir(parents=True)
+    (дом / "gate" / "доработки.yaml").write_text("names:\n  ап_Поле: keep\n", encoding="utf-8")
+    with pytest.raises(PolicyError, match="keep каталогу не доступен"):
+        _гейт(tmp_path, дом)
