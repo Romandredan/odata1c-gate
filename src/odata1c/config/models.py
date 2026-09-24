@@ -91,6 +91,13 @@ class GateSettings(BaseModel):
 
     mode: GateMode = "identifiers+names"
 
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _off_без_кавычек(cls, value):
+        # YAML 1.1 (PyYAML) читает `off` без кавычек как `false`; `mode: off` в записи базы —
+        # ровно та форма, что в документации и в записи `base add --gate off`.
+        return "off" if value is False else value
+
     @model_validator(mode="before")
     @classmethod
     def _переехавшие_ключи(cls, данные):

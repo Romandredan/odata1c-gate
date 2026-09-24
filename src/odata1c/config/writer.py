@@ -21,7 +21,7 @@ import time
 import yaml
 
 from odata1c.config.home import base_dir
-from odata1c.config.loader import ConfigError
+from odata1c.config.loader import УМОЛЧАНИЯ_РОЛЕЙ, ConfigError
 
 _log = logging.getLogger(__name__)
 
@@ -94,21 +94,19 @@ def ensure_policy_template(home: pathlib.Path, base_name: str) -> bool:
     # concurrency: 2                 # одновременных запросов к этой базе от всех сессий
     # ib_session: true               # держать сеанс 1С (IBSession) между запросами
 
-    # --- запись (умолчание роли {role}) ---
+    # --- запись этой базы (умолчание роли {role}) ---
 {write_line}
     # permissions:
     #   post_documents: true         # действия Post/Unpost из $metadata
     #   mark_deletion: true          # PATCH DeletionMark у объектов
-    #   independent_register_delete: false   # DELETE записей регистров сведений без регистратора
+{register_delete_line}
     #   allow_entities: []           # если не пусто — запись только в эти сущности
     #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
     #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
-    #   commit_limit: 20             # коммитов за 10 минут на сессию; 0 = без лимита
+{commit_limit_line}
 
-    # --- гейт: скрывать ли (умолчание роли {role}) ---
-    # gate:
-    #   mode: identifiers+names      # off | identifiers | identifiers+names
-    #                                # что именно скрывать и что открыть: bases/{name}/policy.yaml
+    # --- гейт этой базы: скрывать ли (умолчание роли {role}: {role_gate}) ---
+{gate_lines}
 
     # --- рецепты ---
     # recipes: bases/{name}/recipes.yaml   # путь относительно домашнего каталога
@@ -124,13 +122,49 @@ def _скаляр(value: str) -> str:
     return строка[len("значение: ") :].rstrip("\n")
 
 
+def _с_комментарием(код: str, комментарий: str) -> str:
+    """Строка записи с комментарием в той же колонке, что у соседних строк шаблона."""
+    return f"{код}{' ' * max(37 - len(код), 3)}# {комментарий}"
+
+
 def render_base(name: str, values: dict) -> str:
-    write = values.get("write")
+    # Закомментированные примеры показывают умолчание роли ЭТОЙ базы (SPEC §3.2): раскомментировать
+    # строку, не меняя значения, — ничего не изменить в поведении базы. Активная строка — только
+    # там, где запись задаёт значение, отличное от умолчания роли (`write`), или владелец задал
+    # уровень гейта явно (`base add --gate`): тогда он не зависит от последующей смены роли.
+    role = values.get("role", "prod")
+    умолчания = УМОЛЧАНИЯ_РОЛЕЙ.get(role, УМОЛЧАНИЯ_РОЛЕЙ["prod"])
+    write = values.get("write", умолчания["write"])
+    по_роли = "true" if умолчания["write"] else "false"
     write_line = (
-        "    write: true                    # разрешить пишущие тулы"
-        if write
-        else "    # write: false                 # разрешить пишущие тулы"
+        _с_комментарием(f"    write: {'true' if write else 'false'}", f"по роли — {по_роли}")
+        if write != умолчания["write"]
+        else _с_комментарием(f"    # write: {по_роли}", "разрешить пишущие тулы")
     )
+    разрешения = умолчания["permissions"]
+    удаление = "true" if разрешения["independent_register_delete"] else "false"
+    register_delete_line = _с_комментарием(
+        f"    #   independent_register_delete: {удаление}",
+        "DELETE записей регистров сведений без регистратора",
+    )
+    commit_limit_line = _с_комментарием(
+        f"    #   commit_limit: {разрешения['commit_limit']}",
+        "коммитов за 10 минут на сессию; 0 = без лимита",
+    )
+    гейт_роли = умолчания["gate"]["mode"]
+    гейт = (values.get("gate") or {}).get("mode")
+    уровни = "off | identifiers | identifiers+names"
+    gate_lines = "\n".join(
+        [
+            _с_комментарием(f"      mode: {гейт}", f"{уровни}; задан для этой базы явно")
+            if гейт
+            else _с_комментарием(f"    #   mode: {гейт_роли}", уровни),
+            _с_комментарием(
+                "    #", f"что именно скрывать и что открыть: bases/{name}/policy.yaml"
+            ),
+        ]
+    )
+    gate_lines = ("    gate:\n" if гейт else "    # gate:\n") + gate_lines
     # Библиотека рецептов конфигурации (ADR-0011, поправка 2026-09-14, design §4b): значение
     # приходит от `base add --recipes <config>`, а не читается отдельным полем формы. Команда
     # по-прежнему копирует шаблон в recipes.yaml (design §4b, строка 130) — этой строкой она
@@ -150,8 +184,12 @@ def render_base(name: str, values: dict) -> str:
         url=_скаляр(values["url"]),
         user=_скаляр(values.get("user", "")),
         password=_скаляр(values.get("password", "")),
-        role=values.get("role", "prod"),
+        role=role,
+        role_gate=гейт_роли,
         write_line=write_line,
+        register_delete_line=register_delete_line,
+        commit_limit_line=commit_limit_line,
+        gate_lines=gate_lines,
         config_line=config_line,
     )
 
