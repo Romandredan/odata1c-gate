@@ -14,9 +14,11 @@ import sqlite3
 import pytest
 from conftest import без_класса_пути
 
+from odata1c.config.models import BaseConfig, GateSettings
 from odata1c.gate.dictionary import Dictionary, name_variants_of
 from odata1c.gate.guard import Guard
 from odata1c.gate.masking import Masker
+from odata1c.gate.pipeline import BaseGate
 from odata1c.gate.policy import load_policy
 from odata1c.gate.revealed import RevealedValues
 from odata1c.gate.unmasking import Unmasker
@@ -256,10 +258,86 @@ def test_отбор_по_токену_закрывает_голое_слово(�
         {"Description": "Мост", "Комментарий": "Мост просит сверку"}, ensure_ascii=False
     )
 
-    с_отбором = json.loads(
-        Guard(словарь).check(ответ, mode="identifiers+names", revealed=раскрыто).text
-    )
-    без_отбора = json.loads(Guard(словарь).check(ответ, mode="identifiers+names").text)
+    рез_с_отбором = Guard(словарь).check(ответ, mode="identifiers+names", revealed=раскрыто)
+    рез_без_отбора = Guard(словарь).check(ответ, mode="identifiers+names")
+    с_отбором = json.loads(рез_с_отбором.text)
+    без_отбора = json.loads(рез_без_отбора.text)
 
     assert с_отбором["Комментарий"] == f"{токен} просит сверку"
     assert без_отбора["Комментарий"] == "Мост просит сверку"
+    assert рез_с_отбором.warnings == ["guard_replaced"]
+    assert рез_без_отбора.warnings == []
+
+
+def test_отбор_закрывает_голое_слово_но_не_внутри_другого(среда):
+    """Дополняет `test_раскрытое_название_внутри_слова_не_заменяется`
+    (test_gate_word_boundaries.py, Ruling 115) вариантом на голом «РУДН»: при отборе слой
+    раскрытого закрывает отдельно стоящее написание, но не рвёт «сотрудников» — граница слова
+    действует и у раскрытого значения; без отбора маскировщик голое слово не ищет вовсе, и текст
+    открыт целиком (отступление 2 constraints.md)."""
+    словарь, _, назвать = среда
+    токен = назвать("РУДН")
+    текст = "график работы сотрудников; звонили из РУДН"
+    тело = json.dumps({"Комментарий": текст}, ensure_ascii=False)
+
+    раскрыто = RevealedValues()
+    раскрыто.add("РУДН", token=токен)
+    с_отбором = json.loads(
+        Guard(словарь).check(тело, mode="identifiers+names", revealed=раскрыто).text
+    )
+    без_отбора = json.loads(Guard(словарь).check(тело, mode="identifiers+names").text)
+
+    assert с_отбором["Комментарий"] == f"график работы сотрудников; звонили из {токен}"
+    assert без_отбора["Комментарий"] == текст
+
+
+def test_отбор_по_токену_голое_слово_вся_цепочка_basegate(tmp_path):
+    """Ruling 115, отступление 2 — та же строгость видна по настоящей цепочке гейта
+    (`BaseGate.inbound_filter` → ранний проход `scrubber().load` → `mask` → `finish`), не только
+    у `Guard.check` напрямую: с отбором по токену голое слово закрыто, и `finish` пишет
+    `guard_replaced` в `warnings` — строкой со счётом замен (`BaseGate.finish` формирует её сам),
+    а не голым `"guard_replaced"`, как у `Guard.check`."""
+    (tmp_path / "policy.yaml").write_text(ПОЛИТИКА, encoding="utf-8")
+    словарь = Dictionary(tmp_path / "gate.sqlite", СЕКРЕТ)
+    try:
+        токен = словарь.token_for("org", "Альфа", base="ut", entity=К, field="Description")
+        врата = BaseGate(
+            base=BaseConfig(
+                name="ut",
+                label="ut",
+                url="http://host/base/odata/standard.odata/",
+                user="agent",
+                gate=GateSettings(mode="identifiers+names"),
+            ),
+            dictionary=словарь,
+            guard=Guard(словарь),
+            policy_path=tmp_path / "policy.yaml",
+        )
+
+        def ответ(набор: RevealedValues) -> dict:
+            тело = json.dumps({"Комментарий": "Ошибка: Альфа"}, ensure_ascii=False)
+            данные = врата.scrubber(набор).load(тело)
+            маска = врата.mask(
+                данные,
+                entity=К,
+                resolve=lambda сущность, ключ: None,
+                hidden=lambda сущность: False,
+                revealed=набор,
+                shape=lambda _: None,
+            )
+            текст = врата.finish({"item": маска.data, "warnings": []}, набор)
+            return json.loads(текст)
+
+        набор_с_отбором = RevealedValues()
+        врата.inbound_filter(
+            f"Description eq '{токен}'", entity=К, revealed=набор_с_отбором, shape=lambda _: None
+        )
+        с_отбором = ответ(набор_с_отбором)
+        без_отбора = ответ(RevealedValues())
+
+        assert с_отбором["item"]["Комментарий"] == f"Ошибка: {токен}"
+        assert any("guard_replaced" in предупреждение for предупреждение in с_отбором["warnings"])
+        assert без_отбора["item"]["Комментарий"] == "Ошибка: Альфа"
+        assert без_отбора["warnings"] == []
+    finally:
+        словарь.close()
