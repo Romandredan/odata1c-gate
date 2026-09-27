@@ -292,7 +292,7 @@ def test_base_add_пароль_не_попадает_в_вывод(tmp_path, mon
 
 
 def test_base_add_пишет_корень_публикации_и_печатает_адрес_odata(tmp_path, monkeypatch, capsys):
-    """Ruling 106: владелец вводит адрес из браузера, в bases.yaml ложится корень публикации,
+    """Ruling 107: владелец вводит адрес из браузера, в bases.yaml ложится корень публикации,
     а хвост стандартного интерфейса OData достраивает шлюз."""
     home = tmp_path / "home"
     _ввод_для_add(monkeypatch, url="https://server/base/ru_RU/")

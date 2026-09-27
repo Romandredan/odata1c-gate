@@ -278,12 +278,12 @@ CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base l
    ключ `--home <путь>` (он есть у всех команд) или переменная окружения `ODATA1C_HOME`.
 2. **База.** `uv run odata1c base add trade_dev --role dev --recipes ut` спрашивает адрес
    публикации (как в браузере, `https://server/base`; хвост `/odata/standard.odata/` шлюз
-   достраивает сам, Ruling 106), подпись, пользователя и пароль 1С и
+   достраивает сам, Ruling 107), подпись, пользователя и пароль 1С и
    дописывает запись в `bases.yaml`. Роль задаёт умолчания: `prod` — гейт `identifiers+names`
    и только чтение, `test` — `identifiers`, `dev` — гейт выключен (`off`) и запись разрешена;
    явные поля записи умолчания роли перекрывают. Все поля записи, включая уровень гейта, —
    свои у каждой базы; `--gate off|identifiers|identifiers+names` пишет уровень в запись базы
-   вместо умолчания роли (Ruling 107). `--recipes ut|bp|zup` кладёт в базу шаблон
+   вместо умолчания роли (Ruling 108). `--recipes ut|bp|zup` кладёт в базу шаблон
    готовых запросов из поставки — без него файл рецептов остаётся пустым и тул `odata1c_recipe`
    отдаёт пустой перечень.
 3. **Проверка и индекс.** `uv run odata1c base test trade_dev` проверяет соединение;

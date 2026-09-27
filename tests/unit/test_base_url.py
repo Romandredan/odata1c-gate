@@ -1,5 +1,5 @@
 """Адрес базы в bases.yaml: корень публикации 1С, хвост `/odata/standard.odata/` шлюз достраивает
-сам (SPEC §3.1, Ruling 106)."""
+сам (SPEC §3.1, Ruling 107)."""
 
 import pytest
 
