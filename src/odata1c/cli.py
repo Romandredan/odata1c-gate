@@ -52,6 +52,7 @@ from odata1c.gate.policy_check import (
     suggest_names,
 )
 from odata1c.gate.policy_edit import hide_entity, set_field_class
+from odata1c.gate.rules import load_rules
 from odata1c.gate.service import (
     auto_policy_path,
     classifier_for,
@@ -487,7 +488,7 @@ def cmd_policy_show(home: pathlib.Path, name: str) -> int:
     # (правка по итогам ревью задачи 9). PolicyError уходит наверх — форматирует общий перехват
     # в main() (код + подсказка).
     owner_data = parse_owner_file(путь)
-    policy = load_policy(путь, auto_policy_path(home, base.name))
+    policy = load_policy(путь, auto_policy_path(home, base.name), rules=load_rules(home))
     репозиторий = _открыть_индекс_для_политики(home, base.name)
     try:
         # Полный набор скрытых (корни + поддерево) — обязанность вызывающего (находка 1 ревью

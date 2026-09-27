@@ -1,8 +1,239 @@
-# Рецепты для типовой конфигурации «Бухгалтерия предприятия».
+# Рецепты для типовой конфигурации «Бухгалтерия предприятия 3.0».
 #
-# Пока пусто: нет базы БП, на которой можно сверить имена регистров, виртуальных таблиц и полей,
-# а рецепт с невыверенными именами хуже отсутствия рецепта — он даёт модели уверенную подсказку,
-# по которой база отвечает «сущность не найдена». Заполняется, когда появится база для проверки:
-# образец разметки — ut.yaml рядом.
+# Имена регистров, виртуальных таблиц и полей сверены с полным описанием метаданных реальной
+# базы БП КОРП 3.0 (2026-09-25), каждый рецепт выполнен на ней через шлюз
+# (tools/probes/bp_recipes_check.py). Состав полей у доработанной конфигурации может отличаться:
+# рецепт, сущности которого в базе нет, odata1c_recipe помечает `applicable: false`, и его
+# достаточно поправить в своём bases/<база>/recipes.yaml.
+#
+# Подстановка `{имя}` ставится ТОЛЬКО в позиции литерала и без кавычек: значение подставляется уже
+# готовым литералом по типу параметра. Условия перечисляются списком и склеиваются через `and`;
+# условие с незаданным необязательным параметром из запроса исчезает целиком.
+#
+# Регистр бухгалтерии `Хозрасчетный`: счёт в отборе — только после расчёта (`filter`), путём
+# `Account/Code` по коду плана счетов («62.01», «51»). Внутри виртуальной таблицы (`Condition`)
+# 1С отбор по счёту не принимает — для него у таблицы свой параметр `AccountCondition`, который
+# рецепту недоступен (выражение отбора в одном значении прошло бы мимо разбора гейта).
+# Субконто приходят полями `ExtDimension1..3` со ссылкой и типом (`…_Type`): у счетов расчётов
+# 60 и 62 первое — контрагент, второе — договор, третье — документ расчётов.
 version: 1
-recipes: {}
+recipes:
+  account_balance:
+    title: Остатки по счёту с аналитикой
+    description: >-
+      Сальдо счёта бухгалтерского учёта на момент с разбивкой по субконто: СуммаBalanceDr —
+      дебетовое, СуммаBalanceCr — кредитовое. Счёт — код плана счетов строкой («62.01», «51»,
+      «10.01»). Субконто — ссылки ExtDimension1..3 с типом в ExtDimension1_Type.._Type.
+    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      account: { type: string, required: true, description: "код счёта, например 62.01" }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq {account}
+    select:
+      - Account_Key
+      - Организация_Key
+      - ExtDimension1
+      - ExtDimension1_Type
+      - ExtDimension2
+      - ExtDimension2_Type
+      - ExtDimension3
+      - ExtDimension3_Type
+      - Валюта_Key
+      - Подразделение_Key
+      - СуммаBalanceDr
+      - СуммаBalanceCr
+      - ВалютнаяСуммаBalance
+      - КоличествоBalance
+    top: 200
+
+  trial_balance:
+    title: Оборотно-сальдовая ведомость по счёту
+    description: >-
+      Сальдо на начало, обороты и сальдо на конец интервала по счёту бухгалтерского учёта с
+      разбивкой по субконто. Счёт — код плана счетов строкой. Без счёта ведомость по всем счетам
+      слишком велика — указывайте счёт.
+    entity: AccountingRegister_Хозрасчетный_BalanceAndTurnovers
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      account: { type: string, required: true, description: "код счёта, например 60.01" }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      StartPeriod: "{start}"
+      EndPeriod: "{end}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq {account}
+    select:
+      - Account_Key
+      - Организация_Key
+      - ExtDimension1
+      - ExtDimension1_Type
+      - ExtDimension2
+      - ExtDimension2_Type
+      - СуммаOpeningBalanceDr
+      - СуммаOpeningBalanceCr
+      - СуммаTurnoverDr
+      - СуммаTurnoverCr
+      - СуммаClosingBalanceDr
+      - СуммаClosingBalanceCr
+    top: 200
+
+  debtors:
+    title: Дебиторская задолженность покупателей
+    description: >-
+      Долг покупателей и заказчиков (счёт 62.01) на момент: дебетовое сальдо по контрагенту
+      (ExtDimension1) и договору (ExtDimension2). Авансы полученные — счёт 62.02 в account_balance.
+    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq '62.01'
+      - СуммаBalanceDr gt 0
+    select:
+      - Организация_Key
+      - ExtDimension1
+      - ExtDimension1_Type
+      - ExtDimension2
+      - ExtDimension2_Type
+      - СуммаBalanceDr
+    top: 200
+
+  payables:
+    title: Кредиторская задолженность поставщикам
+    description: >-
+      Долг перед поставщиками и подрядчиками (счёт 60.01) на момент: кредитовое сальдо по
+      контрагенту (ExtDimension1) и договору (ExtDimension2). Авансы выданные — счёт 60.02 в
+      account_balance.
+    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq '60.01'
+      - СуммаBalanceCr gt 0
+    select:
+      - Организация_Key
+      - ExtDimension1
+      - ExtDimension1_Type
+      - ExtDimension2
+      - ExtDimension2_Type
+      - СуммаBalanceCr
+    top: 200
+
+  money_bank:
+    title: Деньги на расчётных счетах
+    description: >-
+      Остаток на счёте 51 на момент по банковским счетам организации (ExtDimension1 — ссылка на
+      банковский счёт).
+    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq '51'
+    select:
+      - Организация_Key
+      - ExtDimension1
+      - ExtDimension1_Type
+      - СуммаBalance
+    top: 200
+
+  money_cash:
+    title: Деньги в кассе
+    description: Остаток в кассе организации (счёт 50.01) на момент.
+    entity: AccountingRegister_Хозрасчетный_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - Account/Code eq '50.01'
+    select:
+      - Организация_Key
+      - Подразделение_Key
+      - СуммаBalance
+    top: 200
+
+  sales:
+    title: Реализация за период
+    description: >-
+      Проведённые документы реализации товаров и услуг за интервал: номер, дата, контрагент,
+      договор, сумма документа. Товары и услуги — табличные части документа.
+    entity: Document_РеализацияТоваровУслуг
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      counterparty: { type: guid, required: false, description: Ref_Key контрагента }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    filter:
+      - Date ge {start}
+      - Date le {end}
+      - Posted eq true
+      - Контрагент_Key eq {counterparty}
+      - Организация_Key eq {organization}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - ВидОперации
+      - Организация_Key
+      - Контрагент_Key
+      - ДоговорКонтрагента_Key
+      - СуммаДокумента
+    orderby: Date desc
+    top: 200
+
+  purchases:
+    title: Поступление за период
+    description: >-
+      Проведённые документы поступления товаров и услуг за интервал: номер и дата документа
+      поставщика, контрагент, договор, сумма документа.
+    entity: Document_ПоступлениеТоваровУслуг
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      counterparty: { type: guid, required: false, description: Ref_Key контрагента }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    filter:
+      - Date ge {start}
+      - Date le {end}
+      - Posted eq true
+      - Контрагент_Key eq {counterparty}
+      - Организация_Key eq {organization}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - НомерВходящегоДокумента
+      - ДатаВходящегоДокумента
+      - ВидОперации
+      - Организация_Key
+      - Контрагент_Key
+      - ДоговорКонтрагента_Key
+      - СуммаДокумента
+    orderby: Date desc
+    top: 200

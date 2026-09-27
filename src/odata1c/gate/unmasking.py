@@ -49,6 +49,7 @@ from odata1c.gate.dictionary import НУМЕРУЕМЫЕ, Dictionary
 from odata1c.gate.field_rules import classify_field
 from odata1c.gate.filter_lexer import Token, lex_filter
 from odata1c.gate.revealed import RevealedValues, ScrubbedText
+from odata1c.gate.rules import RuleCatalog
 from odata1c.gate.tokens import CLASSES, TOKEN_RE, find_tokens, is_partial_token, parse_token
 
 ФУНКЦИИ_ПОДСТРОКИ = ("substringof", "startswith", "endswith")
@@ -149,12 +150,16 @@ class Unmasker:
         field_class: Callable[..., str | None],
         path_class: Callable[[str, str], str | None],
         shape: contact_info.Shape | None = None,
+        rules: RuleCatalog | None = None,
     ) -> None:
         self._dictionary = dictionary
         self._base = base
         self._field_class = field_class
         self._path_class = path_class
         self._shape = shape
+        # Каталог правил сущностей базы (ADR-0016) для запасной классификации по имени поля —
+        # тот же, по которому реиндекс строил авторазметку; без него — каталог поставки.
+        self._rules = rules
         # Ruling 54: где идёт раскрытие и порядковые номера токенов этого вызова — отказ называет
         # токен так, а не повторяет его (`_какой`). `Unmasker` строится на один вызов
         # (`BaseGate._обратная_подмена`), поэтому состояние не переживает запроса.
@@ -1350,14 +1355,19 @@ class Unmasker:
         # защищается ни на одном уровне (инвариант 6). Ключи ссылок и их типы запасной
         # классификации не подлежат; явный класс из политики (`field_class`) по-прежнему главный.
         if класс is None and not _ссылочный_ключ(сегмент):
-            найдено = classify_field(entity, сегмент, "Edm.String", names_for=set())
+            найдено = classify_field(
+                entity, сегмент, "Edm.String", names_for=set(), rules=self._rules, strict=strict
+            )
             класс = найдено[0] if найдено is not None else None
         if класс is not None:
             return класс
         if len(сегменты) < 2:
             return None
         контейнер = сегменты[-2]
-        if classify_field(entity, контейнер, "Edm.String", names_for=set()) is not None:
+        if (
+            classify_field(entity, контейнер, "Edm.String", names_for=set(), rules=self._rules)
+            is not None
+        ):
             raise GateError(
                 "filter_syntax",
                 "класс конечного поля пути не определён: промежуточный сегмент указывает на "

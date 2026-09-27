@@ -144,7 +144,12 @@ def _базовый_класс_поля_политики(
         # разметка полей есть и запасной слой не нужен), поэтому включается он только под
         # `strict`.
         найдено = classify_field(
-            entity, field, "Edm.String", names_for={entity} if strict else set()
+            entity,
+            field,
+            "Edm.String",
+            names_for={entity} if strict else set(),
+            rules=policy.rules,
+            strict=strict,
         )
         if найдено is not None:
             класс = найдено[0]
