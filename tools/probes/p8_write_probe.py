@@ -50,6 +50,7 @@ import httpx
 import yaml
 
 from odata1c.client1c.client import _собрать_запрос, _экранировать_путь
+from odata1c.config.models import адрес_odata
 
 БАЗА = "trade_dev"
 СЕГОДНЯ = datetime.date.today().isoformat()
@@ -134,10 +135,10 @@ class Публикация:
         СКРЫТЬ.добавить([запись["url"], запись["user"], запись["password"]])
         # Хост и путь публикации — отдельно от адреса целиком: вывод режется по длине раньше, чем
         # проходит через `Скрыватель`, и обрезанный адрес целиком уже не совпадает.
-        адрес = httpx.URL(запись["url"])
+        адрес = httpx.URL(адрес_odata(запись["url"]))
         СКРЫТЬ.добавить([адрес.host, адрес.path.strip("/").split("/")[0]])
         self._http = httpx.Client(
-            base_url=запись["url"],
+            base_url=адрес_odata(запись["url"]),
             auth=(запись["user"], запись["password"]),
             timeout=ТАЙМАУТ_С,
             headers={"Accept": "application/json"},

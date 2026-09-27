@@ -51,6 +51,7 @@ import yaml
 from mcp import StdioServerParameters, stdio_client
 from mcp.client.session import ClientSession
 
+from odata1c.config.models import адрес_odata
 from odata1c.gate.tokens import TOKEN_RE, normalize_value
 
 БАЗА = "trade_dev"
@@ -370,7 +371,7 @@ async def main() -> int:
 
     рабочий = pathlib.Path(аргументы.home)
     настройки = yaml.safe_load((рабочий / "bases.yaml").read_text(encoding="utf-8"))["bases"][БАЗА]
-    адрес = настройки["url"].rstrip("/") + "/"
+    адрес = адрес_odata(настройки["url"])
     сырой = httpx.Client(auth=(настройки["user"], настройки["password"]), timeout=120)
     прокси = Прокси(адрес)
     дом = собрать_дом(рабочий, прокси.адрес)
