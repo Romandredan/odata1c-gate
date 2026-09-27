@@ -8,9 +8,14 @@
 цифрой или дефисом, полное ФИО и значения в полях с классом закрываются как прежде.
 """
 
+import sqlite3
+
 import pytest
 
-from odata1c.gate.dictionary import name_variants_of
+from odata1c.gate.dictionary import Dictionary, name_variants_of
+
+СЕКРЕТ = "секрет ровно для тестов подмены!!".encode()
+К = "Catalog_Контрагенты"
 
 
 @pytest.mark.parametrize(
@@ -38,3 +43,72 @@ from odata1c.gate.dictionary import name_variants_of
 )
 def test_ключи_одиночного_слова(название, ожидаемые):
     assert name_variants_of(название) == ожидаемые
+
+
+# ---------------------------------------------------------------------------------------------
+# Задача 2: словарь версии 4 — пересчёт ключей прежних версий, отсев голого ключа прежней версии
+# шлюза (отступление 3 constraints.md)
+# ---------------------------------------------------------------------------------------------
+
+
+def _словарь_с_голым_ключом(путь, версия: int) -> str:
+    """Словарь, где у `ООО "Мост"` лежат ключи прежней версии (голое `мост`) при заданной
+    `user_version`."""
+    словарь = Dictionary(путь, СЕКРЕТ)
+    токен = словарь.token_for("org", 'ООО "Мост"', base="ut", entity=К, field="Description")
+    словарь.close()
+    соединение = sqlite3.connect(путь)
+    with соединение:
+        соединение.execute("DELETE FROM name_variants WHERE token = ?", (токен,))
+        соединение.executemany(
+            "INSERT INTO name_variants (token, variant_norm) VALUES (?, ?)",
+            [(токен, 'ооо "мост"'), (токен, "мост")],
+        )
+        соединение.execute(f"PRAGMA user_version = {версия}")
+    соединение.close()
+    return токен
+
+
+НОВЫЕ_КЛЮЧИ = {'ооо "мост"', '"мост"', '"мост', "ооо мост", 'ооо"мост"'}
+
+
+def test_словарь_версии_3_пересчитывается(tmp_path):
+    путь = tmp_path / "gate.sqlite"
+    токен = _словарь_с_голым_ключом(путь, 3)
+
+    словарь = Dictionary(путь, СЕКРЕТ)
+    try:
+        assert словарь.name_variants() == dict.fromkeys(НОВЫЕ_КЛЮЧИ, токен)
+        версия = словарь._connection.execute("PRAGMA user_version").fetchone()[0]
+        assert версия == 4
+    finally:
+        словарь.close()
+
+
+def test_голое_слово_прежней_версии_после_пересчёта(tmp_path):
+    """Прежняя версия шлюза (демон плагина 0.2.x на том же доме) дописала голый ключ уже при
+    `user_version` 4: пересчёт по версии его не снимет. Чтение ключей его отсекает, а поиск
+    устаревших ключей пересобирает варианты токена."""
+    путь = tmp_path / "gate.sqlite"
+    токен = _словарь_с_голым_ключом(путь, 4)
+
+    словарь = Dictionary(путь, СЕКРЕТ)
+    try:
+        assert словарь.name_variants() == dict.fromkeys(НОВЫЕ_КЛЮЧИ, токен)
+        assert "мост" not in словарь.ambiguous_name_variants()
+    finally:
+        словарь.close()
+
+
+def test_голое_слово_не_идёт_в_поиск_даже_из_таблицы(tmp_path):
+    """Защита на чтении: голый ключ, вписанный в таблицу мимо `name_variants_of` у открытого
+    словаря, в автомат не идёт."""
+    словарь = Dictionary(tmp_path / "gate.sqlite", СЕКРЕТ)
+    try:
+        токен = словарь.token_for("org", "ООО Мост", base="ut", entity=К, field="Description")
+        словарь._connection.execute(
+            "INSERT INTO name_variants (token, variant_norm) VALUES (?, 'мост')", (токен,)
+        )
+        assert "мост" not in словарь.name_variants()
+    finally:
+        словарь.close()
