@@ -26,7 +26,13 @@ from odata1c.client1c.errors import OdataError
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
-from odata1c.config.models import ИМЯ_БАЗЫ, ИМЯ_КОНФИГУРАЦИИ, BaseConfig
+from odata1c.config.models import (
+    ИМЯ_БАЗЫ,
+    ИМЯ_КОНФИГУРАЦИИ,
+    BaseConfig,
+    адрес_odata,
+    корень_публикации,
+)
 from odata1c.config.writer import (
     append_base,
     ensure_gate_secret,
@@ -122,6 +128,12 @@ def main(argv: list[str] | None = None) -> int:
     add = подкоманды.add_parser("add", help="добавить базу", parents=[домашний])
     add.add_argument("name", help="имя базы: строчные латинские буквы, цифры, подчёркивание")
     add.add_argument("--role", choices=("prod", "test", "dev"), default="prod")
+    add.add_argument(
+        "--gate",
+        choices=("off", "identifiers", "identifiers+names"),
+        help="уровень гейта этой базы; без ключа — по роли (prod: identifiers+names, "
+        "test: identifiers, dev: off)",
+    )
     add.add_argument(
         "--recipes",
         choices=("ut", "bp", "zup"),
@@ -236,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.команда == "base" and args.подкоманда == "test":
             return cmd_base_test(home, args.name)
         if args.команда == "base" and args.подкоманда == "add":
-            return cmd_base_add(home, args.name, args.role, args.recipes)
+            return cmd_base_add(home, args.name, args.role, args.recipes, args.gate)
         if args.команда == "base" and args.подкоманда == "import":
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
@@ -947,8 +959,13 @@ def cmd_reveal(
     return 0
 
 
-def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) -> int:
-    """`odata1c base add <имя> [--role] [--recipes ut|bp|zup]`.
+def cmd_base_add(
+    home: pathlib.Path, name: str, role: str, recipes: str | None, gate: str | None = None
+) -> int:
+    """`odata1c base add <имя> [--role] [--gate] [--recipes ut|bp|zup]`.
+
+    `--gate <уровень>` пишет в запись базы `gate: mode: <уровень>` — уровень гейта ЭТОЙ базы
+    поверх умолчания роли; без ключа уровень берётся по роли (SPEC §3.2).
 
     `--recipes <config>` (M3 задача 3, ADR-0011 amended, design §4b) пишет `config: <config>` в
     `bases.yaml` — это и есть новое: библиотеку `~/.claude/odata1c/recipes/<config>/` и шаблон
@@ -969,8 +986,15 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
             f"база «{name}» уже описана в bases.yaml",
             hint="поправьте существующую запись вручную или выберите другое имя",
         )
-    print(f"добавляю базу «{name}» с ролью {role}")
-    url = input("адрес (оканчивается на /odata/standard.odata/): ").strip()
+    print(f"добавляю базу «{name}» с ролью {role}" + (f" и уровнем гейта {gate}" if gate else ""))
+    url = input("адрес публикации 1С, как в браузере (например https://server/base): ").strip()
+    try:
+        # В файл идёт корень публикации, хвост OData достраивает сам шлюз (Ruling 107); адрес
+        # проверяется до вопросов о пользователе и пароле, чтобы не вводить их зря.
+        url = корень_публикации(url)
+    except ValueError as ошибка:
+        raise ConfigError(f"база «{name}» описана неверно: {ошибка}") from ошибка
+    print(f"адрес OData: {_без_учётных_данных(адрес_odata(url))}")
     values = {
         "label": input("подпись для модели: ").strip() or name,
         "url": url,
@@ -979,6 +1003,8 @@ def cmd_base_add(home: pathlib.Path, name: str, role: str, recipes: str | None) 
         "role": role,
         "config": recipes,
     }
+    if gate:
+        values["gate"] = {"mode": gate}
     try:
         BaseConfig(name=name, **values)  # проверка имени и адреса до записи в файл
     except pydantic.ValidationError as ошибка:

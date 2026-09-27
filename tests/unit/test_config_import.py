@@ -106,7 +106,7 @@ def test_запись_добавляется_с_комментариями(tmp_p
     assert "# concurrency:" in текст
     # Регресс: заготовка была беднее шаблона SPEC §3.1 — не хватало блока про рецепты,
     # списка разрешённых сущностей и лимита операций в правах, настроек гейта.
-    assert "# --- рецепты ---" in текст
+    assert "# --- рецепты" in текст
     assert "recipes: bases/ut/recipes.yaml" in текст
     assert "#   allow_entities:" in текст
     assert "#   commit_limit:" in текст

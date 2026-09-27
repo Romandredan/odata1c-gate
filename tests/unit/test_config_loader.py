@@ -113,6 +113,20 @@ def test_url_без_стандартного_окончания_отклоняе
     assert "odata/standard.odata" in str(ошибка.value)
 
 
+def test_gate_mode_off_без_кавычек_это_уровень_off(tmp_path):
+    """YAML 1.1 читает `off` без кавычек как `false`: владелец пишет `mode: off`, как в
+    документации, и получает уровень `off`, а не `config_invalid`."""
+    с_гейтом = BASES + "    gate:\n      mode: off\n"
+    assert load_config(записать(tmp_path, с_гейтом)).bases["ut"].gate.mode == "off"
+
+
+def test_gate_mode_true_отклоняется(tmp_path):
+    с_гейтом = BASES + "    gate:\n      mode: on\n"
+    with pytest.raises(ConfigError) as ошибка:
+        load_config(записать(tmp_path, с_гейтом))
+    assert "gate.mode" in str(ошибка.value)
+
+
 def test_недопустимое_имя_базы_отклоняется(tmp_path):
     плохой = BASES.replace("  ut:", "  UT-Боевая:")
     with pytest.raises(ConfigError) as ошибка:

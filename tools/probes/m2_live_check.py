@@ -77,6 +77,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from odata1c.client1c.client import _собрать_запрос, _экранировать_путь
 from odata1c.client1c.errors import map_error
+from odata1c.config.models import адрес_odata
 from odata1c.config.writer import read_launcher_key
 from odata1c.daemon import (
     CLIENT_ELICITATION_HEADER,
@@ -520,7 +521,7 @@ class Прямой1С:
 
     def __init__(self, запись: dict) -> None:
         self._http = httpx.Client(
-            base_url=запись["url"],
+            base_url=адрес_odata(запись["url"]),
             auth=(запись["user"], запись["password"]),
             timeout=180.0,
             headers={"Accept": "application/json"},
@@ -2215,7 +2216,7 @@ async def main() -> int:
     рабочий = pathlib.Path(аргументы.home)
     запись = yaml.safe_load((рабочий / "bases.yaml").read_text(encoding="utf-8"))["bases"][БАЗА]
     прямой = Прямой1С(запись)
-    посредник = Посредник1С(запись["url"], verify=запись.get("verify_tls", True))
+    посредник = Посредник1С(адрес_odata(запись["url"]), verify=запись.get("verify_tls", True))
     дом = собрать_дом(рабочий, посредник.адрес)
     метка = f"{МАРКЕР_ОБЩИЙ} {time.strftime('%d.%m %H-%M-%S')}"
     к = Контекст(дом, прямой, посредник, метка)

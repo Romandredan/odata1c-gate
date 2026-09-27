@@ -1,64 +1,75 @@
 # odata1c: все базы 1С этой машины. Файл закрыт правами текущего пользователя ОС.
 # Пароли хранятся здесь открытым текстом либо `password: keyring`.
+#
+# Каждая база — отдельная запись в разделе bases, и все её поля задаются для каждой базы
+# отдельно: уровень гейта (gate), запись (write, permissions), соединение, рецепты. Две базы могут
+# иметь разные уровни гейта. Роль (role) задаёт умолчания этих полей; поле, указанное в записи
+# базы, перекрывает умолчание роли только у неё.
+#
+# Новую запись дописывает в конец файла команда
+#   odata1c base add <имя> --role prod|test|dev [--gate off|identifiers|identifiers+names]
+# Описать базу вручную: выделите пример ниже целиком и снимите комментарий (Ctrl+/ в редакторе) —
+# получится рабочая запись, где необязательные поля остались комментариями с верным отступом;
+# их раскомментируйте по одному так же. Действующие уровни и роли баз: odata1c base list.
 
-# default: ut                          # база по умолчанию, если тул вызван без `base`
+# default: ut                                  # база по умолчанию, если тул вызван без `base`
 
 bases:
-  # ut:                                # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
-  #   label: УТ 11, боевая, розница и опт   # подпись для модели: по ней она выбирает базу
-  #   url: https://server/base/odata/standard.odata/   # обязательно оканчивается на /odata/standard.odata/
-  #   user: odata_user                 # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
-  #   password: qwerty123              # пароль ИБ, без кавычек; нужны кавычки, только если в пароле есть #,
-  #                                     # двоеточие с пробелом, он начинается со спецсимвола или похож на
-  #                                     # число — odata1c base add расставит их сама; `keyring` = взять из
-  #                                     # хранилища ОС — нужна установка с extra keyring
-  #                                     # (uv tool install "odata1c-gate[keyring]"), секрет кладётся командой
-  #                                     # пакета keyring: keyring set odata1c/base <имя базы>
-  #   role: prod                       # prod | test | dev — профиль умолчаний
-  #   config: ut                       # конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя
-
-    # --- соединение (умолчания показаны, раскомментируйте для изменения) ---
-    # verify_tls: true               # true | false | путь к CA-сертификату (PEM)
-    # timeout_s: 60                  # таймаут обычного запроса; виртуальные таблицы — 180
-    # virtual_timeout_s: 180         # таймаут виртуальных таблиц (остатки, обороты)
-    # concurrency: 2                 # одновременных запросов к этой базе от всех сессий
-    # ib_session: true               # держать сеанс 1С (IBSession) между запросами
-
-    # --- запись (умолчание роли prod: write: false) ---
-  #   write: true                    # разрешить пишущие тулы (create/update/mark/action); commit всегда с подтверждением
-    # permissions:
-    #   post_documents: true         # действия Post/Unpost из $metadata
-    #   mark_deletion: true          # PATCH DeletionMark у объектов
-    #   independent_register_delete: false   # DELETE записи независимого регистра сведений
-    #                                         # (odata1c_delete_record); прочих регистров не касается
-    #   register_direct_write: false # в первой поставке не действует: запись зависимых регистров закрыта
-    #   allow_entities: []           # если не пусто — запись только в эти сущности
-    #   deny_entities: []            # запрет записи в сущности, например [Catalog_Пользователи]
-    #   deny_fields: []              # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
-    #   commit_limit: 20             # коммитов за 10 минут на сессию; 0 = без лимита
-
-    # --- гейт: скрывать ли (умолчание роли prod: identifiers+names) ---
-    # gate:
-    #   mode: identifiers+names      # off | identifiers | identifiers+names
-    #                                # что именно скрывать и что открыть: bases/ut/policy.yaml
-
-    # --- рецепты ---
-    # config задаёт библиотеку конфигурации (recipes/<config>/, см. выше) и шаблон пакета — оба
-    # подставляются сами, без копирования файла; recipes ниже — СОБСТВЕННЫЙ файл базы, верхний
-    # слой поверх них (odata1c base add --recipes создаёт его копией шаблона, как и прежде — сам
-    # config копии не требует; odata1c recipe list <база> показывает источник каждого рецепта)
-    # recipes: bases/ut/recipes.yaml # путь относительно домашнего каталога
-
-  # buh:
-  #   label: БП 3.0, боевая
-  #   url: https://server/base/odata/standard.odata/
-  #   user: odata_user
-  #   password: qwerty123
-  #   role: prod
-
-  # ut_test:
-  #   label: копия УТ для отладки
-  #   url: https://server/base/odata/standard.odata/
-  #   user: odata_user
-  #   password: qwerty123
-  #   role: dev                      # гейт выключен, запись разрешена
+#   ut:                                        # имя базы: [a-z0-9_]{1,32}; это значение параметра `base` в тулах
+#     label: УТ 11, боевая, розница и опт      # подпись для модели: по ней она выбирает базу
+#     url: https://server/base                 # адрес публикации 1С, как в браузере; /odata/standard.odata/ шлюз допишет сам
+#     user: odata_user                         # пользователь ИБ 1С; рекомендуется отдельная учётка с урезанными правами
+#     password: qwerty123                      # пароль ИБ, без кавычек; нужны кавычки, только если в пароле есть #,
+#                                              # двоеточие с пробелом, он начинается со спецсимвола или похож на
+#                                              # число — odata1c base add расставит их сама; `keyring` = взять из
+#                                              # хранилища ОС — нужна установка с extra keyring
+#                                              # (uv tool install "odata1c-gate[keyring]"), секрет кладётся командой
+#                                              # пакета keyring: keyring set odata1c/base <имя базы>
+#     role: prod                               # prod | test | dev — умолчания гейта и записи этой базы
+#     # config: ut                             # конфигурация для библиотеки рецептов (recipes/<config>/): ut | bp | zup | своя
+#
+#     # --- соединение (показаны умолчания) ---
+#     # verify_tls: true                       # true | false | путь к CA-сертификату (PEM)
+#     # timeout_s: 60                          # таймаут обычного запроса
+#     # virtual_timeout_s: 180                 # таймаут виртуальных таблиц (остатки, обороты)
+#     # concurrency: 2                         # одновременных запросов к этой базе от всех сессий
+#     # ib_session: true                       # держать сеанс 1С (IBSession) между запросами
+#
+#     # --- запись этой базы (показаны умолчания роли prod; у test и dev запись разрешена) ---
+#     # write: false                           # разрешить пишущие тулы (create/update/mark/action); commit всегда с подтверждением
+#     # permissions:
+#     #   post_documents: true                 # действия Post/Unpost из $metadata
+#     #   mark_deletion: true                  # PATCH DeletionMark у объектов
+#     #   independent_register_delete: false   # DELETE записи независимого регистра сведений
+#     #                                        # (odata1c_delete_record); прочих регистров не касается
+#     #   register_direct_write: false         # в первой поставке не действует: запись зависимых регистров закрыта
+#     #   allow_entities: []                   # если не пусто — запись только в эти сущности
+#     #   deny_entities: []                    # запрет записи в сущности, например [Catalog_Пользователи]
+#     #   deny_fields: []                      # запрет записи в поля, например [Catalog_Контрагенты.ИНН]
+#     #   commit_limit: 20                     # коммитов за 10 минут на сессию; 0 = без лимита
+#
+#     # --- гейт этой базы: скрывать ли (показано умолчание роли prod; test — identifiers, dev — off) ---
+#     # gate:
+#     #   mode: identifiers+names              # off | identifiers | identifiers+names
+#     #                                        # что именно скрывать и что открыть: bases/ut/policy.yaml
+#
+#     # --- рецепты ---
+#     # config задаёт библиотеку конфигурации (recipes/<config>/, см. выше) и шаблон пакета — оба
+#     # подставляются сами, без копирования файла; recipes ниже — СОБСТВЕННЫЙ файл базы, верхний
+#     # слой поверх них (odata1c base add --recipes создаёт его копией шаблона, как и прежде — сам
+#     # config копии не требует; odata1c recipe list <база> показывает источник каждого рецепта)
+#     # recipes: bases/ut/recipes.yaml         # путь относительно домашнего каталога
+#
+#   buh:
+#     label: БП 3.0, боевая
+#     url: https://server/buh
+#     user: odata_user
+#     password: qwerty123
+#     role: prod                               # гейт identifiers+names, только чтение
+#
+#   ut_test:
+#     label: копия УТ для отладки
+#     url: https://server/ut_test
+#     user: odata_user
+#     password: qwerty123
+#     role: dev                                # гейт выключен, запись разрешена

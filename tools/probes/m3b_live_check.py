@@ -72,6 +72,8 @@ from tools.probes.m2_live_check import (  # noqa: E402
     через_лаунчер,
 )
 
+from odata1c.config.models import адрес_odata  # noqa: E402
+
 БАЗА = "trade_dev"
 # Копия базы без разрешения на физическое удаление записи регистра (проверка отказа
 # permission_denied у odata1c_delete_record) — собрать_дом её не создаёт, дописывается отдельно.
@@ -705,7 +707,7 @@ async def main() -> int:
     все_базы = yaml.safe_load((рабочий / "bases.yaml").read_text(encoding="utf-8"))["bases"]
     запись_базы = все_базы[БАЗА]
     посредник = Посредник1С(
-        запись_базы["url"],
+        адрес_odata(запись_базы["url"]),
         verify=запись_базы.get("verify_tls", True),
         удалять=_можно_удалять,
         доп_разрешено=_доп_разрешено,

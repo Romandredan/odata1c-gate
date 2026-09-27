@@ -291,6 +291,86 @@ def test_base_add_пароль_не_попадает_в_вывод(tmp_path, mon
     assert config.bases["ut"].password == "секретный_пароль_только_для_теста"
 
 
+def test_base_add_пишет_корень_публикации_и_печатает_адрес_odata(tmp_path, monkeypatch, capsys):
+    """Ruling 107: владелец вводит адрес из браузера, в bases.yaml ложится корень публикации,
+    а хвост стандартного интерфейса OData достраивает шлюз."""
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch, url="https://server/base/ru_RU/")
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "адрес OData: https://server/base/odata/standard.odata/" in вывод
+    текст = (home / "bases.yaml").read_text(encoding="utf-8")
+    assert "url: https://server/base\n" in текст
+    assert load_config(home).bases["ut"].url == "https://server/base/odata/standard.odata/"
+
+
+def test_base_add_gate_пишет_уровень_в_запись_базы(tmp_path, monkeypatch, capsys):
+    """`--gate` задаёт уровень гейта одной базы, не трогая соседние: уровень — поле записи
+    базы, а не общая настройка."""
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+    assert main(["base", "add", "ut", "--gate", "identifiers", "--home", str(home)]) == 0
+    _ввод_для_add(monkeypatch)
+    assert main(["base", "add", "buh", "--home", str(home)]) == 0
+
+    текст = (home / "bases.yaml").read_text(encoding="utf-8")
+    assert "    gate:\n      mode: identifiers " in текст
+    config = load_config(home)
+    assert config.bases["ut"].role == "prod"
+    assert config.bases["ut"].gate.mode == "identifiers"
+    assert config.bases["buh"].gate.mode == "identifiers+names"
+
+
+def test_base_add_недопустимый_gate_отклоняется(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        main(["base", "add", "ut", "--gate", "names", "--home", str(tmp_path / "home")])
+
+
+@pytest.mark.parametrize(
+    ("роль", "гейт", "запись"),
+    [
+        ("prod", "identifiers+names", "false"),
+        ("test", "identifiers", "true"),
+        ("dev", "off", "true"),
+    ],
+)
+def test_base_add_примеры_в_записи_показывают_умолчания_роли(
+    роль, гейт, запись, tmp_path, monkeypatch, capsys
+):
+    """Закомментированные `write` и `gate.mode` новой записи показывают то, что действует по роли
+    этой базы: раскомментированная строка не должна молча менять поведение базы."""
+    home = tmp_path / "home"
+    _ввод_для_add(monkeypatch)
+    assert main(["base", "add", "ut", "--role", роль, "--home", str(home)]) == 0
+
+    текст = (home / "bases.yaml").read_text(encoding="utf-8")
+    запись_базы = текст[текст.index("\n  ut:\n") :]
+    assert f"    # write: {запись} " in запись_базы
+    assert f"    #   mode: {гейт} " in запись_базы
+    раскомментированная = запись_базы.replace("    # write:", "    write:").replace(
+        "    # gate:\n    #   mode:", "    gate:\n      mode:"
+    )
+    (home / "bases.yaml").write_text(текст.replace(запись_базы, раскомментированная), "utf-8")
+    config = load_config(home)
+    assert config.bases["ut"].gate.mode == гейт
+    assert config.bases["ut"].write is (запись == "true")
+
+
+def test_base_add_отклоняет_адрес_до_вопроса_о_пароле(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    monkeypatch.setattr("builtins.input", lambda *_: "server/base")
+    monkeypatch.setattr("getpass.getpass", lambda *_: pytest.fail("пароль спрошен зря"))
+
+    код = main(["base", "add", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "config_invalid" in вывод and "http" in вывод
+
+
 def test_base_add_создаёт_файл_политики_владельца_из_шаблона(tmp_path, monkeypatch, capsys):
     """ADR-0015, задача 3: `base add` создаёт `bases/<имя>/policy.yaml` из шаблона, шапка
     которого называет настоящую базу, а не образец `{{base}}`. Повторное обеспечение (например,
