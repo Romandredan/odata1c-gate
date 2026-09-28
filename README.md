@@ -1,5 +1,15 @@
 # odata1c-gate
 
+[![PyPI](https://img.shields.io/pypi/v/odata1c-gate.svg)](https://pypi.org/project/odata1c-gate/)
+[![AGENTS.md](https://img.shields.io/badge/AGENTS.md-compatible-brightgreen.svg)](https://agents.md)
+
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-d97757.svg)](https://code.claude.com/docs/en/plugins)
+[![MCP](https://img.shields.io/badge/MCP-server-6e56cf.svg)](https://modelcontextprotocol.io)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Romandredan/odata1c-gate/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-%E2%89%A53.12-3776ab.svg)](https://www.python.org/)
+[![1C:Enterprise](https://img.shields.io/badge/1C%3AEnterprise-8.3-ffd200.svg)](https://v8.1c.ru/)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)
+
 Локальный MCP-шлюз между Claude Code и стандартным OData-интерфейсом 1С:Предприятие 8.3.
 Модель получает доступ к данным базы — справочникам, документам, регистрам, — но между ней и 1С
 стоит **гейт псевдонимизации**: реквизиты (ИНН, счета, паспорта, телефоны) и, на выбранном уровне,
