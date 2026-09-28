@@ -23,6 +23,7 @@ from odata1c.index.edmx import parse_edmx
 ДАМПЫ = {
     "ut": КОРЕНЬ / "tests/fixtures/edmx/probe.full.edmx",
     "bp": КОРЕНЬ / "tests/fixtures/edmx/bp.full.edmx",
+    "zup": КОРЕНЬ / "tests/fixtures/edmx/zup.full.edmx",
 }
 
 

@@ -1,12 +1,275 @@
-# Рецепты для типовой конфигурации «Зарплата и управление персоналом».
+# Рецепты для типовой конфигурации «Зарплата и управление персоналом 3».
 #
-# Пока пусто: нет базы ЗУП, на которой можно сверить имена регистров, виртуальных таблиц и полей,
-# а рецепт с невыверенными именами хуже отсутствия рецепта — он даёт модели уверенную подсказку,
-# по которой база отвечает «сущность не найдена». Заполняется, когда появится база для проверки:
-# образец разметки — ut.yaml рядом.
+# Имена регистров, виртуальных таблиц и полей сверены с полным описанием метаданных реальной
+# базы ЗУП КОРП 3.1 (2026-09-28), каждый рецепт выполнен на ней через шлюз
+# (tools/probes/zup_recipes_check.py). Рецепт, сущности которого в базе нет, odata1c_recipe
+# помечает `applicable: false`; у доработанной конфигурации его достаточно поправить в своём
+# bases/<база>/recipes.yaml.
 #
-# Отдельно для ЗУП: почти все выборки здесь идут по физическим лицам, то есть по данным, которые
-# гейт защищает на уровне `identifiers+names` (ФИО, СНИЛС, паспорта). Рецепты должны отдавать
-# ссылки и суммы, а отбор по человеку принимать токеном — открытых ФИО в условиях быть не должно.
+# Почти все выборки здесь идут по людям, то есть по данным, которые гейт защищает на уровне
+# `identifiers+names` (ФИО, СНИЛС, паспорта). Поэтому рецепты отдают ссылки (`Сотрудник_Key`,
+# `ФизическоеЛицо_Key`), даты и суммы, а человека в отборе принимают только ссылкой Ref_Key
+# сотрудника — открытого ФИО в условиях нет. Имя сотрудника модель получает отдельным запросом к
+# Catalog_Сотрудники, и гейт отдаёт его токеном.
+#
+# Подстановка `{имя}` ставится ТОЛЬКО в позиции литерала и без кавычек: значение подставляется уже
+# готовым литералом по типу параметра. Условия перечисляются списком и склеиваются через `and`;
+# условие с незаданным необязательным параметром из запроса исчезает целиком.
 version: 1
-recipes: {}
+recipes:
+  staff:
+    title: Работающие сотрудники на дату
+    description: >-
+      Последнее кадровое событие каждого сотрудника на момент (срез последних регистра кадровой
+      истории), кроме уволенных: организация, подразделение, должность, вид занятости (ВидДоговора),
+      ставки. Уволенные — ВидСобытия «Увольнение», их исключает отбор.
+    entity: InformationRegister_КадроваяИсторияСотрудников_SliceLast
+    params:
+      period: { type: datetime, required: true, description: момент среза }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+    filter:
+      - ВидСобытия ne 'Увольнение'
+    select:
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Организация_Key
+      - Подразделение_Key
+      - Должность_Key
+      - ВидСобытия
+      - ВидДоговора
+      - КоличествоСтавок
+      - Period
+    top: 500
+
+  accruals:
+    title: Начисления и удержания за период
+    description: >-
+      Обороты начислений и удержаний по сотрудникам за интервал: вид начисления или удержания
+      (НачислениеУдержание со ссылкой и типом), подразделение, сумма. Период — по месяцам
+      начисления (MonthPeriod).
+    entity: AccumulationRegister_НачисленияУдержанияПоСотрудникам_Turnovers
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+      employee: { type: guid, required: false, description: Ref_Key сотрудника }
+    virtual:
+      StartPeriod: "{start}"
+      EndPeriod: "{end}"
+      Condition:
+        - Организация_Key eq {organization}
+        - Сотрудник_Key eq {employee}
+    select:
+      - Организация_Key
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Подразделение_Key
+      - НачислениеУдержание
+      - НачислениеУдержание_Type
+      - СуммаTurnover
+    top: 500
+
+  salary_debt:
+    title: Задолженность по зарплате на дату
+    description: >-
+      Остаток взаиморасчётов с сотрудниками на момент: положительный — долг организации перед
+      сотрудником (начислено, но не выплачено), отрицательный — долг сотрудника.
+    entity: AccumulationRegister_ВзаиморасчетыССотрудниками_Balance
+    params:
+      period: { type: datetime, required: true, description: момент остатков }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+      employee: { type: guid, required: false, description: Ref_Key сотрудника }
+    virtual:
+      Period: "{period}"
+      Condition:
+        - Организация_Key eq {organization}
+        - Сотрудник_Key eq {employee}
+    filter:
+      - СуммаВзаиморасчетовBalance ne 0
+    select:
+      - Организация_Key
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Подразделение_Key
+      - СуммаВзаиморасчетовBalance
+    top: 500
+
+  salary_settlements:
+    title: Взаиморасчёты с сотрудниками за период
+    description: >-
+      Остаток на начало, начислено к выплате (Receipt), выплачено и удержано (Expense) и остаток
+      на конец интервала по сотрудникам.
+    entity: AccumulationRegister_ВзаиморасчетыССотрудниками_BalanceAndTurnovers
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+      employee: { type: guid, required: false, description: Ref_Key сотрудника }
+    virtual:
+      StartPeriod: "{start}"
+      EndPeriod: "{end}"
+      Condition:
+        - Организация_Key eq {organization}
+        - Сотрудник_Key eq {employee}
+    select:
+      - Организация_Key
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - СуммаВзаиморасчетовOpeningBalance
+      - СуммаВзаиморасчетовReceipt
+      - СуммаВзаиморасчетовExpense
+      - СуммаВзаиморасчетовClosingBalance
+    top: 500
+
+  hires:
+    title: Приёмы на работу за период
+    description: >-
+      Проведённые документы приёма на работу с датой приёма в интервале: сотрудник, организация,
+      подразделение, должность, вид занятости, ставки.
+    entity: Document_ПриемНаРаботу
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    filter:
+      - ДатаПриема ge {start}
+      - ДатаПриема le {end}
+      - Posted eq true
+      - Организация_Key eq {organization}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - ДатаПриема
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Организация_Key
+      - Подразделение_Key
+      - Должность_Key
+      - ВидЗанятости
+      - КоличествоСтавок
+    orderby: ДатаПриема desc
+    top: 200
+
+  dismissals:
+    title: Увольнения за период
+    description: >-
+      Проведённые документы увольнения с датой увольнения в интервале: сотрудник, статья ТК РФ,
+      основание, начислено и удержано при увольнении.
+    entity: Document_Увольнение
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    filter:
+      - ДатаУвольнения ge {start}
+      - ДатаУвольнения le {end}
+      - Posted eq true
+      - Организация_Key eq {organization}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - ДатаУвольнения
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Организация_Key
+      - СтатьяТКРФ
+      - Начислено
+      - Удержано
+    orderby: ДатаУвольнения desc
+    top: 200
+
+  vacations:
+    title: Отпуска за период
+    description: >-
+      Проведённые документы ежегодного отпуска, начавшегося в интервале: сотрудник, даты и
+      количество дней основного отпуска, начислено.
+    entity: Document_Отпуск
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+      employee: { type: guid, required: false, description: Ref_Key сотрудника }
+    filter:
+      - ДатаНачалаОсновногоОтпуска ge {start}
+      - ДатаНачалаОсновногоОтпуска le {end}
+      - Posted eq true
+      - Организация_Key eq {organization}
+      - Сотрудник_Key eq {employee}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Организация_Key
+      - ДатаНачалаОсновногоОтпуска
+      - ДатаОкончанияОсновногоОтпуска
+      - КоличествоДнейОсновногоОтпуска
+      - Начислено
+    orderby: ДатаНачалаОсновногоОтпуска desc
+    top: 200
+
+  sick_leaves:
+    title: Больничные за период
+    description: >-
+      Проведённые больничные листы, начавшиеся в интервале: сотрудник, даты нетрудоспособности,
+      причина (код), начислено.
+    entity: Document_БольничныйЛист
+    params:
+      start: { type: datetime, required: true, description: начало периода }
+      end: { type: datetime, required: true, description: конец периода }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+      employee: { type: guid, required: false, description: Ref_Key сотрудника }
+    filter:
+      - ДатаНачала ge {start}
+      - ДатаНачала le {end}
+      - Posted eq true
+      - Организация_Key eq {organization}
+      - Сотрудник_Key eq {employee}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - Сотрудник_Key
+      - ФизическоеЛицо_Key
+      - Организация_Key
+      - ДатаНачала
+      - ДатаОкончания
+      - ПричинаНетрудоспособности
+      - Начислено
+    orderby: ДатаНачала desc
+    top: 200
+
+  payroll_documents:
+    title: Документы начисления зарплаты за период
+    description: >-
+      Проведённые документы начисления зарплаты за месяцы интервала: месяц начисления,
+      организация, подразделение, итого начислено и удержано. Строки по сотрудникам — табличная
+      часть Начисления документа.
+    entity: Document_НачислениеЗарплаты
+    params:
+      start: { type: datetime, required: true, description: первый месяц начисления }
+      end: { type: datetime, required: true, description: последний месяц начисления }
+      organization: { type: guid, required: false, description: Ref_Key организации }
+    filter:
+      - МесяцНачисления ge {start}
+      - МесяцНачисления le {end}
+      - Posted eq true
+      - Организация_Key eq {organization}
+    select:
+      - Ref_Key
+      - Number
+      - Date
+      - МесяцНачисления
+      - Организация_Key
+      - Подразделение_Key
+      - Начислено
+      - Удержано
+    orderby: МесяцНачисления desc
+    top: 200
