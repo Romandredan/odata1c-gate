@@ -89,7 +89,7 @@ from odata1c.daemon import (
     client_signature,
     daemon_url,
 )
-from odata1c.gate.dictionary import name_variants_of
+from odata1c.gate.dictionary import _голое_слово, name_variants_of
 from odata1c.launch_parent import ИМЕНА_CLAUDE_CODE, родитель_заверён
 from odata1c.write.journal import Journal
 
@@ -264,16 +264,31 @@ class Иглы:
         self._значения: dict[str, set[str]] = {}
 
     def добавить(self, класс: str, значение) -> None:
+        """Реальное значение защищаемого класса — игла на утечку. Для `org` вариант, оказавшийся
+        одиночным словом (после снятия кавычек — целиком из букв), в свободном тексте не
+        заменяется по правилу гейта (Ruling 115): голая игла из такого варианта считала бы
+        законное отсутствие замены утечкой. Такой вариант кладётся в набор игл только в кавычках
+        (`"мост"`, `«мост»`), в исходном регистре строки, а не голым."""
         if not isinstance(значение, str):
             return
         значение = значение.strip()
         if len(значение) < 4:
             return
-        self._значения.setdefault(класс, set()).add(значение)
+        цель = self._значения.setdefault(класс, set())
+        if класс == "org" and _голое_слово(значение):
+            цель.update({f'"{значение}"', f"«{значение}»"})
+        else:
+            цель.add(значение)
         if класс == "org":
             for вариант in name_variants_of(значение):
                 вариант = вариант.strip().strip('"')
-                if len(вариант) >= 4 and вариант != значение:
+                if len(вариант) < 4 or вариант == значение:
+                    continue
+                if _голое_слово(вариант):
+                    self._значения.setdefault("org: вариант без формы", set()).update(
+                        {f'"{вариант}"', f"«{вариант}»"}
+                    )
+                else:
                     self._значения.setdefault("org: вариант без формы", set()).add(вариант)
 
     def сводка(self) -> dict[str, int]:
