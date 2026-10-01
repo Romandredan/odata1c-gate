@@ -1144,3 +1144,130 @@ def test_скрипт_компилируется_без_syntaxwarning():
             байткод = pathlib.Path(врем) / "pretooluse.pyc"
             py_compile.compile(str(СКРИПТ), cfile=str(байткод), doraise=True)
     assert исходник
+
+
+# --- Правило 4: команды владельца, снижающие защиту → ask (ADR-0017) ------------------------
+
+_СНИЖАЮЩИЕ = [
+    "odata1c base set ut --gate off",
+    "odata1c base set ut --gate identifiers",
+    "odata1c base set ut --gate=default",
+    "odata1c base set ut --write on",
+    "odata1c base set ut --write default",
+    "odata1c base set ut --role dev",
+    "odata1c base set ut --role test",
+    "odata1c base set ut --post-documents on",
+    "odata1c base set ut --mark-deletion default",
+    "odata1c base set ut --register-delete on",
+    "odata1c base set ut --commit-limit 0",
+    "odata1c base set ut --commit-limit 100",
+    "odata1c base set ut --label 'Боевая' --write on",
+    "uvx --from odata1c-gate odata1c base set ut --gate off",
+    "uv run odata1c base set --home C:/дом ut --gate off",
+    "odata1c.exe base set ut --gate off",
+    'odata1c base set ut --label "незакрытая кавычка --write off',
+]
+
+_НЕ_СНИЖАЮЩИЕ = [
+    "odata1c base set ut --gate identifiers+names",
+    "odata1c base set ut --write off",
+    "odata1c base set ut --role prod",
+    "odata1c base set ut --post-documents off --mark-deletion off --register-delete off",
+    "odata1c base set ut --label 'УТ 11, боевая'",
+    "odata1c base set ut --label 'Включить --write on не надо'",
+    "odata1c base list",
+    "odata1c base test ut",
+    "odata1c policy hide ut Catalog_Пользователи --yes",
+    "odata1c policy set ut Catalog_Контрагенты.ИНН inn",
+    "odata1c policy show ut",
+    "odata1c policy check ut",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _СНИЖАЮЩИЕ)
+def test_base_set_снижающий_защиту_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "ask"
+    assert "снижает защиту базы" in решение["permissionDecisionReason"]
+    assert "подтвердите" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _НЕ_СНИЖАЮЩИЕ)
+def test_команды_владельца_без_снижения_молчат(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_base_set_причина_называет_базу_и_ключи(tmp_path):
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "odata1c base set trade_dev --gate off --write on"},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "базы trade_dev" in причина
+    assert "--gate off" in причина and "--write on" in причина
+
+
+def test_base_set_в_цепочке_после_другой_команды(tmp_path):
+    """Review Focus 4: снижающая команда не первая в цепочке."""
+    команда = "odata1c base list && odata1c base set ut --gate off; echo готово"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+def test_base_set_в_цепочке_с_повышающей_командой_молчит(tmp_path):
+    команда = "odata1c base set ut --write off && odata1c base set bp --gate identifiers+names"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+def test_policy_open_даёт_ask(tmp_path):
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "uvx --from odata1c-gate odata1c policy open ut Catalog_Контрагенты.ИНН"
+            },
+        },
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение["permissionDecision"] == "ask"
+    assert "открывает поле" in решение["permissionDecisionReason"]
+
+
+def test_reveal_старше_правила_4(tmp_path):
+    """Правило 3 (`deny`) по-прежнему первое: `reveal` в одной команде с `base set` — deny."""
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "odata1c reveal x && odata1c base set ut --gate off"},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    assert _решение(результат)["permissionDecision"] == "deny"

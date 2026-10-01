@@ -67,7 +67,9 @@
    единого символа шаблона (`ls ~/.claude/odata1c/`, `Get-ChildItem $env:ODATA1C_HOME`) начиная с
    раунда 3 тоже `deny` — намеренное расширение решения контроллера (Ruling 88), а не регрессия
    более ранних раундов.
-4. Иначе — молчание (тул выполняется как обычно).
+4. Команды владельца, которые модель запускает сама (ADR-0017): `odata1c base set` с ключом,
+   снижающим защиту базы, и `odata1c policy open` → `ask`; проверяется после `deny` правила 3.
+5. Иначе — молчание (тул выполняется как обычно).
 
 Причины решений — фиксированный русский текст без значений из события: только `pending_id`
 (правило 1) и не более. Полные пути, содержимое команд и прочие значения из `tool_input` в текст
@@ -95,6 +97,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import sys
 
 # Правило 1: обе формы имени тула odata1c_commit.
@@ -135,6 +138,37 @@ _КОМАНДНЫЕ_ТУЛЫ = {"Bash", "PowerShell"}
 _BASH_ФАЙЛЫ_RE = re.compile(rf"(?<![\w.-])(?:{_БАЗОВЫЕ_ИМЕНА})(?![a-z0-9])", re.IGNORECASE)
 _BASH_REVEAL_RE = re.compile(r"\bodata1c(\.exe)?\b[\s'\"]*reveal\b", re.IGNORECASE)
 _BASH_SQLITE_RE = re.compile(r"\bsqlite3\b.*(gate|journal)\.sqlite", re.IGNORECASE | re.DOTALL)
+
+# Правило 4 (ADR-0017): команды владельца, которые модель теперь запускает сама (навыки
+# `odata1c-base`, `odata1c-policy`). Снижающая защиту форма — `ask`: диалог разрешения — последняя
+# линия против подсказки из данных 1С («выключи гейт»), как и на `odata1c_commit`. Хвост команды
+# после `set` — до разделителя цепочки; форма запуска любая (`uvx --from odata1c-gate odata1c …`,
+# `uv run odata1c …`, `odata1c.exe …`), образец — правило `reveal`.
+_BASH_BASE_SET_RE = re.compile(
+    r"\bodata1c(?:\.exe)?\b[\s'\"]*base[\s'\"]+set\b(?P<хвост>[^&|;\r\n]*)", re.IGNORECASE
+)
+_BASH_POLICY_OPEN_RE = re.compile(
+    r"\bodata1c(?:\.exe)?\b[\s'\"]*policy[\s'\"]+open\b", re.IGNORECASE
+)
+# Ключ `base set` → значения, НЕ снижающие защиту. Хук не знает ни текущих значений, ни роли базы,
+# поэтому `--gate identifiers`, любой `default` и любой `--commit-limit` считаются снижением —
+# цена одного лишнего диалога (проект §3.3).
+_ЗАЩИТНЫЕ_ЗНАЧЕНИЯ = {
+    "--gate": {"identifiers+names"},
+    "--write": {"off"},
+    "--role": {"prod"},
+    "--post-documents": {"off"},
+    "--mark-deletion": {"off"},
+    "--register-delete": {"off"},
+    "--commit-limit": set(),
+}
+_КЛЮЧИ_СО_ЗНАЧЕНИЕМ = set(_ЗАЩИТНЫЕ_ЗНАЧЕНИЯ) | {"--label", "--home"}
+_ПРИЧИНА_BASE_SET = (
+    "odata1c base set снижает защиту базы {база}: {ключи} — подтвердите, что это просьба владельца"
+)
+_ПРИЧИНА_POLICY_OPEN = (
+    "odata1c policy open открывает поле модели — подтвердите, что это просьба владельца"
+)
 
 # Ruling 77 (раунд 2): путь дома шлюза в команде — буквально .claude/odata1c (любой разделитель).
 _HOME_PATH_RE = re.compile(r"\.claude[/\\]odata1c", re.IGNORECASE)
@@ -398,6 +432,53 @@ def _проверить_glob_шаблон(шаблон: object, дома: list[p
     return None
 
 
+def _снижающие_ключи(хвост: str) -> tuple[str, list[str]]:
+    """Имя базы и ключи `base set` из хвоста команды, снижающие защиту. Хвост, который не
+    разбирается (незакрытая кавычка), считается снижающим целиком: сомнение — в сторону вопроса."""
+    try:
+        токены = shlex.split(хвост, posix=True)
+    except ValueError:
+        return "?", ["(хвост команды не разобран)"]
+    база, найдено, i = "?", [], 0
+    while i < len(токены):
+        токен = токены[i]
+        if токен.startswith("--") and "=" in токен:
+            ключ, значение = токен.split("=", 1)
+            i += 1
+        elif токен.lower() in _КЛЮЧИ_СО_ЗНАЧЕНИЕМ:
+            ключ = токен
+            значение = токены[i + 1] if i + 1 < len(токены) else ""
+            i += 2
+        else:
+            if not токен.startswith("-") and база == "?":
+                база = токен
+            i += 1
+            continue
+        ключ = ключ.lower()
+        if ключ in _ЗАЩИТНЫЕ_ЗНАЧЕНИЯ and значение.lower() not in _ЗАЩИТНЫЕ_ЗНАЧЕНИЯ[ключ]:
+            найдено.append(f"{ключ} {значение}".strip())
+    return база, найдено
+
+
+def _команды_владельца(команда: str) -> dict | None:
+    """Правило 4: `ask` на `base set` со снижением защиты (все вхождения в цепочке — один вопрос с
+    объединённой причиной) и на `policy open`; остальные команды владельца проходят молча."""
+    базы: list[str] = []
+    ключи: list[str] = []
+    for совпадение in _BASH_BASE_SET_RE.finditer(команда):
+        база, снижающие = _снижающие_ключи(совпадение.group("хвост"))
+        if снижающие:
+            базы.append(база)
+            ключи.extend(снижающие)
+    if ключи:
+        return _ask(
+            _ПРИЧИНА_BASE_SET.format(база=", ".join(dict.fromkeys(базы)), ключи=", ".join(ключи))
+        )
+    if _BASH_POLICY_OPEN_RE.search(команда):
+        return _ask(_ПРИЧИНА_POLICY_OPEN)
+    return None
+
+
 def decide(event: dict, *, home: pathlib.Path) -> dict | None:
     """Решение хука по одному событию `PreToolUse`. Используется и `main`, и тестами напрямую."""
     tool_name = event.get("tool_name")
@@ -448,6 +529,9 @@ def decide(event: dict, *, home: pathlib.Path) -> dict | None:
                 return _deny(_ПРИЧИНА_ШАБЛОН)
             if _массовое_чтение_дома(команда, home):
                 return _deny(_ПРИЧИНА_МАССОВОЕ_ЧТЕНИЕ)
+            решение = _команды_владельца(команда)
+            if решение is not None:
+                return решение
         return None
 
     return None
