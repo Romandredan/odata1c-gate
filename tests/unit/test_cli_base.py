@@ -990,3 +990,20 @@ def test_отказ_argparse_в_канале_utf8(tmp_path):
 
     assert результат.returncode == 2
     assert "без лимита" in результат.stderr.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "ключ",
+    [["--gat", "off"], ["--g=off"], ["--w", "on"], ["--ro", "dev"], ["--c", "0"]],
+)
+def test_base_set_сокращение_ключа_не_принимается(tmp_path, ключ):
+    """Хук плагина сверяет ключи по точному написанию (ADR-0017, правило 4): сокращение argparse
+    (`--gat off`) прошло бы мимо `ask`, поэтому CLI его не принимает."""
+    home = _дом_с_базой(tmp_path)
+    до = (home / "bases.yaml").read_bytes()
+
+    with pytest.raises(SystemExit) as выход:
+        main(["base", "set", "ut", *ключ, "--home", str(home)])
+
+    assert выход.value.code == 2
+    assert (home / "bases.yaml").read_bytes() == до

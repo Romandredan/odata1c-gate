@@ -92,6 +92,13 @@ _ОШИБКИ_ЗАПУСКА_MCP = (ConfigError, MCPError, httpx2.HTTPError, OSE
 ОЖИДАНИЕ_ГОТОВНОСТИ_S = 15
 
 
+def _подпарсер(действие, имя: str, **параметры) -> argparse.ArgumentParser:
+    """`add_parser` с выключенными сокращениями ключей. Хук плагина (правило 4, ADR-0017) сверяет
+    ключи `base set` по точному написанию; argparse по умолчанию принимает `--gat off` как
+    `--gate off`, и такая команда прошла бы мимо `ask`."""
+    return действие.add_parser(имя, allow_abbrev=False, **параметры)
+
+
 def main(argv: list[str] | None = None) -> int:
     _вывод_в_utf8()
     # --home общий для всех команд, в любой позиции: до подкоманды, между уровнями подкоманд
@@ -113,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        prog="odata1c", description="Шлюз к OData 1С с гейтом", parents=[домашний]
+        prog="odata1c",
+        description="Шлюз к OData 1С с гейтом",
+        parents=[домашний],
+        allow_abbrev=False,
     )
     # Ruling 64: версия пакета — одна на весь инструмент, источник — __about__.py (SPEC design
     # §2). action="version" печатает и завершает разбор ДО проверки required=True у подпарсеров
@@ -121,16 +131,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"odata1c-gate {__version__}")
     команды = parser.add_subparsers(dest="команда", required=True)
 
-    команды.add_parser(
-        "init", help="создать домашний каталог и шаблоны настроек", parents=[домашний]
+    _подпарсер(
+        команды, "init", help="создать домашний каталог и шаблоны настроек", parents=[домашний]
     )
 
-    base = команды.add_parser("base", help="работа с базами", parents=[домашний])
+    base = _подпарсер(команды, "base", help="работа с базами", parents=[домашний])
     подкоманды = base.add_subparsers(dest="подкоманда", required=True)
-    подкоманды.add_parser("list", help="список описанных баз", parents=[домашний])
-    test = подкоманды.add_parser("test", help="проверить соединение с базой", parents=[домашний])
+    _подпарсер(подкоманды, "list", help="список описанных баз", parents=[домашний])
+    test = _подпарсер(подкоманды, "test", help="проверить соединение с базой", parents=[домашний])
     test.add_argument("name", help="имя базы из bases.yaml")
-    add = подкоманды.add_parser("add", help="добавить базу", parents=[домашний])
+    add = _подпарсер(подкоманды, "add", help="добавить базу", parents=[домашний])
     add.add_argument("name", help="имя базы: строчные латинские буквы, цифры, подчёркивание")
     add.add_argument("--role", choices=("prod", "test", "dev"), default="prod")
     add.add_argument(
@@ -144,7 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=("ut", "bp", "zup"),
         help="скопировать шаблон рецептов для типовой конфигурации",
     )
-    set_ = подкоманды.add_parser(
+    set_ = _подпарсер(
+        подкоманды,
         "set",
         help="изменить настройки базы: уровень гейта, запись, подпись, роль, разрешения",
         parents=[домашний],
@@ -189,60 +200,66 @@ def main(argv: list[str] | None = None) -> int:
         type=_лимит_коммитов,
         help="коммитов за 10 минут на сессию: число, 0 — без лимита, default — по роли",
     )
-    импорт = подкоманды.add_parser(
-        "import", help="перенести базы из env-файла прежнего сервера", parents=[домашний]
+    импорт = _подпарсер(
+        подкоманды,
+        "import",
+        help="перенести базы из env-файла прежнего сервера",
+        parents=[домашний],
     )
     импорт.add_argument("path", help="путь к 1c-odata.env")
 
-    reindex_parser = команды.add_parser(
-        "reindex", help="обновить индекс метаданных базы", parents=[домашний]
+    reindex_parser = _подпарсер(
+        команды, "reindex", help="обновить индекс метаданных базы", parents=[домашний]
     )
     reindex_parser.add_argument("name", help="имя базы")
     reindex_parser.add_argument(
         "--force", action="store_true", help="перестроить, даже если $metadata не менялся"
     )
 
-    policy = команды.add_parser("policy", help="политика гейта", parents=[домашний])
+    policy = _подпарсер(команды, "policy", help="политика гейта", parents=[домашний])
     policy_sub = policy.add_subparsers(dest="подкоманда", required=True)
-    show = policy_sub.add_parser("show", help="показать политику базы", parents=[домашний])
+    show = _подпарсер(policy_sub, "show", help="показать политику базы", parents=[домашний])
     show.add_argument("name", help="имя базы")
-    check = policy_sub.add_parser(
-        "check", help="проверить файл владельца по индексу", parents=[домашний]
+    check = _подпарсер(
+        policy_sub, "check", help="проверить файл владельца по индексу", parents=[домашний]
     )
     check.add_argument("name", help="имя базы")
-    hide = policy_sub.add_parser(
-        "hide", help="скрыть сущность целиком (с дочерними)", parents=[домашний]
+    hide = _подпарсер(
+        policy_sub, "hide", help="скрыть сущность целиком (с дочерними)", parents=[домашний]
     )
     hide.add_argument("name", help="имя базы")
     hide.add_argument("entity", help="имя сущности индекса")
     hide.add_argument(
         "--yes", action="store_true", help="не спрашивать подтверждение (для скриптов)"
     )
-    policy_open = policy_sub.add_parser(
-        "open", help="открыть поле (класс keep)", parents=[домашний]
+    policy_open = _подпарсер(
+        policy_sub, "open", help="открыть поле (класс keep)", parents=[домашний]
     )
     policy_open.add_argument("name", help="имя базы")
     policy_open.add_argument("field", help="Сущность.Поле")
-    policy_set = policy_sub.add_parser("set", help="назначить полю класс", parents=[домашний])
+    policy_set = _подпарсер(policy_sub, "set", help="назначить полю класс", parents=[домашний])
     policy_set.add_argument("name", help="имя базы")
     policy_set.add_argument("field", help="Сущность.Поле")
     policy_set.add_argument(
         "cls", metavar="класс", help="CLASSES (gate/tokens.py) | scan | custom:<имя>"
     )
 
-    recipe = команды.add_parser("recipe", help="библиотека рецептов", parents=[домашний])
+    recipe = _подпарсер(команды, "recipe", help="библиотека рецептов", parents=[домашний])
     recipe_sub = recipe.add_subparsers(dest="подкоманда", required=True)
-    recipe_check = recipe_sub.add_parser(
-        "check", help="проверить библиотеку рецептов конфигурации", parents=[домашний]
+    recipe_check = _подпарсер(
+        recipe_sub, "check", help="проверить библиотеку рецептов конфигурации", parents=[домашний]
     )
     recipe_check.add_argument("config", help="имя конфигурации (каталог recipes/<config>/)")
-    recipe_list = recipe_sub.add_parser(
-        "list", help="список рецептов базы (шаблон, библиотека, файл базы)", parents=[домашний]
+    recipe_list = _подпарсер(
+        recipe_sub,
+        "list",
+        help="список рецептов базы (шаблон, библиотека, файл базы)",
+        parents=[домашний],
     )
     recipe_list.add_argument("name", help="имя базы")
 
-    daemon_parser = команды.add_parser(
-        "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
+    daemon_parser = _подпарсер(
+        команды, "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
     )
     daemon_parser.add_argument(
         "--foreground",
@@ -250,9 +267,10 @@ def main(argv: list[str] | None = None) -> int:
         help="работать в текущем процессе (без этого — порождает фоновый процесс и ждёт порт)",
     )
     daemon_подкоманды = daemon_parser.add_subparsers(dest="действие")
-    daemon_подкоманды.add_parser("stop", help="остановить демон по daemon.pid", parents=[домашний])
+    _подпарсер(daemon_подкоманды, "stop", help="остановить демон по daemon.pid", parents=[домашний])
 
-    mcp_parser = команды.add_parser(
+    mcp_parser = _подпарсер(
+        команды,
         "mcp",
         help="лаунчер: stdio-прокси демону (подключение к Claude Code)",
         parents=[домашний],
@@ -265,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         "--url", help="адрес демона явно (иначе daemon_url из порта daemon.yaml)"
     )
 
-    doctor_parser = команды.add_parser(
+    doctor_parser = _подпарсер(
+        команды,
         "doctor",
         help="проверка окружения: uv, дом, базы, индекс, политика, демон, Claude Code",
         parents=[домашний],
@@ -276,8 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         help="дополнительно проверить соединение с 1С каждой видимой базы (как base test)",
     )
 
-    reveal = команды.add_parser(
-        "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
+    reveal = _подпарсер(
+        команды,
+        "reveal",
+        help="реальное значение токена (только для пользователя)",
+        parents=[домашний],
     )
     reveal.add_argument("token", help="токен вида [[inn:M4T2Q9XZ7K]]")
     reveal.add_argument(
