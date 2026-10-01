@@ -655,7 +655,7 @@ def set_base_fields(path: pathlib.Path, name: str, changes: dict[str, object]) -
         if значение is ПО_РОЛИ and поле in ("label", "role"):
             raise ValueError(f"у поля {поле} нет умолчания роли")
         if поле == "role" and (not isinstance(значение, str) or значение not in УМОЛЧАНИЯ_РОЛЕЙ):
-            raise ConfigError("неизвестная роль; допустимы prod, test, dev")
+            raise ConfigError(f"неизвестная роль «{значение}»; допустимы prod, test, dev")
     if not path.exists():
         raise ConfigError(
             f"файл баз не найден: {path}", hint=f"выполните: odata1c init --home {path.parent}"
