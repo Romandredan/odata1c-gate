@@ -13,8 +13,10 @@ import difflib
 import getpass
 import importlib.resources
 import pathlib
+import re
 import sys
 import time
+import unicodedata
 
 import httpx2
 import pydantic
@@ -91,6 +93,7 @@ _ОШИБКИ_ЗАПУСКА_MCP = (ConfigError, MCPError, httpx2.HTTPError, OSE
 
 
 def main(argv: list[str] | None = None) -> int:
+    _вывод_в_utf8()
     # --home общий для всех команд, в любой позиции: до подкоманды, между уровнями подкоманд
     # или после них. Наивное решение — добавить --home через parents=[...] на каждый уровень —
     # не работает: argparse разбирает хвост, доставшийся подпарсеру, в отдельное пространство
@@ -285,8 +288,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    if args.команда != "mcp":
-        _вывод_в_utf8()
     home = resolve_home(getattr(args, "home", None))
 
     try:
@@ -1014,27 +1015,33 @@ def _вывод_в_utf8() -> None:
     """Команды CLI теперь читает и модель через канал инструмента Bash (навыки `odata1c-base`,
     `odata1c-policy`, ADR-0017), а на Windows поток Python в канале кодируется кодовой страницей
     (`cp1251`) — кириллица дошла бы искажённой. В настоящей консоли Windows поток и так UTF-8.
-    Тот же приём, что у хука плагина (`pretooluse.py::main`). Команда `mcp` исключена:
-    её stdout — канал JSON-RPC клиента, им распоряжается лаунчер."""
+    Тот же приём, что у хука плагина (`pretooluse.py::main`). Вызывается первой строкой `main`:
+    справка `--help` и отказы argparse печатаются внутри `parse_args`. Команда `mcp` не
+    исключена: SDK `stdio_server` забирает дескриптор 1 в двоичном режиме, и текстовая обёртка
+    канал JSON-RPC не затрагивает. Режим ошибок потока сохраняется: сброс в `strict` уронил бы
+    печать отказа на суррогате из `argv`."""
     for поток in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
-            поток.reconfigure(encoding="utf-8")
+            поток.reconfigure(encoding="utf-8", errors=поток.errors)
 
 
-def _лимит_коммитов(значение: str):
+def _лимит_коммитов(значение: str) -> int | str:
+    # Не-ASCII цифры (`²`) отклоняются здесь же: `int("²")` дал бы `ValueError`, и argparse
+    # напечатал бы вместо подсказки «invalid _лимит_коммитов value» с именем функции.
     if значение == "default":
         return значение
-    if значение.isdigit():
+    if re.fullmatch(r"[0-9]+", значение):
         return int(значение)
     raise argparse.ArgumentTypeError("целое число (0 — без лимита) или default")
 
 
-# Ключ командной строки → поле записи базы (`config/base_edit.py::ПОЛЯ`).
+# Ключ командной строки → поле записи базы (`config/base_edit.py::ПОЛЯ`); порядок — как в `ПОЛЯ`
+# и в файле: так строки таблицы «было → стало» идут в порядке записи.
 _КЛЮЧИ_BASE_SET = (
-    ("gate", "gate.mode"),
-    ("write", "write"),
     ("label", "label"),
     ("role", "role"),
+    ("write", "write"),
+    ("gate", "gate.mode"),
     ("post_documents", "permissions.post_documents"),
     ("mark_deletion", "permissions.mark_deletion"),
     ("register_delete", "permissions.independent_register_delete"),
@@ -1052,7 +1059,11 @@ def _изменения_base_set(args: argparse.Namespace) -> dict[str, object]:
         значение = getattr(args, атрибут, None)
         if значение is None:
             continue
-        if значение == "default":
+        if поле == "label":
+            # Подпись — произвольная строка: `default`, `on`, `off` здесь обычные слова, а не
+            # значения-переключатели. Края обрезаются, как у `base add`.
+            изменения[поле] = значение.strip()
+        elif значение == "default":
             изменения[поле] = ПО_РОЛИ
         elif значение == "on":
             изменения[поле] = True
@@ -1063,11 +1074,15 @@ def _изменения_base_set(args: argparse.Namespace) -> dict[str, object]:
     return изменения
 
 
+def _да_нет(значение: bool) -> str:
+    return "да" if значение else "нет"
+
+
 def _показать_значение(поле: str, значение: object) -> str:
     if поле == "permissions.commit_limit":
         return "без лимита" if значение == 0 else str(значение)
     if isinstance(значение, bool):
-        return "да" if значение else "нет"
+        return _да_нет(значение)
     return str(значение)
 
 
@@ -1083,8 +1098,10 @@ def cmd_base_set(home: pathlib.Path, name: str, изменения: dict[str, ob
     Печатает только изменённые поля «было → стало» с источником и действующее состояние базы.
     Адрес, пользователь и пароль не печатаются ни в одной ветке: команду теперь запускает модель
     (навык `odata1c-base`), и её вывод — тот же канал наружу, что и ответ тула. Правку делает
-    `set_base_fields`; настройки читаются заранее, чтобы файл, который не разбирается, дал тот же
-    `config_invalid` с путём и строкой, что и у демона, а не отказ посреди правки."""
+    `set_base_fields`: он сам проверяет файл той же моделью, что читает демон (тот же
+    `config_invalid` с путём и строкой), и отвечает `base_unknown` с перечнем баз. `load_config`
+    здесь не вызывается: он разрешает `password: keyring` и без пакета или секрета отказал бы,
+    хотя пароль команде не нужен."""
     if not изменения:
         print(_ПОДСКАЗКА_BASE_SET)
         return 1
@@ -1092,41 +1109,42 @@ def cmd_base_set(home: pathlib.Path, name: str, изменения: dict[str, ob
         подпись = str(изменения["label"])
         if not подпись.strip():
             raise ConfigError("подпись базы не может быть пустой")
-        # Перевод строки или табуляция в подписи писатель положил бы многострочным скаляром, и
-        # правило «одно поле — одна строка» сломалось бы при следующей правке файла.
-        if not all(символ.isprintable() for символ in подпись):
+        # Перевод строки в подписи писатель положил бы многострочным скаляром, и правило «одно
+        # поле — одна строка» сломалось бы при следующей правке файла. Неразрывный пробел и
+        # прочие пробелы допустимы: отклоняются только управляющие символы и разделители строк.
+        if any(unicodedata.category(символ) in ("Cc", "Zl", "Zp") for символ in подпись):
             raise ConfigError("подпись базы должна быть одной строкой без управляющих символов")
-    config = load_config(home)
-    _печать_предупреждений(config)
-    if name not in config.bases:
-        raise ConfigError(
-            f"база «{name}» не описана в bases.yaml",
-            code="base_unknown",
-            hint=f"известные базы: {', '.join(sorted(config.bases)) or 'ни одной'}",
-        )
     результат = set_base_fields(home / "bases.yaml", name, изменения)
     print(f"база {name} ({результат.label})")
     if not результат.изменено:
         print("изменений нет")
         return 0
-    print(f"{'поле':<42}{'было':<30}стало")
-    for и in результат.изменения:
-        if not и.есть:
-            continue
-        print(
-            f"{и.поле:<42}{_с_источником(и.поле, и.было, и.было_источник):<30}"
-            f"{_с_источником(и.поле, и.стало, и.стало_источник)}"
+    строки = [
+        (
+            и.поле,
+            _с_источником(и.поле, и.было, и.было_источник),
+            _с_источником(и.поле, и.стало, и.стало_источник),
         )
-    if "role" in изменения and результат.явные_поля:
+        for и in результат.изменения
+        if и.есть
+    ]
+    # Ширина колонок — по данным: «identifiers+names (по роли prod)» длиннее любой фиксированной
+    # ширины, и значения слиплись бы.
+    ширина_поля = max(len(поле) for поле, _, _ in [("поле", "", ""), *строки]) + 2
+    ширина_было = max(len(было) for _, было, _ in [("", "было", ""), *строки]) + 2
+    print(f"{'поле':<{ширина_поля}}{'было':<{ширина_было}}стало")
+    for поле, было, стало in строки:
+        print(f"{поле:<{ширина_поля}}{было:<{ширина_было}}{стало}")
+    if результат.явные_поля and any(и.поле == "role" and и.есть for и in результат.изменения):
         print(f"задано явно, роль не влияет: {', '.join(результат.явные_поля)}")
     д = результат.действует
     р = д["permissions"]
     print(
         f"действует: роль {д['role']}; гейт {д['gate']}; "
-        f"запись {_показать_значение('write', д['write'])}; "
-        f"проведение {_показать_значение('', р['post_documents'])}; "
-        f"пометка удаления {_показать_значение('', р['mark_deletion'])}; "
-        f"удаление записей регистров {_показать_значение('', р['independent_register_delete'])}; "
+        f"запись {_да_нет(д['write'])}; "
+        f"проведение {_да_нет(р['post_documents'])}; "
+        f"пометка удаления {_да_нет(р['mark_deletion'])}; "
+        f"удаление записей регистров {_да_нет(р['independent_register_delete'])}; "
         f"лимит коммитов {_показать_значение('permissions.commit_limit', р['commit_limit'])}"
     )
     print(
