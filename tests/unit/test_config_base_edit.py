@@ -759,3 +759,44 @@ def test_замена_файла_удаётся_со_второй_попытки
     assert len(вызовы) == 2
     assert _данные(путь, "ut")["write"] is False
     assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_многострочная_подпись_без_кавычек_отклоняется_контрольным_чтением(tmp_path):
+    """Обычный скаляр с продолжением на следующей строке: правка первой строки оставила бы хвост,
+    YAML склеил бы строки в «Короткая подпись», а загрузчик такую запись принимает."""
+    путь = _рукописный(
+        tmp_path,
+        "bases:\n  ut:\n    label: очень длинная\n      подпись\n    url: https://server/ut\n"
+        "    user: u\n    password: p\n    role: prod\n",
+    )
+    assert _данные(путь, "ut")["label"] == "очень длинная подпись"
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="читается не так") as ошибка:
+        set_base_fields(путь, "ut", {"label": "Короткая"})
+
+    assert "подпись" not in str(ошибка.value)
+    assert "label" in str(ошибка.value)
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_пустой_раздел_gate_отклоняется_как_нестандартная_форма(tmp_path):
+    путь = _рукописный(tmp_path, _ГОЛОВА + "    role: prod\n    gate:\n")
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="нестандартной форме"):
+        set_base_fields(путь, "ut", {"write": True})
+
+    assert путь.read_bytes() == байты
+
+
+def test_контрольное_чтение_пропускает_off_и_числа(tmp_path):
+    """YAML 1.1 читает `off` как `false`; `_значение` возвращает его как `off`."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+
+    set_base_fields(путь, "ut", {"gate.mode": "off", "permissions.commit_limit": 0, "write": False})
+
+    данные = _данные(путь, "ut")
+    assert данные["gate"] == {"mode": False}
+    assert данные["permissions"] == {"commit_limit": 0}
