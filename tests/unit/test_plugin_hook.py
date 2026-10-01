@@ -1402,6 +1402,54 @@ def test_powershell_обратная_кавычка_перед_кавычкой_
     assert _решение(результат)["permissionDecision"] == "ask"
 
 
+@pytest.mark.parametrize(
+    ("тул", "команда"),
+    [
+        # `;` в подписи режет хвост до незакрытой кавычки; слово подкоманды с кавычкой внутри
+        # не должно распасться на `b as e` в запасном разборе
+        ("Bash", 'odata1c b"as"e set ut --label "a;" --gate off'),
+        ("PowerShell", 'odata1c b"as"e set ut --gate off --label "x`"y"'),
+        # `>|` — перенаправление, аргументы после него принадлежат команде
+        ("Bash", "odata1c base set ut >| итог.txt --gate off"),
+        ("PowerShell", "odata1c base set ut >| итог.txt --gate off"),
+        # `$'…'` в Bash: `\'` внутри — экранирование, которого `shlex` не знает
+        ("Bash", "odata1c base set ut --label $'a\\';' --gate off"),
+    ],
+)
+def test_остатки_обходов_ревью_раунд_2_дают_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда", ["odata1c base set --help", "odata1c base set -h", "odata1c base set ut --help"]
+)
+def test_справка_base_set_молчит(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_конвейер_после_base_set_по_прежнему_режет_хвост(tmp_path):
+    """`|&` остаётся разделителем: `--gate off` после него — аргумент другой команды."""
+    команда = "odata1c base set ut --write off |& echo --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.stdout.strip() == ""
+
+
 def test_две_снижающие_команды_называют_обе_базы(tmp_path):
     команда = "odata1c base set ut --gate off && odata1c base set bp --write on"
 
