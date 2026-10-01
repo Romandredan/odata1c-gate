@@ -10,11 +10,7 @@ import pytest
 import yaml
 
 import odata1c.config.base_edit as base_edit
-from odata1c.config.base_edit import (  # noqa: F401 — для задач 4–6
-    ПО_РОЛИ,
-    SetResult,
-    set_base_fields,
-)
+from odata1c.config.base_edit import ПО_РОЛИ, set_base_fields
 from odata1c.config.loader import ConfigError
 from odata1c.config.writer import append_base
 
@@ -30,7 +26,7 @@ def _файл(tmp_path: pathlib.Path, *записи: tuple[str, dict]) -> pathli
 
 
 def _строки(путь: pathlib.Path) -> list[str]:
-    return путь.read_bytes().decode("utf-8").split("\n")
+    return путь.read_bytes().decode("utf-8").replace("\r\n", "\n").split("\n")
 
 
 def _данные(путь: pathlib.Path, имя: str) -> dict:
@@ -214,3 +210,244 @@ def test_разделы_gate_и_permissions_первыми_ключами_зап
         "permissions.commit_limit": 6,
         "url": 7,
     }
+
+
+# --- Задача 4: установка полей и запись файла -----------------------------------------------
+
+
+def test_write_off_на_prod_пишет_явно_в_строку_образца(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    до = _строки(путь)
+
+    результат = set_base_fields(путь, "ut", {"write": False})
+
+    после = _строки(путь)
+    assert результат.изменено
+    [и] = результат.изменения
+    assert (и.было, и.было_источник, и.стало, и.стало_источник) == (
+        False,
+        "по роли prod",
+        False,
+        "явно",
+    )
+    assert _данные(путь, "ut")["write"] is False
+    assert len(до) == len(после)
+    различия = [(a, b) for a, b in zip(до, после, strict=True) if a != b]
+    assert len(различия) == 1
+    assert различия[0][0].startswith("    # write: false")
+    assert различия[0][1].startswith("    write: false")
+    assert различия[0][1].endswith("# разрешить пишущие тулы")
+
+
+def test_активная_строка_переписывается_с_комментарием_владельца(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+    текст = путь.read_text(encoding="utf-8").replace("# по роли — false", "# мой комментарий")
+    путь.write_text(текст, encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"write": False})
+
+    строка = next(с for с in _строки(путь) if с.startswith("    write:"))
+    assert строка.startswith("    write: false")
+    assert строка.endswith("# мой комментарий")
+    assert _данные(путь, "ut")["write"] is False
+
+
+def test_повтор_того_же_значения_не_меняет_файл(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    set_base_fields(путь, "ut", {"write": False})
+    байты = путь.read_bytes()
+
+    результат = set_base_fields(путь, "ut", {"write": False})
+
+    assert not результат.изменено
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_write_совпадающий_с_ролью_всё_равно_пишется_явно(tmp_path):
+    """Как `base add --gate`: явное значение не зависит от последующей смены роли; «изменений
+    нет» — только когда совпали и значение, и источник."""
+    путь = _файл(tmp_path, ("ut", {"role": "dev"}))
+
+    результат = set_base_fields(путь, "ut", {"write": True})
+
+    assert результат.изменено
+    assert _данные(путь, "ut")["write"] is True
+    [и] = результат.изменения
+    assert (и.было_источник, и.стало_источник) == ("по роли dev", "явно")
+
+
+def test_label_с_решёткой_и_кавычкой(tmp_path):
+    """Review Focus 2: подпись с символами разметки остаётся разбираемой и правится повторно."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+
+    set_base_fields(путь, "ut", {"label": "УТ #1: 'боевая'"})
+    assert _данные(путь, "ut")["label"] == "УТ #1: 'боевая'"
+
+    результат = set_base_fields(путь, "ut", {"label": "УТ #2"})
+    assert _данные(путь, "ut")["label"] == "УТ #2"
+    assert результат.label == "УТ #2"
+    строка = next(с for с in _строки(путь) if с.startswith("    label:"))
+    assert строка.endswith("# подпись для модели") or "#" not in строка.split("'УТ #2'")[-1][:1]
+
+
+def test_gate_mode_активирует_родителя_и_оставляет_прочие_образцы(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+
+    результат = set_base_fields(путь, "ut", {"gate.mode": "off"})
+
+    строки = _строки(путь)
+    assert "    gate:" in строки
+    mode = next(с for с in строки if с.startswith("      mode:"))
+    assert mode.startswith("      mode: off")
+    assert "off | identifiers | identifiers+names" in mode
+    assert any(с.startswith("    #") and "что именно скрывать" in с for с in строки)
+    assert _данные(путь, "ut")["gate"] == {
+        "mode": False
+    }  # YAML 1.1: off → false; модель примет как off
+    [и] = результат.изменения
+    assert (и.было, и.стало, и.стало_источник) == ("identifiers+names", "off", "явно")
+    assert результат.действует["gate"] == "off"
+    assert результат.явные_поля == ["gate.mode"]
+
+
+def test_permissions_флаг_активирует_раздел_и_оставляет_остальное_образцами(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+
+    результат = set_base_fields(путь, "ut", {"permissions.commit_limit": 5})
+
+    строки = _строки(путь)
+    assert "    permissions:" in строки
+    assert any(с.startswith("      commit_limit: 5") for с in строки)
+    assert any(с.startswith("    #   post_documents: true") for с in строки)
+    assert _данные(путь, "ut")["permissions"] == {"commit_limit": 5}
+    assert результат.действует["permissions"]["commit_limit"] == 5
+    assert результат.действует["permissions"]["post_documents"] is True
+
+
+def test_второй_флаг_раздела_активируется_внутри_активного_раздела(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    set_base_fields(путь, "ut", {"permissions.commit_limit": 5})
+
+    set_base_fields(путь, "ut", {"permissions.post_documents": False})
+
+    assert _данные(путь, "ut")["permissions"] == {"post_documents": False, "commit_limit": 5}
+    assert _строки(путь).count("    permissions:") == 1
+
+
+def test_вложенное_поле_вставляется_под_активного_родителя(tmp_path):
+    """Review Focus 3: владелец сам дописал `permissions:` с одним флагом, образцов нет."""
+    текст = (
+        "bases:\n  ut:\n    label: УТ\n    url: https://server/ut\n    user: u\n"
+        "    password: p\n    role: prod\n    permissions:\n      mark_deletion: false\n"
+    )
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(текст, encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"permissions.commit_limit": 3})
+
+    строки = _строки(путь)
+    assert строки[7] == "    permissions:"
+    assert строки[8].startswith("      commit_limit: 3")
+    assert строки[9] == "      mark_deletion: false"
+    assert _данные(путь, "ut")["permissions"] == {"mark_deletion": False, "commit_limit": 3}
+
+
+def test_рукописная_запись_без_образцов_вставка_после_role(tmp_path):
+    текст = (
+        "bases:\n  ut:\n    label: УТ\n    url: https://server/ut\n    user: u\n"
+        "    password: p\n    role: prod\n"
+    )
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(текст, encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"write": True, "gate.mode": "identifiers"})
+
+    строки = _строки(путь)
+    assert строки[6] == "    role: prod"
+    assert строки[7] == "    gate:"
+    assert строки[8].startswith("      mode: identifiers")
+    assert строки[9].startswith("    write: true")
+    assert _данные(путь, "ut")["gate"] == {"mode": "identifiers"}
+
+
+def test_запись_из_шаблона_поставки_правится(tmp_path):
+    """Шаблон `bases.example.yaml`, раскомментированный целиком (Ctrl+/ редактора): колонка
+    комментариев на две позиции правее, но образцы и структура те же."""
+    import importlib.resources
+
+    шаблон = (
+        importlib.resources.files("odata1c.templates")
+        .joinpath("bases.example.yaml")
+        .read_text(encoding="utf-8")
+    )
+    строки, в_разделе = [], False
+    for с in шаблон.split("\n"):
+        if с.startswith("bases:"):
+            в_разделе = True
+        elif в_разделе and с.startswith("# "):
+            с = с[2:]
+        строки.append(с)
+    путь = tmp_path / "bases.yaml"
+    путь.write_text("\n".join(строки), encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"write": True, "gate.mode": "identifiers"})
+
+    данные = _данные(путь, "ut")
+    assert данные["write"] is True
+    assert данные["gate"] == {"mode": "identifiers"}
+    assert _данные(путь, "buh")["role"] == "prod"
+
+
+def test_другие_записи_и_строки_вне_правки_не_меняются(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}), ("bp", {"role": "dev"}))
+    до = _строки(путь)
+    ut_до = _данные(путь, "ut")
+
+    set_base_fields(путь, "bp", {"write": False, "gate.mode": "identifiers+names"})
+
+    после = _строки(путь)
+    assert len(после) == len(до)
+    различия = [i for i, (a, b) in enumerate(zip(до, после, strict=True)) if a != b]
+    assert len(различия) == 3  # write, `gate:`, `mode`
+    assert all(до[i].startswith("    #") for i in различия)
+    assert _данные(путь, "ut") == ut_до
+
+
+def test_сбой_проверки_оставляет_файл_нетронутым(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    def отказ(*args, **kwargs):
+        raise ConfigError("bases.yaml: база «ut» описана неверно: write: тест")
+
+    monkeypatch.setattr(base_edit, "parse_bases", отказ)
+
+    with pytest.raises(ConfigError, match="описана неверно"):
+        set_base_fields(путь, "ut", {"write": True})
+
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_crlf_сохраняется(tmp_path):
+    """Review Focus 1: на Windows `pathlib.write_text` пишет `\\r\\n`, и файл владельца такой."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    путь.write_bytes(путь.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+
+    set_base_fields(путь, "ut", {"write": False})
+
+    байты = путь.read_bytes()
+    assert b"\r\n" in байты
+    assert b"\n" not in байты.replace(b"\r\n", b"")
+    assert _данные(путь, "ut")["write"] is False
+
+
+def test_неизвестное_поле_и_default_у_label_отклоняются_до_чтения_файла(tmp_path):
+    путь = tmp_path / "нет_такого.yaml"
+    with pytest.raises(ValueError):
+        set_base_fields(путь, "ut", {"url": "x"})
+    with pytest.raises(ValueError):
+        set_base_fields(путь, "ut", {"label": ПО_РОЛИ})
+    with pytest.raises(ConfigError, match="не найден"):
+        set_base_fields(путь, "ut", {"write": True})
