@@ -1,13 +1,14 @@
 """Командная строка odata1c (SPEC §3.5).
 
-В этой задаче реализованы init, base list, base test, daemon и daemon stop; остальные команды
-добавляются следующими задачами и планами.
+В этой задаче реализованы init, base list, base test, base set, daemon и daemon stop; остальные
+команды добавляются следующими задачами и планами.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import difflib
 import getpass
 import importlib.resources
@@ -23,6 +24,7 @@ from odata1c import doctor
 from odata1c.__about__ import __version__
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
+from odata1c.config.base_edit import ПО_РОЛИ, set_base_fields
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
@@ -139,6 +141,51 @@ def main(argv: list[str] | None = None) -> int:
         choices=("ut", "bp", "zup"),
         help="скопировать шаблон рецептов для типовой конфигурации",
     )
+    set_ = подкоманды.add_parser(
+        "set",
+        help="изменить настройки базы: уровень гейта, запись, подпись, роль, разрешения",
+        parents=[домашний],
+    )
+    set_.add_argument("name", help="имя базы")
+    set_.add_argument(
+        "--gate",
+        choices=("off", "identifiers", "identifiers+names", "default"),
+        help="уровень гейта этой базы; default — по роли",
+    )
+    set_.add_argument(
+        "--write", choices=("on", "off", "default"), help="пишущие тулы; default — по роли"
+    )
+    set_.add_argument("--label", help="подпись базы для модели")
+    set_.add_argument(
+        "--role",
+        choices=("prod", "test", "dev"),
+        help="роль: умолчания гейта, записи и разрешений; явно заданные поля остаются",
+    )
+    set_.add_argument(
+        "--post-documents",
+        dest="post_documents",
+        choices=("on", "off", "default"),
+        help="проведение и отмена проведения (Post/Unpost)",
+    )
+    set_.add_argument(
+        "--mark-deletion",
+        dest="mark_deletion",
+        choices=("on", "off", "default"),
+        help="пометка удаления объектов",
+    )
+    set_.add_argument(
+        "--register-delete",
+        dest="register_delete",
+        choices=("on", "off", "default"),
+        help="удаление записей независимых регистров сведений "
+        "(permissions.independent_register_delete)",
+    )
+    set_.add_argument(
+        "--commit-limit",
+        dest="commit_limit",
+        type=_лимит_коммитов,
+        help="коммитов за 10 минут на сессию: число, 0 — без лимита, default — по роли",
+    )
     импорт = подкоманды.add_parser(
         "import", help="перенести базы из env-файла прежнего сервера", parents=[домашний]
     )
@@ -238,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.команда != "mcp":
+        _вывод_в_utf8()
     home = resolve_home(getattr(args, "home", None))
 
     try:
@@ -249,6 +298,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_test(home, args.name)
         if args.команда == "base" and args.подкоманда == "add":
             return cmd_base_add(home, args.name, args.role, args.recipes, args.gate)
+        if args.команда == "base" and args.подкоманда == "set":
+            return cmd_base_set(home, args.name, _изменения_base_set(args))
         if args.команда == "base" and args.подкоманда == "import":
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
@@ -956,6 +1007,132 @@ def cmd_reveal(
         print(f"[token_unknown] токен {token} не найден в словаре")
         return 1
     print(значение)
+    return 0
+
+
+def _вывод_в_utf8() -> None:
+    """Команды CLI теперь читает и модель через канал инструмента Bash (навыки `odata1c-base`,
+    `odata1c-policy`, ADR-0017), а на Windows поток Python в канале кодируется кодовой страницей
+    (`cp1251`) — кириллица дошла бы искажённой. В настоящей консоли Windows поток и так UTF-8.
+    Тот же приём, что у хука плагина (`pretooluse.py::main`). Команда `mcp` исключена:
+    её stdout — канал JSON-RPC клиента, им распоряжается лаунчер."""
+    for поток in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            поток.reconfigure(encoding="utf-8")
+
+
+def _лимит_коммитов(значение: str):
+    if значение == "default":
+        return значение
+    if значение.isdigit():
+        return int(значение)
+    raise argparse.ArgumentTypeError("целое число (0 — без лимита) или default")
+
+
+# Ключ командной строки → поле записи базы (`config/base_edit.py::ПОЛЯ`).
+_КЛЮЧИ_BASE_SET = (
+    ("gate", "gate.mode"),
+    ("write", "write"),
+    ("label", "label"),
+    ("role", "role"),
+    ("post_documents", "permissions.post_documents"),
+    ("mark_deletion", "permissions.mark_deletion"),
+    ("register_delete", "permissions.independent_register_delete"),
+    ("commit_limit", "permissions.commit_limit"),
+)
+_ПОДСКАЗКА_BASE_SET = (
+    "укажите хотя бы одно поле: --gate, --write, --label, --role, --post-documents, "
+    "--mark-deletion, --register-delete, --commit-limit"
+)
+
+
+def _изменения_base_set(args: argparse.Namespace) -> dict[str, object]:
+    изменения: dict[str, object] = {}
+    for атрибут, поле in _КЛЮЧИ_BASE_SET:
+        значение = getattr(args, атрибут, None)
+        if значение is None:
+            continue
+        if значение == "default":
+            изменения[поле] = ПО_РОЛИ
+        elif значение == "on":
+            изменения[поле] = True
+        elif значение == "off" and поле != "gate.mode":
+            изменения[поле] = False
+        else:
+            изменения[поле] = значение
+    return изменения
+
+
+def _показать_значение(поле: str, значение: object) -> str:
+    if поле == "permissions.commit_limit":
+        return "без лимита" if значение == 0 else str(значение)
+    if isinstance(значение, bool):
+        return "да" if значение else "нет"
+    return str(значение)
+
+
+def _с_источником(поле: str, значение: object, источник: str) -> str:
+    текст = _показать_значение(поле, значение)
+    return f"{текст} ({источник})" if источник else текст
+
+
+def cmd_base_set(home: pathlib.Path, name: str, изменения: dict[str, object]) -> int:
+    """`odata1c base set <база> [--gate] [--write] [--label] [--role] [--post-documents]
+    [--mark-deletion] [--register-delete] [--commit-limit]` (ADR-0017, проект 2026-10-01 §3.1).
+
+    Печатает только изменённые поля «было → стало» с источником и действующее состояние базы.
+    Адрес, пользователь и пароль не печатаются ни в одной ветке: команду теперь запускает модель
+    (навык `odata1c-base`), и её вывод — тот же канал наружу, что и ответ тула. Правку делает
+    `set_base_fields`; настройки читаются заранее, чтобы файл, который не разбирается, дал тот же
+    `config_invalid` с путём и строкой, что и у демона, а не отказ посреди правки."""
+    if not изменения:
+        print(_ПОДСКАЗКА_BASE_SET)
+        return 1
+    if "label" in изменения:
+        подпись = str(изменения["label"])
+        if not подпись.strip():
+            raise ConfigError("подпись базы не может быть пустой")
+        # Перевод строки или табуляция в подписи писатель положил бы многострочным скаляром, и
+        # правило «одно поле — одна строка» сломалось бы при следующей правке файла.
+        if not all(символ.isprintable() for символ in подпись):
+            raise ConfigError("подпись базы должна быть одной строкой без управляющих символов")
+    config = load_config(home)
+    _печать_предупреждений(config)
+    if name not in config.bases:
+        raise ConfigError(
+            f"база «{name}» не описана в bases.yaml",
+            code="base_unknown",
+            hint=f"известные базы: {', '.join(sorted(config.bases)) or 'ни одной'}",
+        )
+    результат = set_base_fields(home / "bases.yaml", name, изменения)
+    print(f"база {name} ({результат.label})")
+    if not результат.изменено:
+        print("изменений нет")
+        return 0
+    print(f"{'поле':<42}{'было':<30}стало")
+    for и in результат.изменения:
+        if not и.есть:
+            continue
+        print(
+            f"{и.поле:<42}{_с_источником(и.поле, и.было, и.было_источник):<30}"
+            f"{_с_источником(и.поле, и.стало, и.стало_источник)}"
+        )
+    if "role" in изменения and результат.явные_поля:
+        print(f"задано явно, роль не влияет: {', '.join(результат.явные_поля)}")
+    д = результат.действует
+    р = д["permissions"]
+    print(
+        f"действует: роль {д['role']}; гейт {д['gate']}; "
+        f"запись {_показать_значение('write', д['write'])}; "
+        f"проведение {_показать_значение('', р['post_documents'])}; "
+        f"пометка удаления {_показать_значение('', р['mark_deletion'])}; "
+        f"удаление записей регистров {_показать_значение('', р['independent_register_delete'])}; "
+        f"лимит коммитов {_показать_значение('permissions.commit_limit', р['commit_limit'])}"
+    )
+    print(
+        "демон перечитает файл перед следующим вызовом тула; "
+        "смена уровня гейта придёт модели строкой warnings"
+    )
     return 0
 
 

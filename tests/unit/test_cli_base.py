@@ -1,6 +1,9 @@
-"""Команды CLI: init, base list, base test, base add, base import."""
+"""Команды CLI: init, base list, base test, base add, base set, base import."""
 
+import os
 import pathlib
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -11,7 +14,7 @@ import odata1c
 import odata1c.cli as cli
 from odata1c.cli import main
 from odata1c.config.loader import ConfigError, load_config
-from odata1c.config.writer import ensure_policy_template
+from odata1c.config.writer import append_base, ensure_policy_template
 
 URL = "http://localhost/ut/odata/standard.odata/"
 BASES = f"""
@@ -638,3 +641,200 @@ def test_base_test_печатает_предупреждение_о_правах
     assert код == 0
     assert "предупреждение" in вывод
     assert "доступен другим учётным записям" in вывод
+
+
+_АДРЕС = "https://server-secret/ut"
+_ПОЛЬЗОВАТЕЛЬ = "пользователь_1с_секретный"
+
+
+def _дом_с_базой(tmp_path, роль="prod", **значения):
+    home = tmp_path / "home"
+    assert main(["init", "--home", str(home)]) == 0
+    append_base(
+        home / "bases.yaml",
+        "ut",
+        {
+            "label": "УТ 11, тестовая",
+            "url": _АДРЕС,
+            "user": _ПОЛЬЗОВАТЕЛЬ,
+            "password": "секретный_пароль_только_для_теста",
+            "role": роль,
+            **значения,
+        },
+    )
+    return home
+
+
+def _без_реквизитов(вывод: str) -> None:
+    assert "server-secret" not in вывод
+    assert _ПОЛЬЗОВАТЕЛЬ not in вывод
+    assert "секретный_пароль_только_для_теста" not in вывод
+
+
+def test_base_set_без_ключей_подсказывает(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path)
+
+    код = main(["base", "set", "ut", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "укажите хотя бы одно поле" in вывод
+    assert "--gate" in вывод and "--commit-limit" in вывод
+
+
+def test_base_set_неизвестная_база(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path)
+
+    код = main(["base", "set", "zup", "--write", "off", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "base_unknown" in вывод
+    assert "известные базы: ut" in вывод
+    _без_реквизитов(вывод)
+
+
+def test_base_set_write_off_печатает_было_и_стало_без_реквизитов(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path, роль="dev")
+
+    код = main(
+        ["base", "set", "ut", "--write", "off", "--gate", "identifiers+names", "--home", str(home)]
+    )
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "база ut (УТ 11, тестовая)" in вывод
+    assert "write" in вывод and "да (по роли dev)" in вывод and "нет (явно)" in вывод
+    assert "gate.mode" in вывод and "off (по роли dev)" in вывод
+    assert "действует: роль dev; гейт identifiers+names; запись нет;" in вывод
+    assert "лимит коммитов без лимита" in вывод
+    assert "демон перечитает файл" in вывод
+    _без_реквизитов(вывод)
+    config = load_config(home)
+    assert config.bases["ut"].write is False
+    assert config.bases["ut"].gate.mode == "identifiers+names"
+
+
+def test_base_set_повтор_печатает_изменений_нет(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path)
+    assert main(["base", "set", "ut", "--write", "off", "--home", str(home)]) == 0
+    capsys.readouterr()
+
+    код = main(["base", "set", "ut", "--write", "off", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "изменений нет" in вывод
+    assert "действует:" not in вывод
+
+
+def test_base_set_смена_роли_называет_явные_поля(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path, gate={"mode": "identifiers+names"})
+
+    код = main(["base", "set", "ut", "--role", "dev", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "role" in вывод and "prod (явно)" in вывод and "dev (явно)" in вывод
+    assert "задано явно, роль не влияет: gate.mode" in вывод
+    assert "действует: роль dev; гейт identifiers+names; запись да;" in вывод
+    _без_реквизитов(вывод)
+
+
+def test_base_set_разрешения_и_лимит(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path)
+
+    код = main(
+        [
+            "base",
+            "set",
+            "ut",
+            "--post-documents",
+            "off",
+            "--register-delete",
+            "on",
+            "--commit-limit",
+            "0",
+            "--label",
+            "УТ: боевая #1",
+            "--home",
+            str(home),
+        ]
+    )
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "permissions.post_documents" in вывод
+    assert "permissions.independent_register_delete" in вывод
+    assert "20 (по роли prod)" in вывод and "без лимита (явно)" in вывод
+    assert "база ut (УТ: боевая #1)" in вывод
+    config = load_config(home)
+    assert config.bases["ut"].permissions.post_documents is False
+    assert config.bases["ut"].permissions.independent_register_delete is True
+    assert config.bases["ut"].permissions.commit_limit == 0
+    assert config.bases["ut"].label == "УТ: боевая #1"
+
+
+def test_base_set_default_возвращает_по_роли(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path, write=True)
+
+    код = main(["base", "set", "ut", "--write", "default", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 0
+    assert "да (явно)" in вывод and "нет (по роли prod)" in вывод
+    assert load_config(home).bases["ut"].write is False
+
+
+def test_base_set_неверный_лимит_отклоняет_argparse(tmp_path):
+    home = _дом_с_базой(tmp_path)
+
+    with pytest.raises(SystemExit) as выход:
+        main(["base", "set", "ut", "--commit-limit", "много", "--home", str(home)])
+
+    assert выход.value.code == 2
+
+
+def test_base_set_пустая_подпись_отклоняется(tmp_path, capsys):
+    home = _дом_с_базой(tmp_path)
+
+    код = main(["base", "set", "ut", "--label", "   ", "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "подпись" in вывод
+    assert load_config(home).bases["ut"].label == "УТ 11, тестовая"
+
+
+@pytest.mark.parametrize("подпись", ["a\nb", "a\rb", "a\tb"])
+def test_base_set_подпись_с_управляющими_символами_отклоняется(tmp_path, capsys, подпись):
+    home = _дом_с_базой(tmp_path)
+
+    код = main(["base", "set", "ut", "--label", подпись, "--home", str(home)])
+    вывод = capsys.readouterr().out
+
+    assert код == 1
+    assert "одной строкой" in вывод
+    assert load_config(home).bases["ut"].label == "УТ 11, тестовая"
+
+
+def test_вывод_cli_в_канале_utf8(tmp_path):
+    """Команды CLI читает модель через канал Bash; на Windows без `PYTHONUTF8` поток Python в
+    канале кодировался бы кодовой страницей. Подпроцесс — настоящий интерпретатор, переменные
+    принудительного UTF-8 сняты, как в тестах хука."""
+    home = _дом_с_базой(tmp_path)
+    окружение = {
+        к: з
+        for к, з in os.environ.items()
+        if к not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")
+    }
+
+    результат = subprocess.run(
+        [sys.executable, "-m", "odata1c", "base", "list", "--home", str(home)],
+        capture_output=True,
+        env=окружение,
+        timeout=60,
+    )
+
+    assert результат.returncode == 0, результат.stderr
+    assert "УТ 11, тестовая".encode() in результат.stdout
