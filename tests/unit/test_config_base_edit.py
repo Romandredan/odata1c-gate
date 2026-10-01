@@ -1050,6 +1050,61 @@ def test_смена_роли_перерисовывает_все_образцы_
     assert all(с.lstrip().startswith("# write: true") for с in образцы)
 
 
+def _строка_write(путь: pathlib.Path) -> str:
+    return next(с for с in _строки(путь) if с.startswith("    write:"))
+
+
+def test_хвост_по_роли_у_активной_write_следует_за_ролью(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+    исходные = путь.read_bytes()
+    assert _строка_write(путь).endswith("# по роли — false")
+
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    assert _строка_write(путь).endswith("# по роли — true")
+    assert _строка_write(путь).startswith("    write: true")
+    set_base_fields(путь, "ut", {"role": "prod"})
+    assert путь.read_bytes() == исходные
+
+
+def test_комментарий_владельца_другой_формы_у_write_не_трогается(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        _ГОЛОВА
+        + "    role: prod\n"
+        + "    write: true   # решено ИБ, по роли — false было бы неверно\n",
+    )
+
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    assert "    write: true   # решено ИБ, по роли — false было бы неверно" in _строки(путь)
+
+
+@pytest.mark.parametrize(
+    ("исходная", "ожидание"),
+    [
+        (
+            "    # умолчание роли этой базы согласовано с ИБ",
+            "    # умолчание роли этой базы согласовано с ИБ",
+        ),
+        (
+            "    # умолчание роли prod: запись закрыта до аудита",
+            "    # умолчание роли dev: запись закрыта до аудита",
+        ),
+        (
+            "    # (показаны умолчания роли prod; у test и dev запись разрешена)",
+            "    # (показаны умолчания роли dev; у test и dev запись разрешена)",
+        ),
+    ],
+)
+def test_заголовок_роли_правится_строго(tmp_path, исходная, ожидание):
+    путь = _рукописный(tmp_path, _ГОЛОВА + "    role: prod\n" + исходная + "\n")
+
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    assert ожидание in _строки(путь)
+
+
 # --- Ревью задачи 5 ---------------------------------------------------------------------------
 
 
