@@ -12,6 +12,7 @@ from odata1c.config.loader import load_config
 from odata1c.config.writer import (
     КОЛОНКА_КОММЕНТАРИЯ,
     КОММЕНТАРИИ_ПОЛЕЙ,
+    append_base,
     render_base,
     строка_записи,
 )
@@ -138,3 +139,22 @@ def test_render_base_после_выделения_помощников_не_и�
         "    #   mode: identifiers+names              # off | identifiers | identifiers+names\n"
         in текст
     )
+
+
+def test_длинная_подпись_записывается_одной_строкой(tmp_path):
+    """`yaml.safe_dump` по умолчанию переносит строку длиннее 80 знаков; построчная правка записи
+    (`base set`) держится на правиле «один ключ — одна строка»."""
+    подпись = " ".join(["слово"] * 24)
+    assert len(подпись) > 120
+    home = _дом_с(tmp_path, _шаблон())
+
+    append_base(
+        home / "bases.yaml",
+        "ut",
+        {"url": "https://s/ut", "user": "u", "password": "p", "label": подпись},
+    )
+
+    строки = (home / "bases.yaml").read_text(encoding="utf-8").splitlines()
+    [номер] = [i for i, с in enumerate(строки) if с.startswith("    label:")]
+    assert строки[номер + 1].startswith("    url:")
+    assert load_config(home).bases["ut"].label == подпись

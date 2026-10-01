@@ -288,7 +288,7 @@ def test_label_с_решёткой_и_кавычкой(tmp_path):
     assert _данные(путь, "ut")["label"] == "УТ #2"
     assert результат.label == "УТ #2"
     строка = next(с for с in _строки(путь) if с.startswith("    label:"))
-    assert строка.endswith("# подпись для модели") or "#" not in строка.split("'УТ #2'")[-1][:1]
+    assert строка == "    label: 'УТ #2'"
 
 
 def test_gate_mode_активирует_родителя_и_оставляет_прочие_образцы(tmp_path):
@@ -414,18 +414,110 @@ def test_другие_записи_и_строки_вне_правки_не_ме
     assert _данные(путь, "ut") == ut_до
 
 
-def test_сбой_проверки_оставляет_файл_нетронутым(tmp_path, monkeypatch):
+def _считающая_проверка(monkeypatch, *, отказ_на_вызове: int) -> list[int]:
+    """Подменить `parse_bases` счётчиком: настоящая проверка работает, а вызов с номером
+    `отказ_на_вызове` отказывает. Возвращает список вызовов (по одному элементу на вызов)."""
+    вызовы: list[int] = []
+    настоящая = base_edit.parse_bases
+
+    def проверка(*args, **kwargs):
+        вызовы.append(1)
+        if len(вызовы) == отказ_на_вызове:
+            raise ConfigError("bases.yaml: база «ut» описана неверно: write: тест")
+        return настоящая(*args, **kwargs)
+
+    monkeypatch.setattr(base_edit, "parse_bases", проверка)
+    return вызовы
+
+
+def test_сбой_проверки_нового_текста_оставляет_файл_нетронутым(tmp_path, monkeypatch):
     путь = _файл(tmp_path, ("ut", {"role": "prod"}))
     байты = путь.read_bytes()
-
-    def отказ(*args, **kwargs):
-        raise ConfigError("bases.yaml: база «ut» описана неверно: write: тест")
-
-    monkeypatch.setattr(base_edit, "parse_bases", отказ)
+    вызовы = _считающая_проверка(monkeypatch, отказ_на_вызове=2)
 
     with pytest.raises(ConfigError, match="описана неверно"):
         set_base_fields(путь, "ut", {"write": True})
 
+    assert len(вызовы) == 2  # исходный текст прошёл, новый отклонён
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_сбой_проверки_исходного_текста_до_любой_правки(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+    вызовы = _считающая_проверка(monkeypatch, отказ_на_вызове=1)
+
+    with pytest.raises(ConfigError, match="описана неверно"):
+        set_base_fields(путь, "ut", {"write": True})
+
+    assert len(вызовы) == 1
+    assert путь.read_bytes() == байты
+
+
+def test_проверка_нового_текста_идёт_и_когда_изменений_нет(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+    байты = путь.read_bytes()
+    вызовы = _считающая_проверка(monkeypatch, отказ_на_вызове=0)
+
+    результат = set_base_fields(путь, "ut", {"write": True})
+
+    assert not результат.изменено
+    assert len(вызовы) == 2
+    assert путь.read_bytes() == байты
+
+
+def test_роль_с_опечаткой_в_исходном_файле_даёт_конфигурационную_ошибку(tmp_path):
+    """Без `monkeypatch`: настоящий отказ `parse_bases`, а не `KeyError` из таблицы ролей."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    путь.write_text(
+        путь.read_text(encoding="utf-8").replace("    role: prod", "    role: staging"),
+        encoding="utf-8",
+    )
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="роль"):
+        set_base_fields(путь, "ut", {"write": False})
+
+    assert путь.read_bytes() == байты
+
+
+# Латинский тег проходит `compose` и падает на `safe_load` (ConstructorError), кириллический
+# падает уже в `compose` (ScannerError, «expected URI»): секрет не должен попасть в ошибку ни там,
+# ни там — ни текстом, ни цепочкой исключений, которую печатает трассировка.
+@pytest.mark.parametrize("тег", ["!secret_value", "!секретное_значение"])
+def test_тег_yaml_в_пароле_не_попадает_ни_в_ошибку_ни_в_цепочку(tmp_path, тег):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    путь.write_text(
+        путь.read_text(encoding="utf-8").replace("    password: p", f"    password: {тег}"),
+        encoding="utf-8",
+    )
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError) as ошибка:
+        set_base_fields(путь, "ut", {"write": False})
+
+    assert тег[1:] not in str(ошибка.value)
+    assert тег[1:] not in (ошибка.value.hint or "")
+    assert ошибка.value.__cause__ is None
+    assert ошибка.value.__suppress_context__
+    assert путь.read_bytes() == байты
+
+
+def test_правка_дала_неразбираемый_файл_без_значений_в_ошибке(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    def портит(строки, з, *, поле, текст):
+        строки.insert(з.начало + 1, "    заметка: !секретное_значение")
+
+    monkeypatch.setattr(base_edit, "_установить", портит)
+
+    with pytest.raises(ConfigError, match="неразбираемый") as ошибка:
+        set_base_fields(путь, "ut", {"write": True})
+
+    assert "секретное_значение" not in str(ошибка.value)
+    assert ошибка.value.__cause__ is None
     assert путь.read_bytes() == байты
     assert not путь.with_suffix(".yaml.new").exists()
 
@@ -451,3 +543,219 @@ def test_неизвестное_поле_и_default_у_label_отклоняют�
         set_base_fields(путь, "ut", {"label": ПО_РОЛИ})
     with pytest.raises(ConfigError, match="не найден"):
         set_base_fields(путь, "ut", {"write": True})
+
+
+# --- Ревью задачи 4: подпись в одну строку, раскладка образцов, запись файла ----------------
+
+_ГОЛОВА = "bases:\n  ut:\n    label: УТ\n    url: https://server/ut\n    user: u\n    password: p\n"
+
+
+def _рукописный(tmp_path: pathlib.Path, текст: str) -> pathlib.Path:
+    путь = tmp_path / "bases.yaml"
+    путь.write_bytes(текст.encode("utf-8"))
+    return путь
+
+
+def test_двухстрочная_подпись_отклоняется_без_значения(tmp_path):
+    """Файл, записанный прежней версией `base add`: длинная подпись перенесена на вторую строку."""
+    путь = _рукописный(
+        tmp_path,
+        "bases:\n  ut:\n    label: 'очень секретная длинная\n      подпись'\n"
+        "    url: https://server/ut\n    user: u\n    password: p\n    role: prod\n",
+    )
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="несколько строк") as ошибка:
+        set_base_fields(путь, "ut", {"label": "Короткая"})
+
+    assert "секретная" not in str(ошибка.value)
+    assert путь.read_bytes() == байты
+
+
+def test_длинная_подпись_после_правки_остаётся_в_одной_строке(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    подпись = " ".join(["слово"] * 30)
+
+    set_base_fields(путь, "ut", {"label": подпись})
+    set_base_fields(путь, "ut", {"label": "Короткая"})
+
+    assert _данные(путь, "ut")["label"] == "Короткая"
+    assert sum(1 for с in _строки(путь) if с.startswith("    label:")) == 1
+    assert "слово" not in путь.read_text(encoding="utf-8")
+
+
+def test_образец_с_тремя_пробелами_после_решётки_встаёт_на_колонку_записи(tmp_path):
+    путь = _рукописный(tmp_path, _ГОЛОВА + "    role: prod\n    #   write: false\n")
+
+    set_base_fields(путь, "ut", {"write": True})
+
+    assert _строки(путь)[7].startswith("    write: true")
+    assert _данные(путь, "ut")["write"] is True
+
+
+def test_флаг_встаёт_под_активный_раздел_а_не_на_образец_выше_него(tmp_path):
+    """Раздел `permissions:` дописан в конец записи `base add`; образцы флагов остались выше."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    путь.write_bytes(
+        путь.read_bytes().replace(b"\r\n", b"\n").rstrip(b"\n")
+        + b"\n    permissions:\n      mark_deletion: false\n"
+    )
+
+    set_base_fields(путь, "ut", {"permissions.post_documents": False})
+
+    строки = _строки(путь)
+    i = строки.index("    permissions:")
+    assert строки[i + 1].startswith("      post_documents: false")
+    assert any(с.startswith("    #   post_documents: true") for с in строки)
+    assert _данные(путь, "ut")["permissions"] == {"post_documents": False, "mark_deletion": False}
+
+
+def test_образец_внутри_блока_активного_раздела_активируется_на_колонку_детей(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        _ГОЛОВА
+        + "    role: prod\n    permissions:\n      mark_deletion: false\n"
+        + "    #   commit_limit: 20\n",
+    )
+
+    set_base_fields(путь, "ut", {"permissions.commit_limit": 3})
+
+    строки = _строки(путь)
+    assert строки[8] == "      mark_deletion: false"
+    assert строки[9].startswith("      commit_limit: 3")
+    assert _данные(путь, "ut")["permissions"] == {"mark_deletion": False, "commit_limit": 3}
+
+
+def test_ребёнок_активного_раздела_встаёт_вровень_с_прежними_детьми(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        _ГОЛОВА + "    role: prod\n    permissions:\n        mark_deletion: false\n",
+    )
+
+    set_base_fields(путь, "ut", {"permissions.commit_limit": 3})
+
+    assert _строки(путь)[8].startswith("        commit_limit: 3")
+    assert _данные(путь, "ut")["permissions"] == {"mark_deletion": False, "commit_limit": 3}
+
+
+def test_образец_ребёнка_есть_образца_родителя_нет(tmp_path):
+    путь = _рукописный(tmp_path, _ГОЛОВА + "    role: prod\n    #   mode: off\n")
+
+    set_base_fields(путь, "ut", {"gate.mode": "identifiers"})
+
+    строки = _строки(путь)
+    assert строки[6] == "    role: prod"
+    assert строки[7] == "    gate:"
+    assert строки[8].startswith("      mode: identifiers")
+    assert _данные(путь, "ut")["gate"] == {"mode": "identifiers"}
+
+
+def test_разделить_двойные_кавычки_с_экранированной_косой_чертой():
+    assert base_edit._разделить(' "a\\\\"   # к') == ('"a\\\\"', "к")
+    assert base_edit._разделить(' "a\\"b"   # к') == ('"a\\"b"', "к")
+
+
+def test_подпись_с_косой_чертой_в_конце_правится_с_комментарием(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        """bases:\n  ut:\n    label: "a\\\\"   # к\n    url: https://server/ut\n"""
+        "    user: u\n    password: p\n    role: prod\n",
+    )
+    assert _данные(путь, "ut")["label"] == "a\\"
+
+    set_base_fields(путь, "ut", {"label": "Новая"})
+
+    строка = next(с for с in _строки(путь) if с.startswith("    label:"))
+    assert строка.startswith("    label: Новая")
+    assert строка.endswith("# к")
+
+
+def test_окончания_строк_берутся_по_первой_строке(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    lf = путь.read_bytes().replace(b"\r\n", b"\n")
+    первая, _, остальное = lf.partition(b"\n")
+
+    путь.write_bytes(первая + b"\n" + остальное.replace(b"\n", b"\r\n"))
+    set_base_fields(путь, "ut", {"write": False})
+    assert b"\r\n" not in путь.read_bytes()
+
+    путь.write_bytes(первая + b"\r\n" + остальное)
+    set_base_fields(путь, "ut", {"write": False})
+    байты = путь.read_bytes()
+    assert b"\r\n" in байты
+    assert b"\n" not in байты.replace(b"\r\n", b"")
+
+
+def test_поле_без_изменения_не_переписывается_в_вызове_с_несколькими_полями(tmp_path):
+    путь = _рукописный(tmp_path, _ГОЛОВА + "    role: prod\n    write: true   # мой\n")
+
+    результат = set_base_fields(путь, "ut", {"write": True, "label": "Новая"})
+
+    assert "    write: true   # мой" in _строки(путь)
+    assert _данные(путь, "ut")["label"] == "Новая"
+    assert результат.изменено
+
+
+def test_снять_поле_которого_нет_явно_ничего_не_делает(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    результат = set_base_fields(путь, "ut", {"write": ПО_РОЛИ})
+
+    assert not результат.изменено
+    assert путь.read_bytes() == байты
+
+
+def test_вставка_без_role_идёт_после_последней_из_label_url_user_password(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        "bases:\n  ut:\n    password: p\n    user: u\n    url: https://server/ut\n    label: УТ\n",
+    )
+
+    set_base_fields(путь, "ut", {"write": True})
+
+    строки = _строки(путь)
+    assert строки[5] == "    label: УТ"
+    assert строки[6].startswith("    write: true")
+
+
+def test_замена_файла_занята_другим_процессом(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+    вызовы: list[int] = []
+
+    def занято(*args, **kwargs):
+        вызовы.append(1)
+        raise PermissionError(13, "занят")
+
+    monkeypatch.setattr(base_edit.os, "replace", занято)
+    monkeypatch.setattr(base_edit.time, "sleep", lambda секунды: None)
+
+    with pytest.raises(ConfigError, match="занят другим процессом") as ошибка:
+        set_base_fields(путь, "ut", {"write": False})
+
+    assert len(вызовы) > 1  # были повторы
+    assert ошибка.value.hint
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
+
+
+def test_замена_файла_удаётся_со_второй_попытки(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    настоящая = base_edit.os.replace
+    вызовы: list[int] = []
+
+    def занято_один_раз(*args, **kwargs):
+        вызовы.append(1)
+        if len(вызовы) == 1:
+            raise PermissionError(13, "занят")
+        return настоящая(*args, **kwargs)
+
+    monkeypatch.setattr(base_edit.os, "replace", занято_один_раз)
+    monkeypatch.setattr(base_edit.time, "sleep", lambda секунды: None)
+
+    set_base_fields(путь, "ut", {"write": False})
+
+    assert len(вызовы) == 2
+    assert _данные(путь, "ut")["write"] is False
+    assert not путь.with_suffix(".yaml.new").exists()
