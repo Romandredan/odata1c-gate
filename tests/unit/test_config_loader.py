@@ -4,7 +4,8 @@ import concurrent.futures
 
 import pytest
 
-from odata1c.config.loader import ConfigError, load_config, reload_bases
+import odata1c.config.loader as loader
+from odata1c.config.loader import ConfigError, load_config, parse_bases, reload_bases
 from odata1c.config.models import DaemonConfig
 
 BASES = """
@@ -297,3 +298,52 @@ def test_reload_bases_видит_новый_состав_баз(tmp_path):
 
     assert set(вторая.bases) == {"buh"}
     assert вторая.daemon is первая.daemon
+
+
+def _данные_с_keyring() -> dict:
+    return {
+        "default": "ut",
+        "bases": {
+            "ut": {
+                "label": "УТ",
+                "url": "http://localhost/ut",
+                "user": "u",
+                "password": "keyring",
+                "role": "test",
+            }
+        },
+    }
+
+
+def test_parse_bases_с_resolve_keyring_false_не_ходит_в_хранилище(monkeypatch, tmp_path):
+    """`base set` проверяет новый текст файла до записи (задача 4): пароль `keyring` при этом
+    остаётся строкой, хранилище ОС не трогается — иначе проверка падала бы на машине без
+    пакета keyring или без записанного секрета."""
+    monkeypatch.setattr(loader, "_из_keyring", lambda имя: pytest.fail("хранилище ОС тронуто"))
+
+    default, bases = parse_bases(
+        _данные_с_keyring(), tmp_path / "bases.yaml", [], resolve_keyring=False
+    )
+
+    assert default == "ut"
+    assert bases["ut"].password == "keyring"
+    assert bases["ut"].gate.mode == "identifiers"  # умолчание роли test наложено
+
+
+def test_parse_bases_по_умолчанию_раскрывает_keyring(monkeypatch, tmp_path):
+    monkeypatch.setattr(loader, "_из_keyring", lambda имя: f"секрет-{имя}")
+
+    _, bases = parse_bases(_данные_с_keyring(), tmp_path / "bases.yaml", [])
+
+    assert bases["ut"].password == "секрет-ut"
+
+
+def test_parse_bases_ошибка_записи_называет_файл_и_не_значение(tmp_path):
+    данные = _данные_с_keyring()
+    данные["bases"]["ut"]["url"] = "server/ut"  # без схемы — отказ валидатора адреса
+
+    with pytest.raises(ConfigError) as ошибка:
+        parse_bases(данные, tmp_path / "bases.yaml", [], resolve_keyring=False)
+
+    assert "bases.yaml: база «ut» описана неверно" in str(ошибка.value)
+    assert "server/ut" not in str(ошибка.value)

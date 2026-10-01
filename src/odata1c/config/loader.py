@@ -153,7 +153,23 @@ def _load_bases(
     предупреждение = check_file_permissions(path)
     if предупреждение:
         warnings.append(предупреждение)
-    data = _разобрать_yaml(path)
+    return parse_bases(_разобрать_yaml(path), path, warnings)
+
+
+def parse_bases(
+    data: dict,
+    path: pathlib.Path,
+    warnings: list[str],
+    *,
+    resolve_keyring: bool = True,
+) -> tuple[str | None, dict[str, BaseConfig]]:
+    """Собрать записи баз из уже разобранного содержимого файла баз: умолчания роли, модель
+    `BaseConfig`, база по умолчанию. `path` нужен только для текстов ошибок.
+
+    Отдельно от чтения файла — ради `base set` (`config/base_edit.py`): команда проверяет новый
+    текст этой же функцией ДО того, как положит его на место исходного файла, и с
+    `resolve_keyring=False` — пароль `keyring` остаётся строкой, хранилище ОС не трогается: проверка
+    текста не должна зависеть от того, установлен ли пакет keyring и записан ли секрет."""
     raw_bases = data.get("bases") or {}
     if not isinstance(raw_bases, dict):
         raise ConfigError("в bases.yaml раздел bases должен быть словарём «имя базы: настройки»")
@@ -190,7 +206,7 @@ def _load_bases(
                 f"bases.yaml: база «{name}» описана неверно: {текст_ошибки}",
                 hint=f"проверьте запись базы в файле {path}",
             ) from exc
-        if bases[name].password == "keyring":
+        if resolve_keyring and bases[name].password == "keyring":
             bases[name] = bases[name].model_copy(update={"password": _из_keyring(name)})
 
     default = data.get("default")
