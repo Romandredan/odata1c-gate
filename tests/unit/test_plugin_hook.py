@@ -1271,3 +1271,156 @@ def test_reveal_старше_правила_4(tmp_path):
     )
 
     assert _решение(результат)["permissionDecision"] == "deny"
+
+
+# --- Правило 4, раунд правок по ревью задачи 8: разбор по токенам ---------------------------
+
+# `--home` CLI принимает в любой позиции; сокращения ключей argparse тоже принимал (теперь
+# `allow_abbrev=False`, но хук не должен на это полагаться); оболочка склеивает переносы строк и
+# передаёт аргументы после перенаправления.
+_СНИЖАЮЩИЕ_РАУНД_2 = [
+    "odata1c --home C:/h base set ut --gate off",
+    "odata1c --home=C:/h base set ut --gate off",
+    "odata1c base --home C:/h set ut --gate off",
+    "odata1c base --home=C:/h set ut --gate off",
+    "uv run odata1c --home C:/h base --home C:/h set ut --write on",
+    "odata1c base set ut --gat off",
+    "odata1c base set ut --g=off",
+    "odata1c base set ut --w on",
+    "odata1c base set ut --ro dev",
+    "odata1c base set ut --p on",
+    "odata1c base set ut --m on",
+    "odata1c base set ut --re on",
+    "odata1c base set ut --c 0",
+    "odata1c base set ut --несуществующий",
+    "odata1c base set ut --write off --gate off",
+    "odata1c base set ut --gate off\n",
+    "odata1c \\\nbase set ut --gate off",
+    "odata1c base set ut \\\n  --gate off",
+    "odata1c base set ut `\n  --gate off",
+    "odata1c base set ut 2>&1 --gate off",
+    "odata1c base set ut &>log --gate off",
+    "odata1c base set ut *>&1 --gate off",
+    "odata1c base set ut >&2 --gate off",
+    "odata1c base set ut --gate off & echo фон",
+    "odata1c base list & odata1c base set ut --gate off",
+    '"odata1c" "base" "set" ut --gate off',
+    "python -m odata1c base set ut --gate off",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _СНИЖАЮЩИЕ_РАУНД_2)
+def test_base_set_обходы_ревью_дают_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c --home C:/h base set ut --write off",
+        "odata1c base --home C:/h set ut --gate identifiers+names",
+        "odata1c base set ut --write off 2>&1",
+        "odata1c base set ut --write off > итог.txt",
+        "odata1c base set ut --write off && echo готово",
+        "odata1c base set ut --write off \\\n  --mark-deletion off",
+        "odata1c base set ut --label 'УТ' --home C:/h --write off",
+        "odata1c --version",
+        "odata1c --home C:/h base list",
+    ],
+)
+def test_команды_владельца_без_снижения_молчат_раунд_2(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c --home C:/h policy open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy --home C:/h open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy --home=C:/h open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy hide ut X && odata1c policy open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy open ut Catalog_Контрагенты.ИНН 2>&1",
+        "odata1c \\\npolicy open ut Catalog_Контрагенты.ИНН",
+    ],
+)
+def test_policy_open_обходы_ревью_дают_ask(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "открывает поле" in решение["permissionDecisionReason"]
+
+
+def test_неизвестный_ключ_называется_в_причине(tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": "odata1c base set ut --gat off"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert "--gat (неизвестный ключ)" in _решение(результат)["permissionDecisionReason"]
+
+
+def test_powershell_обратная_косая_перед_кавычкой_делает_хвост_неразобранным(tmp_path):
+    """PowerShell 5.1 не экранирует `\\`, `shlex` экранирует: без этого правила подпись
+    `"x\\" --gate off --label "y\\"` для хука — один токен, а для PowerShell — ключ `--gate off`."""
+    команда = 'odata1c base set ut --label "x\\" --gate off --label "y\\"'
+
+    ps = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+    bash = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(ps)["permissionDecision"] == "ask"
+    # в Bash та же строка — действительно одна подпись; молчание там верно
+    assert bash.stdout.strip() == ""
+
+
+def test_powershell_обратная_кавычка_перед_кавычкой_делает_хвост_неразобранным(tmp_path):
+    команда = 'odata1c base set ut --label "x`" --gate off --label "y`"'
+
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+def test_две_снижающие_команды_называют_обе_базы(tmp_path):
+    команда = "odata1c base set ut --gate off && odata1c base set bp --write on"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "базы ut, bp" in причина
+    assert "--gate off" in причина and "--write on" in причина
+
+
+def test_смешанная_команда_называет_и_base_set_и_policy_open(tmp_path):
+    команда = "odata1c policy open ut Catalog_Контрагенты.ИНН && odata1c base set ut --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "снижает защиту базы ut" in причина
+    assert "policy open открывает поле модели" in причина
