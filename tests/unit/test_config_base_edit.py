@@ -800,3 +800,85 @@ def test_контрольное_чтение_пропускает_off_и_чис�
     данные = _данные(путь, "ut")
     assert данные["gate"] == {"mode": False}
     assert данные["permissions"] == {"commit_limit": 0}
+
+
+# --- Задача 5: default ----------------------------------------------------------------------
+
+
+def test_default_возвращает_образец_и_комментирует_пустого_родителя(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    исходные = _строки(путь)
+    set_base_fields(путь, "ut", {"gate.mode": "off"})
+
+    результат = set_base_fields(путь, "ut", {"gate.mode": ПО_РОЛИ})
+
+    assert _строки(путь) == исходные  # образец с умолчанием prod и стандартным комментарием
+    assert "gate" not in _данные(путь, "ut")
+    [и] = результат.изменения
+    assert (и.было, и.было_источник, и.стало, и.стало_источник) == (
+        "off",
+        "явно",
+        "identifiers+names",
+        "по роли prod",
+    )
+
+
+def test_default_у_поля_по_роли_ничего_не_меняет(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    результат = set_base_fields(путь, "ut", {"write": ПО_РОЛИ})
+
+    assert not результат.изменено
+    assert путь.read_bytes() == байты
+
+
+def test_default_одного_из_двух_флагов_оставляет_раздел_активным(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "test"}))
+    set_base_fields(
+        путь, "ut", {"permissions.commit_limit": 5, "permissions.post_documents": False}
+    )
+
+    set_base_fields(путь, "ut", {"permissions.commit_limit": ПО_РОЛИ})
+
+    строки = _строки(путь)
+    assert "    permissions:" in строки
+    assert any(с.startswith("    #   commit_limit: 50") for с in строки)  # умолчание роли test
+    assert _данные(путь, "ut")["permissions"] == {"post_documents": False}
+
+
+def test_default_последнего_флага_комментирует_раздел(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "test"}))
+    set_base_fields(путь, "ut", {"permissions.post_documents": False})
+
+    set_base_fields(путь, "ut", {"permissions.post_documents": ПО_РОЛИ})
+
+    строки = _строки(путь)
+    assert "    permissions:" not in строки
+    assert "    # permissions:" in строки
+    assert "permissions" not in _данные(путь, "ut")
+
+
+def test_default_у_write_с_комментарием_владельца_ставит_стандартный(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+
+    set_base_fields(путь, "ut", {"write": ПО_РОЛИ})
+
+    строка = next(с for с in _строки(путь) if с.startswith("    # write:"))
+    assert строка.startswith("    # write: false")
+    assert строка.endswith("# разрешить пишущие тулы")
+    assert "write" not in _данные(путь, "ut")
+
+
+def test_контрольное_чтение_проверяет_и_default(tmp_path, monkeypatch):
+    """Снятие ничего не изменило, поле осталось явным: команда не должна отчитаться «по роли»."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+    байты = путь.read_bytes()
+    monkeypatch.setattr(base_edit, "_снять_поле", lambda *args, **kwargs: None)
+
+    with pytest.raises(ConfigError, match="читается не так") as ошибка:
+        set_base_fields(путь, "ut", {"write": ПО_РОЛИ})
+
+    assert "write" in str(ошибка.value)
+    assert путь.read_bytes() == байты
+    assert not путь.with_suffix(".yaml.new").exists()
