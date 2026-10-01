@@ -12,7 +12,7 @@ import yaml
 import odata1c.config.base_edit as base_edit
 from odata1c.config.base_edit import ПО_РОЛИ, set_base_fields
 from odata1c.config.loader import ConfigError
-from odata1c.config.writer import append_base
+from odata1c.config.writer import _с_комментарием, append_base
 
 URL = "https://server/ut"
 
@@ -882,3 +882,275 @@ def test_контрольное_чтение_проверяет_и_default(tmp_p
     assert "write" in str(ошибка.value)
     assert путь.read_bytes() == байты
     assert not путь.with_suffix(".yaml.new").exists()
+
+
+# --- Задача 6: смена роли -------------------------------------------------------------------
+
+
+def test_смена_роли_перерисовывает_образцы_и_не_трогает_явные(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "gate": {"mode": "identifiers+names"}}))
+
+    результат = set_base_fields(путь, "ut", {"role": "dev"})
+
+    строки = _строки(путь)
+    assert "    role: dev" in строки
+    assert any(с.startswith("    # write: true") for с in строки)
+    assert any(с.startswith("    #   independent_register_delete: true") for с in строки)
+    assert any(с.startswith("    #   commit_limit: 0") for с in строки)
+    assert any(с.startswith("      mode: identifiers+names") for с in строки)  # явный, остался
+    assert any("умолчание роли dev)" in с for с in строки)
+    assert any("умолчание роли dev: off)" in с for с in строки)
+    assert not any("умолчание роли prod" in с for с in строки)
+    [и] = результат.изменения
+    assert (и.было, и.стало, и.стало_источник) == ("prod", "dev", "явно")
+    assert результат.явные_поля == ["gate.mode"]
+    assert результат.действует == {
+        "role": "dev",
+        "gate": "identifiers+names",
+        "write": True,
+        "permissions": {
+            "post_documents": True,
+            "mark_deletion": True,
+            "independent_register_delete": True,
+            "commit_limit": 0,
+        },
+    }
+
+
+def test_смена_роли_обратно_возвращает_образцы_prod(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    исходные = путь.read_bytes()
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    set_base_fields(путь, "ut", {"role": "prod"})
+
+    assert путь.read_bytes() == исходные
+
+
+def test_смена_роли_без_ключа_role_вставляет_его_после_пароля(tmp_path):
+    текст = (
+        "bases:\n  ut:\n    label: УТ\n    url: https://server/ut\n    user: u\n    password: p\n"
+    )
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(текст, encoding="utf-8")
+
+    результат = set_base_fields(путь, "ut", {"role": "test"})
+
+    assert _строки(путь)[6] == "    role: test"
+    [и] = результат.изменения
+    assert (и.было, и.было_источник, и.стало, и.стало_источник) == (
+        "prod",
+        "по умолчанию",
+        "test",
+        "явно",
+    )
+
+
+def test_смена_роли_и_поле_в_одном_вызове(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+
+    результат = set_base_fields(путь, "ut", {"role": "dev", "write": False})
+
+    данные = _данные(путь, "ut")
+    assert данные["role"] == "dev" and данные["write"] is False
+    assert результат.действует["write"] is False
+    assert результат.явные_поля == ["write"]
+    assert [и.поле for и in результат.изменения] == ["role", "write"]
+
+
+def test_неизвестная_роль_отклоняется_до_правки(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="неизвестная роль"):
+        set_base_fields(путь, "ut", {"role": "admin"})
+
+    assert путь.read_bytes() == байты
+
+
+def test_неизвестная_роль_не_первой_в_вызове_отклоняется_до_любой_правки(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+
+    with pytest.raises(ConfigError, match="неизвестная роль"):
+        set_base_fields(путь, "ut", {"write": True, "role": "admin"})
+    with pytest.raises(ConfigError, match="неизвестная роль"):
+        set_base_fields(путь, "ut", {"role": ["dev"]})
+
+    assert путь.read_bytes() == байты
+
+
+def test_та_же_явная_роль_файл_не_меняет(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "test"}))
+    байты = путь.read_bytes()
+
+    результат = set_base_fields(путь, "ut", {"role": "test"})
+
+    assert not результат.изменено
+    assert путь.read_bytes() == байты
+
+
+def test_роль_prod_без_ключа_role_пишется_явно(tmp_path):
+    путь = _рукописный(tmp_path, _ГОЛОВА)
+
+    результат = set_base_fields(путь, "ut", {"role": "prod"})
+
+    assert _данные(путь, "ut")["role"] == "prod"
+    assert результат.изменено
+    [и] = результат.изменения
+    assert (и.было_источник, и.стало_источник) == ("по умолчанию", "явно")
+
+
+def test_контрольное_чтение_проверяет_и_роль(tmp_path, monkeypatch):
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    байты = путь.read_bytes()
+    monkeypatch.setattr(base_edit, "_применить_роль", lambda текст, name, новая: текст)
+
+    with pytest.raises(ConfigError, match="читается не так") as ошибка:
+        set_base_fields(путь, "ut", {"role": "dev"})
+
+    assert "role" in str(ошибка.value)
+    assert путь.read_bytes() == байты
+
+
+def test_заголовок_роли_правится_только_в_строках_комментариев(tmp_path):
+    """Подпись, похожая на заголовок, остаётся как есть: правятся только строки-комментарии."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "label": "умолчание роли prod #1"}))
+
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    assert _данные(путь, "ut")["label"] == "умолчание роли prod #1"
+
+
+@pytest.mark.parametrize(
+    ("прежняя", "новая"),
+    [("prod", "test"), ("test", "dev"), ("dev", "prod"), ("test", "prod"), ("dev", "test")],
+)
+def test_смена_роли_туда_и_обратно_байт_в_байт(tmp_path, прежняя, новая):
+    путь = _файл(tmp_path, ("ut", {"role": прежняя}))
+    исходные = путь.read_bytes()
+
+    set_base_fields(путь, "ut", {"role": новая})
+    assert путь.read_bytes() != исходные
+    set_base_fields(путь, "ut", {"role": прежняя})
+
+    assert путь.read_bytes() == исходные
+
+
+def test_смена_роли_перерисовывает_все_образцы_ключа_в_записи(tmp_path):
+    """Рукописная раскладка: образец `write` есть и в шаблонной секции, и вписан ниже вручную."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod"}))
+    текст = путь.read_text(encoding="utf-8").rstrip("\n")
+    путь.write_text(текст + "\n    # write: false\n", encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"role": "dev"})
+
+    образцы = [с for с in _строки(путь) if с.lstrip().startswith("# write:")]
+    assert len(образцы) == 2
+    assert all(с.lstrip().startswith("# write: true") for с in образцы)
+
+
+# --- Ревью задачи 5 ---------------------------------------------------------------------------
+
+
+def test_установка_флага_раздела_выбирает_ближайший_образец_родителя(tmp_path):
+    """Владелец вписал `permissions:` сразу после `role`; после `default` у его ребёнка в записи
+    два образца `# permissions:`. Активировать первый нельзя: между ним и образцом флага стоит
+    активный ключ записи."""
+    путь = _файл(tmp_path, ("ut", {"role": "prod", "write": True}))
+    исходные = _строки(путь)
+    n = исходные.index("    role: prod") + 1
+    вписано = исходные[:n] + ["    permissions:", "      commit_limit: 5"] + исходные[n:]
+    путь.write_text("\n".join(вписано), encoding="utf-8")
+    set_base_fields(путь, "ut", {"permissions.commit_limit": ПО_РОЛИ})
+
+    set_base_fields(путь, "ut", {"permissions.post_documents": False})
+
+    assert _данные(путь, "ut")["permissions"] == {"post_documents": False}
+    assert _данные(путь, "ut")["write"] is True
+
+
+def test_разделить_пустое_значение_с_комментарием():
+    assert base_edit._разделить("   # решено") == ("", "решено")
+    assert base_edit._разделить("") == ("", None)
+    assert base_edit._разделить("  off  # так") == ("off", "так")
+
+
+def test_родитель_с_комментарием_сохраняет_его_после_default_и_установки(tmp_path):
+    путь = _рукописный(
+        tmp_path,
+        _ГОЛОВА + "    role: prod\n    gate:   # решено 01.10\n      mode: off\n",
+    )
+    set_base_fields(путь, "ut", {"gate.mode": ПО_РОЛИ})
+    assert "    # gate:   # решено 01.10" in _строки(путь)
+
+    set_base_fields(путь, "ut", {"gate.mode": "identifiers"})
+
+    assert _с_комментарием("    gate:", "решено 01.10") in _строки(путь)
+    assert _данные(путь, "ut")["gate"] == {"mode": "identifiers"}
+
+
+# --- Круговой путь установки и default по байтам -------------------------------------------
+
+_ПОЛЯ_КРУГА = (
+    "write",
+    "gate.mode",
+    "permissions.post_documents",
+    "permissions.mark_deletion",
+    "permissions.independent_register_delete",
+    "permissions.commit_limit",
+)
+
+
+def _иное_значение(роль: str, поле: str) -> object:
+    """Значение поля, отличное от умолчания роли."""
+    умолчание = base_edit._умолчание_роли(роль, поле)
+    if поле == "gate.mode":
+        return next(у for у in ("off", "identifiers", "identifiers+names") if у != умолчание)
+    if поле == "permissions.commit_limit":
+        return умолчание + 7
+    return not умолчание
+
+
+@pytest.mark.parametrize("роль", ["prod", "test", "dev"])
+@pytest.mark.parametrize("поле", _ПОЛЯ_КРУГА)
+def test_установка_и_default_возвращают_файл_байт_в_байт(tmp_path, роль, поле):
+    путь = _файл(tmp_path, ("ut", {"role": роль}))
+    исходные = путь.read_bytes()
+
+    set_base_fields(путь, "ut", {поле: _иное_значение(роль, поле)})
+    assert путь.read_bytes() != исходные
+    set_base_fields(путь, "ut", {поле: ПО_РОЛИ})
+
+    assert путь.read_bytes() == исходные
+
+
+def test_два_default_у_детей_одного_родителя_в_одном_вызове(tmp_path):
+    путь = _файл(tmp_path, ("ut", {"role": "test"}))
+    исходные = путь.read_bytes()
+    set_base_fields(
+        путь, "ut", {"permissions.commit_limit": 5, "permissions.post_documents": False}
+    )
+
+    set_base_fields(
+        путь, "ut", {"permissions.post_documents": ПО_РОЛИ, "permissions.commit_limit": ПО_РОЛИ}
+    )
+
+    assert путь.read_bytes() == исходные
+
+
+@pytest.mark.parametrize("порядок", ["default_первым", "установка_первой"])
+def test_default_одного_ребёнка_и_установка_другого_в_одном_вызове(tmp_path, порядок):
+    (tmp_path / "эталон").mkdir()
+    эталон = _файл(tmp_path / "эталон", ("ut", {"role": "test"}))
+    set_base_fields(эталон, "ut", {"permissions.post_documents": False})
+    путь = _файл(tmp_path, ("ut", {"role": "test"}))
+    set_base_fields(путь, "ut", {"permissions.commit_limit": 5})
+    изменения = {"permissions.commit_limit": ПО_РОЛИ, "permissions.post_documents": False}
+    if порядок == "установка_первой":
+        изменения = dict(reversed(list(изменения.items())))
+
+    set_base_fields(путь, "ut", изменения)
+
+    assert _данные(путь, "ut")["permissions"] == {"post_documents": False}
+    assert путь.read_bytes() == эталон.read_bytes()
