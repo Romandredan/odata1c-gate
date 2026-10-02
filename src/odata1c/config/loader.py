@@ -193,8 +193,9 @@ def parse_bases(
         try:
             resolved = apply_role(role, raw)
         except ConfigError as exc:
-            # `from None`: исключение в `__cause__` попало бы в трассировку целиком, а при отказе
-            # валидатора оно несёт `input_value` — значение поля, то есть пароль без кавычек.
+            # `from None` ради единообразия с соседними `raise`: в цепочке здесь отказ неизвестной
+            # роли (`ConfigError` без значений полей), а не валидатор с `input_value`; текст отказа
+            # уже переписан в новое исключение, второй раз его трассировка печатать не должна.
             raise ConfigError(f"база «{name}»: {exc}", code=exc.code, hint=exc.hint) from None
         try:
             bases[name] = BaseConfig(name=name, **resolved)
