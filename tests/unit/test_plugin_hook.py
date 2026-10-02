@@ -2046,3 +2046,51 @@ def test_неразобранный_хвост_с_тире_вместо_базы
     причина = _решение(результат)["permissionDecisionReason"]
     assert "команда odata1c не разобрана" in причина
     assert "базы —" not in причина
+
+
+# --- Правило 4, раунд 5: запасной разбор не должен молча терять подкоманду -------------------
+
+
+@pytest.mark.parametrize(
+    ("тул", "команда"),
+    [
+        # R1: `--home 'a b'` в запасном разборе распадается на два слова и сдвигает подкоманду
+        (
+            "PowerShell",
+            "odata1c --home 'a b' --home C:/h base set ut --gate off --label 'x y\\'",
+        ),
+        (
+            "PowerShell",
+            "odata1c base --home 'a b' set ut --gate off --label 'x y\\'",
+        ),
+        ("Bash", "odata1c --home '' base set ut --gate off --label $'x'"),
+        ("PowerShell", "odata1c --home 'a b' --home C:/h base set ut --gate off --label x`y"),
+        ("Bash", "odata1c --home 'a b' --home C:/h $'base' set ut --gate off"),
+    ],
+)
+def test_запасной_разбор_со_сдвигом_подкоманды_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --write off",
+        "odata1c base list",
+        "git add src/odata1c/config/base_edit.py",
+    ],
+)
+def test_запасной_разбор_контроли_молчат(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
