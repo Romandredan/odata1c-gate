@@ -194,9 +194,10 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
   рецепт, pending-операция, коммит, подтверждение, журнал, откат, пометка удаления, маркетплейс,
   навык, хук, evals, каталог правил сущностей.
   Для каждого термина указаны запрещённые синонимы (`_Avoid_`) — соблюдайте их в текстах и коде.
-- `docs/adr/` — 16 архитектурных решений (0001–0016) с обоснованиями. Формат: frontmatter
+- `docs/adr/` — 17 архитектурных решений (0001–0017) с обоснованиями. Формат: frontmatter
   (`status: accepted|superseded|amended`, `superseded_by`) + разделы `Considered Options` и
-  `Consequences`. ADR-0001 отменён ADR-0013 — всегда проверяйте статус в frontmatter.
+  `Consequences`. ADR-0001 отменён ADR-0013, ADR-0015 поправлен ADR-0017 — всегда проверяйте
+  статус в frontmatter.
 - `README.md` — описание проекта для внешнего читателя: плашки, одна фраза о пользе, краткое
   описание по-английски, пример работы, главные возможности (карточки с кратким «как включить»),
   быстрый старт с подготовкой 1С, настройка, устройство (что видит модель, архитектура, тулы),
@@ -221,10 +222,12 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
   верхнего уровня — `cli`, `launcher`, `daemon`, `doctor`. Версия — только в `__about__.py`.
 - `plugin/` — плагин Claude Code по SPEC §11.2: `.claude-plugin/plugin.json` (манифест),
   `.mcp.json` (MCP-сервер шлюза с закреплённой версией пакета), `skills/odata1c/SKILL.md`
-  (методика работы модели), `skills/odata1c-policy/SKILL.md` (конструктор политики, ADR-0015),
+  (методика работы модели), `skills/odata1c-policy/SKILL.md` (конструктор политики, ADR-0015, ADR-0017),
   `skills/odata1c-recipe/SKILL.md` (свернуть запрос в рецепт), `skills/odata1c-setup/SKILL.md`
   (подключить базу вместе с пользователем: одна команда терминала, остальное делает модель;
-  пароль модель не видит), `hooks/hooks.json` и
+  пароль модель не видит), `skills/odata1c-base/SKILL.md` (настройки подключённой базы:
+  `odata1c base set` выполняет модель, снижение защиты — после согласия и с подтверждением,
+  ADR-0017), `hooks/hooks.json` и
   `hooks/pretooluse.py` (хук `PreToolUse`), `agents/odata1c-investigator.md` (следователь только
   чтением), `evals/` (дела `claude plugin eval`).
 - `.claude-plugin/marketplace.json` — маркетплейс с одним плагином `odata1c`, источник `./plugin`;
@@ -259,7 +262,7 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
 2. **Лаунчер** `odata1c mcp` — тонкий stdio-процесс на сессию без логики: создаёт домашний
    каталог (`~/.claude/odata1c/`), поднимает демон при необходимости, проксирует MCP.
 
-Плюс плагин Claude Code `plugin/` (четыре навыка, хук `PreToolUse`, агент, дела evals) и маркетплейс
+Плюс плагин Claude Code `plugin/` (пять навыков, хук `PreToolUse`, агент, дела evals) и маркетплейс
 `.claude-plugin/marketplace.json` в том же репозитории.
 
 ## Технологический стек (ADR-0008)
@@ -302,7 +305,7 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
   на рабочую копию репозитория (`uv run --directory …`), вход для `claude plugin eval` (команда
   прогона — `plugin/evals/README.md`).
 
-CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base list|base test|reindex|policy show|check|hide|open|set|recipe check|recipe list|reveal|doctor|service install|remove`.
+CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base set|base import|base list|base test|reindex|policy show|check|hide|open|set|recipe check|recipe list|reveal|doctor|service install|remove`.
 
 Стратегия тестирования (SPEC §12):
 - юнит: контрольные суммы и regex классов гейта, нормализация, лексер `$filter`, роли и
@@ -355,6 +358,8 @@ CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base l
    `odata1c policy open trade_dev <Сущность.Поле>` открывает поле, `odata1c policy set trade_dev
    <Сущность.Поле> <класс>` назначает класс — каждая команда пишет `policy.yaml` с сохранением
    комментариев (`ruamel.yaml`) и сама выполняет `check` после записи.
+   `uv run odata1c base set trade_dev --write off --gate identifiers+names` меняет поля записи
+   базы с сохранением комментариев файла; то же делает модель по навыку `odata1c-base`.
 4. **Демон.** `uv run odata1c daemon` поднимает единственный на машину процесс MCP на
    `127.0.0.1:7171` (`--foreground` — не отцепляться, `daemon stop` — остановить). Отдельно
    запускать не обязательно: лаунчер поднимает демон сам, если тот не слушает. Холодный старт —
@@ -612,7 +617,12 @@ Ruling 31 не работает: журнал адресов запросов н
   журналу через `sqlite3`. Правила действуют на `Read`/`Edit`/`Write`/`MultiEdit`/`NotebookEdit`
   и на `Grep`/`Glob` по самому дому и его предкам (Ruling 72), на `Bash` и `PowerShell`
   одинаково (Ruling 73), имена файлов сравниваются без учёта регистра (Ruling 68), имена тулов
-  принимаются в обеих формах — плагинной и ручной регистрации.
+  принимаются в обеих формах — плагинной и ручной регистрации. Правило 4 (ADR-0017): `Bash` и
+  `PowerShell` с `odata1c base set`, снижающим защиту, и с `odata1c policy open` или
+  `odata1c policy set … keep|scan` → `ask` с перечнем ключей; команду разбирает токенизатор
+  (`--home` в любой позиции), любой ключ, которого хук не знает, считается снижением, текущих
+  значений базы хук не знает и ошибается в сторону вопроса (пределы и цена — SPEC §11.2
+  «Границы хука»).
   **Чего хук не отсекает:** `python -c` с тем же чтением, копирование файла под другим именем,
   чтение сторонним инструментом, любой путь мимо перечисленных тулов. Ставить его на место
   инварианта 1 нельзя: настоящие линии обороны — то, что реальные значения не выходят через MCP
