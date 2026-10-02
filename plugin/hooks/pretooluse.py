@@ -68,7 +68,9 @@
    раунда 3 тоже `deny` — намеренное расширение решения контроллера (Ruling 88), а не регрессия
    более ранних раундов.
 4. Команды владельца, которые модель запускает сама (ADR-0017): `odata1c base set` с ключом,
-   снижающим защиту базы, и `odata1c policy open` → `ask`; проверяется после `deny` правила 3.
+   снижающим защиту базы, `odata1c policy open` и `odata1c policy set <база> <Сущность.Поле>
+   keep|scan` (классы `keep` и `scan` снимают закрытие значения, как `open`; закрывающие классы и
+   `custom:<имя>` проходят молча) → `ask`; проверяется после `deny` правила 3.
 5. Иначе — молчание (тул выполняется как обычно).
 
 Причины решений — фиксированный русский текст без значений из события, кроме двух мест:
@@ -101,7 +103,8 @@
 (`$o='odata1c'; & $o base set …`, `iex` над строкой из частей, `Start-Process`,
 `python -c "from odata1c.cli import main; …"`) и кавычки или экранирование внутри самого слова
 `odata1c` (`od''ata1c`) хук не видит — слово ищется буквально. Цена правила — лишний `ask` на
-безобидной команде, в тексте которой стоит фраза `odata1c base set` или `odata1c policy open`
+безобидной команде, в тексте которой стоит фраза `odata1c base set`, `odata1c policy open` или
+`odata1c policy set … keep`
 (`echo`, `grep`, `git commit -m "… odata1c base set …"`); владелец проекта принял эту цену как
 плату за защиту в глубину. Хук — защита в глубину поверх инварианта 1 (реальные значения
 не выходят через MCP) и разрешений Claude Code на Bash; последняя линия — они, не этот скрипт.
@@ -190,6 +193,11 @@ _ПРИЧИНА_BASE_SET = (
 _ПРИЧИНА_POLICY_OPEN = (
     "odata1c policy open открывает поле модели — подтвердите, что это просьба владельца"
 )
+_ПРИЧИНА_POLICY_SET = (
+    "odata1c policy set … keep|scan открывает поле модели — подтвердите, что это просьба владельца"
+)
+# Классы `policy set`, которые снимают закрытие значения (`open` — это `set … keep`).
+_ОТКРЫВАЮЩИЕ_КЛАССЫ = {"keep", "scan"}
 
 # Ruling 77 (раунд 2): путь дома шлюза в команде — буквально .claude/odata1c (любой разделитель).
 _HOME_PATH_RE = re.compile(r"\.claude[/\\]odata1c", re.IGNORECASE)
@@ -484,7 +492,8 @@ def _пропустить_ключи(токены: list[str], i: int) -> int:
 
 
 def _подкоманда_владельца(токены: list[str]) -> tuple[str, list[str]] | None:
-    """`("base set" | "policy open", токены после подкоманды)` или `None` для другой команды."""
+    """`("base set" | "policy open" | "policy set", токены после подкоманды)` или `None` для
+    другой команды."""
     i = _пропустить_ключи(токены, 0)
     if i >= len(токены) or токены[i].lower() not in ("base", "policy"):
         return None
@@ -493,7 +502,7 @@ def _подкоманда_владельца(токены: list[str]) -> tuple[s
     if i >= len(токены):
         return None
     имя = f"{группа} {токены[i].lower()}"
-    if имя in ("base set", "policy open"):
+    if имя in ("base set", "policy open", "policy set"):
         return имя, токены[i + 1 :]
     return None
 
@@ -534,13 +543,39 @@ def _снижающие_ключи(токены: list[str], разобран: bo
     return база, найдено
 
 
+def _set_открывает_поле(токены: list[str], разобран: bool = True) -> bool:
+    """`policy set <база> <Сущность.Поле> <класс>`: `keep` и `scan` открывают поле. Класс ищется
+    среди всех позиционных токенов, а не только последнего: за ним может стоять перенаправление
+    (`2>&1`, `> файл`), которое оболочка уберёт, а токен останется. `--home` (со значением)
+    пропускается, `-h`/`--help` ничего не меняет; неизвестный ключ и неразобранный хвост —
+    открытие (сомнение в сторону вопроса)."""
+    if not разобран:
+        return True
+    позиционные: list[str] = []
+    i = 0
+    while i < len(токены):
+        токен = токены[i]
+        if токен.lower() == "--home":
+            i += 2
+        elif токен.lower().startswith("--home=") or токен.lower() in _КЛЮЧИ_СПРАВКИ:
+            i += 1
+        elif токен.startswith("-"):
+            return True
+        else:
+            позиционные.append(токен)
+            i += 1
+    return any(токен.lower() in _ОТКРЫВАЮЩИЕ_КЛАССЫ for токен in позиционные)
+
+
 def _команды_владельца(команда: str, *, powershell: bool = False) -> dict | None:
     """Правило 4: `ask` на `base set` со снижением защиты (все вхождения в цепочке — один вопрос с
-    объединённой причиной) и на `policy open`; остальные команды владельца проходят молча."""
+    объединённой причиной), на `policy open` и на `policy set … keep|scan`; остальные команды
+    владельца проходят молча."""
     команда = _ПЕРЕНОС_СТРОКИ_RE.sub(" ", команда)
     базы: list[str] = []
     ключи: list[str] = []
     policy_open = False
+    policy_set = False
     for совпадение in _ODATA1C_СЛОВО_RE.finditer(команда):
         хвост = команда[совпадение.end() :]
         разделитель = _РАЗДЕЛИТЕЛЬ_ЦЕПОЧКИ_RE.search(хвост)
@@ -554,20 +589,23 @@ def _команды_владельца(команда: str, *, powershell: bool 
         if имя == "policy open":
             policy_open = True
             continue
+        if имя == "policy set":
+            policy_set = policy_set or _set_открывает_поле(остаток, разобран)
+            continue
         база, снижающие = _снижающие_ключи(остаток, разобран)
         if снижающие:
             базы.append(база)
             ключи.extend(снижающие)
+    причины: list[str] = []
     if ключи:
-        причина = _ПРИЧИНА_BASE_SET.format(
-            база=", ".join(dict.fromkeys(базы)), ключи=", ".join(ключи)
+        причины.append(
+            _ПРИЧИНА_BASE_SET.format(база=", ".join(dict.fromkeys(базы)), ключи=", ".join(ключи))
         )
-        if policy_open:
-            причина += "; " + _ПРИЧИНА_POLICY_OPEN
-        return _ask(причина)
     if policy_open:
-        return _ask(_ПРИЧИНА_POLICY_OPEN)
-    return None
+        причины.append(_ПРИЧИНА_POLICY_OPEN)
+    if policy_set:
+        причины.append(_ПРИЧИНА_POLICY_SET)
+    return _ask("; ".join(причины)) if причины else None
 
 
 def decide(event: dict, *, home: pathlib.Path) -> dict | None:

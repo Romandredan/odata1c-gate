@@ -1472,3 +1472,76 @@ def test_смешанная_команда_называет_и_base_set_и_polic
     причина = _решение(результат)["permissionDecisionReason"]
     assert "снижает защиту базы ut" in причина
     assert "policy open открывает поле модели" in причина
+
+
+# --- Правило 4, ревью задачи 9: `policy set … keep|scan` открывает поле, как `open` --------------
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c policy set ut Catalog_X.ИНН keep",
+        "odata1c policy set ut Catalog_X.ИНН scan",
+        "odata1c policy set ut Catalog_X.ИНН KEEP",
+        "odata1c policy set ut Catalog_X.ИНН Scan",
+        'odata1c policy set ut Catalog_X.ИНН "keep"',
+        "odata1c policy set --home C:/h ut X.Y keep",
+        "odata1c --home C:/h policy set ut X.Y keep",
+        "odata1c policy --home C:/h set ut X.Y scan",
+        "odata1c policy set ut X.Y keep 2>&1",
+        "odata1c policy hide ut X --yes && odata1c policy set ut X.Y keep",
+    ],
+)
+def test_policy_set_keep_scan_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c policy set ut Catalog_X.ИНН inn",
+        "odata1c policy set ut Catalog_X.ИНН org",
+        "odata1c policy set ut Catalog_X.ИНН custom:мой",
+        "odata1c policy set --home C:/h ut X.Y inn",
+        "odata1c policy set ut X.Y inn --home C:/h",
+        "odata1c policy set --help",
+        "odata1c policy set ut X.Y",
+        "odata1c policy hide ut X --yes",
+    ],
+)
+def test_policy_set_закрывающий_класс_молчит(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+def test_policy_set_незакрытая_кавычка_в_хвосте_даёт_ask(tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": 'odata1c policy set ut X.Y inn "keep'}},
+        env=_окружение(tmp_path),
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+def test_смешанная_команда_называет_base_set_и_policy_set(tmp_path):
+    команда = "odata1c policy set ut X.Y keep && odata1c base set ut --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "снижает защиту базы ut" in причина
+    assert "policy set … keep|scan открывает поле модели" in причина
