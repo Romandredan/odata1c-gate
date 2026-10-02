@@ -1545,3 +1545,82 @@ def test_смешанная_команда_называет_base_set_и_policy_s
     причина = _решение(результат)["permissionDecisionReason"]
     assert "снижает защиту базы ut" in причина
     assert "policy set … keep|scan открывает поле модели" in причина
+
+
+# --- Правило 4, финальное ревью ветки: раскрытие оболочки внутри слова команды → ask ----------
+
+_РАСКРЫТИЕ_В_СЛОВЕ = [
+    "odata1c ba$()se set ut --gate off",
+    "odata1c base s$()et ut --gate off",
+    "odata1c $'base' set ut --gate off",
+    "odata1c ba${x}se set ut --gate off",
+    "s=set; odata1c base $s ut --gate off",
+    "odata1c b`ase set ut --gate off",
+    "odata1c base s`et ut --gate off",
+    "odata1c ba$('')se set ut --gate off",
+    "odata1c policy s$()et ut X.Y keep",
+    "odata1c po$()licy open ut X.Y",
+    "odata1c -$()-home C:/h base set ut --gate off",
+    "odata1c $cmd ut --gate off",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _РАСКРЫТИЕ_В_СЛОВЕ)
+def test_раскрытие_оболочки_в_слове_команды_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "команда odata1c не разобрана" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base list",
+        "odata1c base set ut --write off",
+        "odata1c --home C:/h base set ut --write off",
+        "odata1c --home=$HOME/h base set ut --write off",
+        "odata1c policy hide ut X --yes",
+    ],
+)
+def test_раскрытие_оболочки_контроль_без_ложных_вопросов(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда", ["odata1c policy set ut X.Y ke$()ep", "odata1c policy set ut X.Y $класс"]
+)
+def test_policy_set_класс_с_раскрытием_оболочки_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+def test_неразобранный_хвост_без_базы_называет_вопрос_вопросом(tmp_path):
+    """Фраза в `echo`/`git commit -m` с закрывающей кавычкой в хвосте: базы нет, хвост не
+    разобран — причина не должна говорить «защита базы ?»."""
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": 'echo "odata1c base set --gate off"'}},
+        env=_окружение(tmp_path),
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "команда odata1c не разобрана — подтвердите" in причина
+    assert "базы ?" not in причина
+    assert "(хвост команды не разобран)" not in причина
