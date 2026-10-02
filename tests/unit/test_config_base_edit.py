@@ -399,6 +399,60 @@ def test_запись_из_шаблона_поставки_правится(tmp_
     assert _данные(путь, "buh")["role"] == "prod"
 
 
+_С_ЗАКОММЕНТИРОВАННОЙ_СОСЕДКОЙ = (
+    "bases:\n"
+    "  ut:\n"
+    "    label: УТ\n"
+    "    url: https://server/ut\n"
+    "    user: u\n"
+    "    password: p\n"
+    "    role: prod\n"
+    "  # ut2:\n"
+    "    # label: УТ2\n"
+    "    # url: https://server/ut2\n"
+    "    # user: u\n"
+    "    # password: p\n"
+    "    # write: true\n"
+    "    # role: dev\n"
+    "    # gate:\n"
+    "    #   mode: off\n"
+)
+
+
+def test_образец_из_закомментированной_соседней_записи_не_берётся(tmp_path):
+    """Закомментированная построчно соседняя запись (`  # ut2:` и `    # write: true` под ней):
+    `base set ut --write on` не должен «раскомментировать» строку чужой записи — YAML прочитал бы
+    её как поле `ut`, но стоит она под заголовком `# ut2:`."""
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(_С_ЗАКОММЕНТИРОВАННОЙ_СОСЕДКОЙ, encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"write": True})
+
+    строки = _строки(путь)
+    assert строки[6] == "    role: prod"
+    assert строки[7].startswith("    write: true")
+    assert строки[8] == "  # ut2:"
+    assert "    # write: true" in строки
+    assert _данные(путь, "ut")["write"] is True
+
+
+def test_вложенный_образец_из_закомментированной_соседней_записи_не_берётся(tmp_path):
+    """То же для вложенного поля: `    # gate:` и `    #   mode: off` из блока `# ut2:` не
+    активируются, раздел `gate` вставляется в запись `ut`."""
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(_С_ЗАКОММЕНТИРОВАННОЙ_СОСЕДКОЙ, encoding="utf-8")
+
+    set_base_fields(путь, "ut", {"gate.mode": "identifiers"})
+
+    строки = _строки(путь)
+    assert строки[7] == "    gate:"
+    assert строки[8].startswith("      mode: identifiers")
+    assert строки[9] == "  # ut2:"
+    assert "    # gate:" in строки
+    assert "    #   mode: off" in строки
+    assert _данные(путь, "ut")["gate"] == {"mode": "identifiers"}
+
+
 def test_другие_записи_и_строки_вне_правки_не_меняются(tmp_path):
     путь = _файл(tmp_path, ("ut", {"role": "prod"}), ("bp", {"role": "dev"}))
     до = _строки(путь)

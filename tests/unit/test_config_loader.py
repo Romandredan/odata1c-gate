@@ -347,3 +347,25 @@ def test_parse_bases_ошибка_записи_называет_файл_и_не
 
     assert "bases.yaml: база «ut» описана неверно" in str(ошибка.value)
     assert "server/ut" not in str(ошибка.value)
+
+
+def test_parse_bases_отказ_валидатора_не_несёт_значения_в_цепочке(tmp_path):
+    """В `__cause__` у `pydantic.ValidationError` лежит `input_value` — значение поля, для
+    пароля это открытый текст; трассировка печатает цепочку целиком."""
+    данные = _данные_с_keyring()
+    данные["bases"]["ut"]["url"] = "server/ut"
+
+    with pytest.raises(ConfigError) as ошибка:
+        parse_bases(данные, tmp_path / "bases.yaml", [], resolve_keyring=False)
+
+    assert ошибка.value.__cause__ is None
+
+
+def test_parse_bases_отказ_роли_не_несёт_исходное_исключение_в_цепочке(tmp_path):
+    данные = _данные_с_keyring()
+    данные["bases"]["ut"]["role"] = "нет-такой-роли"
+
+    with pytest.raises(ConfigError) as ошибка:
+        parse_bases(данные, tmp_path / "bases.yaml", [], resolve_keyring=False)
+
+    assert ошибка.value.__cause__ is None
