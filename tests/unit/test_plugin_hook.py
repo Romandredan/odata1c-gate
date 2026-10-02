@@ -1144,3 +1144,953 @@ def test_скрипт_компилируется_без_syntaxwarning():
             байткод = pathlib.Path(врем) / "pretooluse.pyc"
             py_compile.compile(str(СКРИПТ), cfile=str(байткод), doraise=True)
     assert исходник
+
+
+# --- Правило 4: команды владельца, снижающие защиту → ask (ADR-0017) ------------------------
+
+_СНИЖАЮЩИЕ = [
+    "odata1c base set ut --gate off",
+    "odata1c base set ut --gate identifiers",
+    "odata1c base set ut --gate=default",
+    "odata1c base set ut --write on",
+    "odata1c base set ut --write default",
+    "odata1c base set ut --role dev",
+    "odata1c base set ut --role test",
+    "odata1c base set ut --post-documents on",
+    "odata1c base set ut --mark-deletion default",
+    "odata1c base set ut --register-delete on",
+    "odata1c base set ut --commit-limit 0",
+    "odata1c base set ut --commit-limit 100",
+    "odata1c base set ut --label 'Боевая' --write on",
+    "uvx --from odata1c-gate odata1c base set ut --gate off",
+    "uv run odata1c base set --home C:/дом ut --gate off",
+    "odata1c.exe base set ut --gate off",
+    'odata1c base set ut --label "незакрытая кавычка --write off',
+]
+
+_НЕ_СНИЖАЮЩИЕ = [
+    "odata1c base set ut --gate identifiers+names",
+    "odata1c base set ut --write off",
+    "odata1c base set ut --role prod",
+    "odata1c base set ut --post-documents off --mark-deletion off --register-delete off",
+    "odata1c base set ut --label 'УТ 11 боевая'",
+    "odata1c base set ut --label 'Включить --write on не надо'",
+    "odata1c base list",
+    "odata1c base test ut",
+    "odata1c policy hide ut Catalog_Пользователи --yes",
+    "odata1c policy set ut Catalog_Контрагенты.ИНН inn",
+    "odata1c policy show ut",
+    "odata1c policy check ut",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _СНИЖАЮЩИЕ)
+def test_base_set_снижающий_защиту_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert решение["permissionDecision"] == "ask"
+    assert "снижает защиту базы" in решение["permissionDecisionReason"]
+    assert "подтвердите" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _НЕ_СНИЖАЮЩИЕ)
+def test_команды_владельца_без_снижения_молчат(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_base_set_причина_называет_базу_и_ключи(tmp_path):
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "odata1c base set trade_dev --gate off --write on"},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "базы trade_dev" in причина
+    assert "--gate off" in причина and "--write on" in причина
+
+
+def test_base_set_в_цепочке_после_другой_команды(tmp_path):
+    """Review Focus 4: снижающая команда не первая в цепочке."""
+    команда = "odata1c base list && odata1c base set ut --gate off; echo готово"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+def test_base_set_в_цепочке_с_повышающей_командой_молчит(tmp_path):
+    команда = "odata1c base set ut --write off && odata1c base set bp --gate identifiers+names"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+def test_policy_open_даёт_ask(tmp_path):
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "uvx --from odata1c-gate odata1c policy open ut Catalog_Контрагенты.ИНН"
+            },
+        },
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение["permissionDecision"] == "ask"
+    assert "открывает поле" in решение["permissionDecisionReason"]
+
+
+def test_reveal_старше_правила_4(tmp_path):
+    """Правило 3 (`deny`) по-прежнему первое: `reveal` в одной команде с `base set` — deny."""
+    результат = _запустить(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "odata1c reveal x && odata1c base set ut --gate off"},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    assert _решение(результат)["permissionDecision"] == "deny"
+
+
+# --- Правило 4, раунд правок по ревью задачи 8: разбор по токенам ---------------------------
+
+# `--home` CLI принимает в любой позиции; сокращения ключей argparse тоже принимал (теперь
+# `allow_abbrev=False`, но хук не должен на это полагаться); оболочка склеивает переносы строк и
+# передаёт аргументы после перенаправления.
+_СНИЖАЮЩИЕ_РАУНД_2 = [
+    "odata1c --home C:/h base set ut --gate off",
+    "odata1c --home=C:/h base set ut --gate off",
+    "odata1c base --home C:/h set ut --gate off",
+    "odata1c base --home=C:/h set ut --gate off",
+    "uv run odata1c --home C:/h base --home C:/h set ut --write on",
+    "odata1c base set ut --gat off",
+    "odata1c base set ut --g=off",
+    "odata1c base set ut --w on",
+    "odata1c base set ut --ro dev",
+    "odata1c base set ut --p on",
+    "odata1c base set ut --m on",
+    "odata1c base set ut --re on",
+    "odata1c base set ut --c 0",
+    "odata1c base set ut --несуществующий",
+    "odata1c base set ut --write off --gate off",
+    "odata1c base set ut --gate off\n",
+    "odata1c \\\nbase set ut --gate off",
+    "odata1c base set ut \\\n  --gate off",
+    "odata1c base set ut `\n  --gate off",
+    "odata1c base set ut 2>&1 --gate off",
+    "odata1c base set ut &>log --gate off",
+    "odata1c base set ut *>&1 --gate off",
+    "odata1c base set ut >&2 --gate off",
+    "odata1c base set ut --gate off & echo фон",
+    "odata1c base list & odata1c base set ut --gate off",
+    '"odata1c" "base" "set" ut --gate off',
+    "python -m odata1c base set ut --gate off",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _СНИЖАЮЩИЕ_РАУНД_2)
+def test_base_set_обходы_ревью_дают_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c --home C:/h base set ut --write off",
+        "odata1c base --home C:/h set ut --gate identifiers+names",
+        "odata1c base set ut --write off && echo готово",
+        "odata1c base set ut --write off \\\n  --mark-deletion off",
+        "odata1c base set ut --label 'УТ' --home C:/h --write off",
+        "odata1c --version",
+        "odata1c --home C:/h base list",
+    ],
+)
+def test_команды_владельца_без_снижения_молчат_раунд_2(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c --home C:/h policy open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy --home C:/h open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy --home=C:/h open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy hide ut X && odata1c policy open ut Catalog_Контрагенты.ИНН",
+        "odata1c policy open ut Catalog_Контрагенты.ИНН 2>&1",
+        "odata1c \\\npolicy open ut Catalog_Контрагенты.ИНН",
+    ],
+)
+def test_policy_open_обходы_ревью_дают_ask(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "открывает поле" in решение["permissionDecisionReason"]
+
+
+def test_неизвестный_ключ_называется_в_причине(tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": "odata1c base set ut --gat off"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert "--gat (неизвестный ключ)" in _решение(результат)["permissionDecisionReason"]
+
+
+def test_powershell_обратная_косая_перед_кавычкой_делает_хвост_неразобранным(tmp_path):
+    """PowerShell 5.1 не экранирует `\\`, `shlex` экранирует: без этого правила подпись
+    `"x\\" --gate off --label "y\\"` для хука — один токен, а для PowerShell — ключ `--gate off`."""
+    команда = 'odata1c base set ut --label "x\\" --gate off --label "y\\"'
+
+    ps = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+    bash = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(ps)["permissionDecision"] == "ask"
+    # в Bash та же строка — действительно одна подпись; молчание там верно
+    assert bash.stdout.strip() == ""
+
+
+def test_powershell_обратная_кавычка_перед_кавычкой_делает_хвост_неразобранным(tmp_path):
+    команда = 'odata1c base set ut --label "x`" --gate off --label "y`"'
+
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize(
+    ("тул", "команда"),
+    [
+        # `;` в подписи режет хвост до незакрытой кавычки; слово подкоманды с кавычкой внутри
+        # не должно распасться на `b as e` в запасном разборе
+        ("Bash", 'odata1c b"as"e set ut --label "a;" --gate off'),
+        ("PowerShell", 'odata1c b"as"e set ut --gate off --label "x`"y"'),
+        # `>|` — перенаправление, аргументы после него принадлежат команде
+        ("Bash", "odata1c base set ut >| итог.txt --gate off"),
+        ("PowerShell", "odata1c base set ut >| итог.txt --gate off"),
+        # `$'…'` в Bash: `\'` внутри — экранирование, которого `shlex` не знает
+        ("Bash", "odata1c base set ut --label $'a\\';' --gate off"),
+    ],
+)
+def test_остатки_обходов_ревью_раунд_2_дают_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда", ["odata1c base set --help", "odata1c base set -h", "odata1c base set ut --help"]
+)
+def test_справка_base_set_молчит(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == ""
+
+
+def test_конвейер_после_base_set_по_прежнему_режет_хвост(tmp_path):
+    """`|&` остаётся разделителем: `--gate off` после него — аргумент другой команды."""
+    команда = "odata1c base set ut --write off |& echo --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+def test_две_снижающие_команды_называют_обе_базы(tmp_path):
+    команда = "odata1c base set ut --gate off && odata1c base set bp --write on"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "базы ut, bp" in причина
+    assert "--gate off" in причина and "--write on" in причина
+
+
+def test_смешанная_команда_называет_и_base_set_и_policy_open(tmp_path):
+    команда = "odata1c policy open ut Catalog_Контрагенты.ИНН && odata1c base set ut --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "снижает защиту базы ut" in причина
+    assert "policy open открывает поле модели" in причина
+
+
+# --- Правило 4, ревью задачи 9: `policy set … keep|scan` открывает поле, как `open` --------------
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c policy set ut Catalog_X.ИНН keep",
+        "odata1c policy set ut Catalog_X.ИНН scan",
+        "odata1c policy set ut Catalog_X.ИНН KEEP",
+        "odata1c policy set ut Catalog_X.ИНН Scan",
+        'odata1c policy set ut Catalog_X.ИНН "keep"',
+        "odata1c policy set --home C:/h ut X.Y keep",
+        "odata1c --home C:/h policy set ut X.Y keep",
+        "odata1c policy --home C:/h set ut X.Y scan",
+        "odata1c policy set ut X.Y keep 2>&1",
+        "odata1c policy hide ut X --yes && odata1c policy set ut X.Y keep",
+    ],
+)
+def test_policy_set_keep_scan_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c policy set ut Catalog_X.ИНН inn",
+        "odata1c policy set ut Catalog_X.ИНН org",
+        "odata1c policy set ut Catalog_X.ИНН custom:мой",
+        "odata1c policy set --home C:/h ut X.Y inn",
+        "odata1c policy set ut X.Y inn --home C:/h",
+        "odata1c policy set --help",
+        "odata1c policy set ut X.Y",
+        "odata1c policy hide ut X --yes",
+    ],
+)
+def test_policy_set_закрывающий_класс_молчит(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+def test_policy_set_незакрытая_кавычка_в_хвосте_даёт_ask(tmp_path):
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": 'odata1c policy set ut X.Y inn "keep'}},
+        env=_окружение(tmp_path),
+    )
+
+    assert _решение(результат)["permissionDecision"] == "ask"
+
+
+def test_смешанная_команда_называет_base_set_и_policy_set(tmp_path):
+    команда = "odata1c policy set ut X.Y keep && odata1c base set ut --gate off"
+
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "снижает защиту базы ut" in причина
+    assert "policy set … keep|scan открывает поле модели" in причина
+
+
+# --- Правило 4, финальное ревью ветки: раскрытие оболочки внутри слова команды → ask ----------
+
+_РАСКРЫТИЕ_В_СЛОВЕ = [
+    "odata1c ba$()se set ut --gate off",
+    "odata1c base s$()et ut --gate off",
+    "odata1c $'base' set ut --gate off",
+    "odata1c ba${x}se set ut --gate off",
+    "s=set; odata1c base $s ut --gate off",
+    "odata1c b`ase set ut --gate off",
+    "odata1c base s`et ut --gate off",
+    "odata1c ba$('')se set ut --gate off",
+    "odata1c policy s$()et ut X.Y keep",
+    "odata1c po$()licy open ut X.Y",
+    "odata1c -$()-home C:/h base set ut --gate off",
+    "odata1c $cmd ut --gate off",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _РАСКРЫТИЕ_В_СЛОВЕ)
+def test_раскрытие_оболочки_в_слове_команды_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "команда odata1c не разобрана" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base list",
+        "odata1c base set ut --write off",
+        "odata1c --home C:/h base set ut --write off",
+        "odata1c base set --home C:/h ut --write off",
+        "odata1c --home=C:/h base set ut --write off",
+        "odata1c policy hide ut X --yes",
+    ],
+)
+def test_раскрытие_оболочки_контроль_без_ложных_вопросов(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда", ["odata1c policy set ut X.Y ke$()ep", "odata1c policy set ut X.Y $класс"]
+)
+def test_policy_set_класс_с_раскрытием_оболочки_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+def test_неразобранный_хвост_без_базы_называет_вопрос_вопросом(tmp_path):
+    """Фраза в `echo`/`git commit -m` с закрывающей кавычкой в хвосте: базы нет, хвост не
+    разобран — причина не должна говорить «защита базы ?»."""
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": 'echo "odata1c base set --gate off"'}},
+        env=_окружение(tmp_path),
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "команда odata1c не разобрана — подтвердите" in причина
+    assert "базы ?" not in причина
+    assert "(хвост команды не разобран)" not in причина
+
+
+# --- Правило 4, раунд 2 финального ревью: разрешительный список (N2) и хвост `base set` (N1) ---
+
+# N2: слово в позиции ключа, группы, подкоманды или класса — распознано либо целиком из
+# разрешённых символов; `@a`, `%S%`, `^`, glob и прежние `$()`/`` ` `` дают вопрос.
+_НЕ_РАЗОБРАНО_РАУНД_2 = [
+    "$a='base','set','ut','--gate','off'; odata1c @a",
+    "$a='set','ut','--gate','off'; odata1c base @a",
+    "odata1c base %S% ut --gate off",
+    "cmd /c odata1c base s^et ut --gate off",
+    "cmd /c odata1c base %S% ut --gate off",
+    "odata1c ^base set ut --gate off",
+    "odata1c ba[s]e s[e]t ut --gate off",
+    "odata1c base se? ut --gate off",
+    "odata1c base s* ut --gate off",
+    "odata1c b?se set ut --gate off",
+    "odata1c policy o* ut X.Y",
+    "odata1c --h?me C:/h base set ut --gate off",
+    "odata1c --ho@me C:/h base set ut --gate off",
+    "odata1c --home %H% base set ut --gate off",
+    "h='x set ut --gate off'; odata1c --home $h",
+    "h='x set ut --gate off'; odata1c --home=$h",
+    "h='x set ut --gate off'; odata1c base --home $h",
+    "h='x set ut --gate off'; odata1c base --home=$h",
+    "$h='x','set','ut','--gate','off'; odata1c --home $h",
+    "odata1c --home=$HOME/h base set ut --write off",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _НЕ_РАЗОБРАНО_РАУНД_2)
+def test_разрешительный_список_слов_команды_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "команда odata1c не разобрана" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "$env:S='set'; odata1c --% base %S% ut --gate off",
+        "odata1c --% base list",
+        "icacls --% x; odata1c base list",
+    ],
+)
+def test_powershell_остановка_разбора_даёт_ask(команда, tmp_path):
+    """`--%` — остаток строки PowerShell передаёт как есть, раскрывая `%VAR%`: разбор недостоверен
+    где бы в команде токен ни стоял, если команда вообще вызывает odata1c."""
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "команда odata1c не разобрана" in решение["permissionDecisionReason"]
+
+
+def test_powershell_остановка_разбора_без_odata1c_молчит(tmp_path):
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": "icacls --% x /grant y"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+# N1: раскрытие переменной в хвосте `base set` (в том числе значение нейтрального ключа) —
+# снижение с пометкой; `shlex` кавычек не помнит, поэтому подпись со скобкой, `@` или `%` — цена.
+_РАСКРЫТИЕ_В_ХВОСТЕ = [
+    "s='--gate off'; odata1c base set ut $s",
+    "s='--gate off'; odata1c base set ut --label $s",
+    "s='--gate off'; odata1c base set ut --label=$s",
+    "s='t --gate off'; odata1c base set u$s",
+    "s='--gate off'; odata1c base set ut --home $s",
+    "s='ut --gate off'; odata1c base set $s",
+    "$s='--gate','off'; odata1c base set ut $s",
+    "$s='--gate','off'; odata1c base set ut @s",
+    "odata1c base set ut --gate=$'off'",
+    "odata1c base set ut --label 'УТ (розница)'",
+    "odata1c base set ut --label 'НДС 20%'",
+    "odata1c base set ut --label 'за@дача'",
+]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("команда", _РАСКРЫТИЕ_В_ХВОСТЕ)
+def test_раскрытие_оболочки_в_хвосте_base_set_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+    assert "(раскрытие оболочки)" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "h='x keep'; odata1c policy set ut X.Y --home $h",
+        "h='x keep'; odata1c policy set ut X.Y --home=$h",
+        "odata1c policy set ut X.Y ke^ep",
+        "odata1c policy set ut X.Y k?ep",
+        "odata1c policy set ut X.Y k[e]ep",
+        "odata1c policy set ut X.Y %K%",
+        "odata1c policy set ut X.Y @k",
+    ],
+)
+def test_policy_set_раскрытие_в_классе_или_home_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base list",
+        "odata1c base set ut --write off",
+        "odata1c base set --home C:/h ut --write off",
+        "odata1c policy set ut Catalog_Контрагенты.ИНН custom:мой",
+        "git add src/odata1c/config/base_edit.py",
+        "uvx --from odata1c-gate@0.3.0 odata1c base list",
+        "git commit -m 'хук odata1c спрашивает подтверждение'",
+    ],
+)
+def test_разрешительный_список_контроль_без_ложных_вопросов(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+# N4: перевод строки в подписи — цена правила 4, как `;`, `&`, `|`: хвост режется по нему до
+# разбора кавычек и считается неразобранным; CLI всё равно отвечает отказом до записи.
+@pytest.mark.parametrize(
+    ("тул", "команда"),
+    [
+        ("Bash", 'odata1c base set trade_dev --label "строка1\nстрока2"'),
+        ("Bash", "odata1c base set trade_dev --label 'строка1\nстрока2'"),
+        ("Bash", "odata1c base set trade_dev --label $'строка1\\nстрока2'"),
+        ("PowerShell", 'odata1c base set trade_dev --label "строка1`nстрока2"'),
+        ("PowerShell", 'odata1c base set trade_dev --label "строка1\nстрока2"'),
+    ],
+)
+def test_перевод_строки_в_подписи_даёт_ask_хвост_не_разобран(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "(хвост команды не разобран)" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+def test_раскрытие_внутри_слова_odata1c_известный_предел(тул, tmp_path):
+    """Предел правила 4 (N5): слово `odata1c` ищется буквально, раскрытие внутри него хук не
+    видит — команда `od$()ata1c base set ut --gate off` проходит молча."""
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": "od$()ata1c base set ut --gate off"}},
+        env=_окружение(tmp_path),
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+# --- Правило 4, раунд 3 повторного ревью: PowerShell 5.1, лишние слова, форма запуска ---------
+
+# PowerShell: унарная запятая и `a,b` раскладываются в отдельные аргументы native-команды.
+_ЗАПЯТАЯ_POWERSHELL = [
+    "odata1c base set ut ,--gate,off",
+    "odata1c base set ,ut,--gate,off",
+    "odata1c base set ut --label x ,--gate ,off",
+    "odata1c base set ut --label ,x,--gate,off",
+    "odata1c base set ut --write off,--gate",
+    "odata1c --home C:/h,base,set,ut,--gate,off",
+    "odata1c base --home=C:/h,set,ut,--gate,off",
+]
+
+
+@pytest.mark.parametrize("команда", _ЗАПЯТАЯ_POWERSHELL)
+def test_powershell_запятая_в_команде_даёт_ask(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+def test_powershell_запятая_в_policy_set_даёт_ask(tmp_path):
+    результат = _запустить(
+        {
+            "tool_name": "PowerShell",
+            "tool_input": {"command": "odata1c policy set ut ,Catalog_X.ИНН,keep"},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    решение = _решение(результат)
+    assert решение is not None
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+def test_запятая_в_подписи_в_bash_молчит_в_powershell_спрашивает(tmp_path):
+    команда = 'odata1c base set ut --label "УТ, розница" --write off'
+
+    bash = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+    ps = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert bash.stdout.strip() == ""
+    assert "(раскрытие оболочки)" in _решение(ps)["permissionDecisionReason"]
+
+
+# PowerShell 5.1 передаёт буквальную `"` внутри строки без экранирования: native-команда видит её
+# границей аргумента.
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --label 'УТ розница\" --gate \"off'",
+        'odata1c base set ut --label "a b"" --gate ""off"',
+    ],
+)
+def test_powershell_встроенная_двойная_кавычка_даёт_ask(команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "(хвост команды не разобран)" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --label 'УТ розница\" --gate \"off'",
+        'odata1c base set ut --label "a b"" --gate ""off"',
+    ],
+)
+def test_встроенная_двойная_кавычка_в_bash_молчит(команда, tmp_path):
+    """В Bash это одна подпись: для хука вопрос только в PowerShell."""
+    результат = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut extra --write off",
+        "odata1c base set ut *",
+        "odata1c base set ut ut2 --write off",
+        "odata1c base set u* --write off",
+    ],
+)
+def test_base_set_лишнее_слово_или_glob_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "снижает защиту базы" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c policy set ut X.Y inn extra",
+        "odata1c policy set ut X.Y inn *",
+        "odata1c policy set ut X.* inn",
+        "odata1c policy set ut X.Y i?n",
+    ],
+)
+def test_policy_set_лишнее_слово_или_glob_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert "policy set … keep|scan открывает поле модели" in решение["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "python -m odata1c.__main__ base set ut --gate off",
+        "python -m odata1c.cli base set ut --gate off",
+        "python -m odata1c.__main__ policy open ut X.Y",
+    ],
+)
+def test_запуск_модуля_python_m_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат) is not None, команда
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --write off",
+        "odata1c policy set ut X.Y inn",
+        "python -m odata1c.__main__ base list",
+    ],
+)
+def test_раунд_3_контроли_без_ложных_вопросов(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда
+
+
+# Перенаправление после команды владельца — лишнее слово хвоста: цена правила, не дефект. Разбор
+# перенаправлений отвергнут: экранированная кавычка в цели (`> a\"b`) уносила следующие аргументы.
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --write off > log",
+        "odata1c base set ut --write off 2>&1",
+        "odata1c base set ut --write off &>log",
+        "odata1c base set ut --write off >| итог.txt",
+        "odata1c base set ut --write off>log",
+        "odata1c base set ut --write off 2>$null",
+        "odata1c policy set ut X.Y inn 2>&1",
+        "odata1c policy set ut X.Y inn > итог.txt",
+        "odata1c base set ut > $f --gate off",
+        "odata1c base set ut >f --gate off",
+        "odata1c base set ut 2>&1 --gate off",
+        "odata1c base set ut >| итог.txt --gate off",
+        'odata1c base set ut > a\\"b --gate off',
+    ],
+)
+def test_перенаправление_после_команды_владельца_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат) is not None, команда
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "python -m 'odata1c.__main__' base set ut --gate off",
+        'python -m "odata1c.__main__" base set ut --gate off',
+        "python -m 'odata1c.cli' policy open ut X.Y",
+    ],
+)
+def test_запуск_модуля_в_кавычках_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert _решение(результат) is not None, команда
+
+
+def test_powershell_пробел_и_конечная_косая_черта_в_токене_даёт_ask(tmp_path):
+    """PowerShell 5.1 оборачивает аргумент с пробелом в кавычки и не удваивает конечную `\\`:
+    закрывающая кавычка теряется, и границы следующих аргументов смещаются; в Bash та же строка —
+    две подписи."""
+    команда = "odata1c base set ut --label 'C:\\Temp dir\\' --label 'x --gate off'"
+
+    ps = _запустить(
+        {"tool_name": "PowerShell", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+    bash = _запустить(
+        {"tool_name": "Bash", "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert "(хвост команды не разобран)" in _решение(ps)["permissionDecisionReason"]
+    assert bash.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+def test_неразобранный_хвост_с_тире_вместо_базы_называет_вопрос_вопросом(тул, tmp_path):
+    """`git commit -m "feat: odata1c base set — поля"`: первое слово после `set` — тире, не имя
+    базы; причина — «команда odata1c не разобрана», а не «снижает защиту базы —»."""
+    результат = _запустить(
+        {
+            "tool_name": тул,
+            "tool_input": {"command": 'git commit -m "feat: odata1c base set — поля"'},
+        },
+        env=_окружение(tmp_path),
+    )
+
+    причина = _решение(результат)["permissionDecisionReason"]
+    assert "команда odata1c не разобрана" in причина
+    assert "базы —" not in причина
+
+
+# --- Правило 4, раунд 5: запасной разбор не должен молча терять подкоманду -------------------
+
+
+@pytest.mark.parametrize(
+    ("тул", "команда"),
+    [
+        # R1: `--home 'a b'` в запасном разборе распадается на два слова и сдвигает подкоманду
+        (
+            "PowerShell",
+            "odata1c --home 'a b' --home C:/h base set ut --gate off --label 'x y\\'",
+        ),
+        (
+            "PowerShell",
+            "odata1c base --home 'a b' set ut --gate off --label 'x y\\'",
+        ),
+        ("Bash", "odata1c --home '' base set ut --gate off --label $'x'"),
+        ("PowerShell", "odata1c --home 'a b' --home C:/h base set ut --gate off --label x`y"),
+        ("Bash", "odata1c --home 'a b' --home C:/h $'base' set ut --gate off"),
+    ],
+)
+def test_запасной_разбор_со_сдвигом_подкоманды_даёт_ask(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    решение = _решение(результат)
+    assert решение is not None, команда
+    assert решение["permissionDecision"] == "ask"
+
+
+@pytest.mark.parametrize("тул", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "команда",
+    [
+        "odata1c base set ut --write off",
+        "odata1c base list",
+        "git add src/odata1c/config/base_edit.py",
+    ],
+)
+def test_запасной_разбор_контроли_молчат(тул, команда, tmp_path):
+    результат = _запустить(
+        {"tool_name": тул, "tool_input": {"command": команда}}, env=_окружение(tmp_path)
+    )
+
+    assert результат.returncode == 0
+    assert результат.stdout.strip() == "", команда

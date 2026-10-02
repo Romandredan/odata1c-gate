@@ -77,7 +77,7 @@ def _разобрать_yaml(path: pathlib.Path) -> dict:
         raise ConfigError(
             f"файл {path.name} повреждён и не разбирается как YAML: {место}",
             hint=f"проверьте синтаксис файла {path}",
-        ) from exc
+        ) from None  # текст ошибки PyYAML вклеивает фрагмент файла — а в нём может быть пароль
     return data or {}
 
 
@@ -153,7 +153,23 @@ def _load_bases(
     предупреждение = check_file_permissions(path)
     if предупреждение:
         warnings.append(предупреждение)
-    data = _разобрать_yaml(path)
+    return parse_bases(_разобрать_yaml(path), path, warnings)
+
+
+def parse_bases(
+    data: dict,
+    path: pathlib.Path,
+    warnings: list[str],
+    *,
+    resolve_keyring: bool = True,
+) -> tuple[str | None, dict[str, BaseConfig]]:
+    """Собрать записи баз из уже разобранного содержимого файла баз: умолчания роли, модель
+    `BaseConfig`, база по умолчанию. `path` нужен только для текстов ошибок.
+
+    Отдельно от чтения файла — ради `base set` (`config/base_edit.py`): команда проверяет новый
+    текст этой же функцией ДО того, как положит его на место исходного файла, и с
+    `resolve_keyring=False` — пароль `keyring` остаётся строкой, хранилище ОС не трогается: проверка
+    текста не должна зависеть от того, установлен ли пакет keyring и записан ли секрет."""
     raw_bases = data.get("bases") or {}
     if not isinstance(raw_bases, dict):
         raise ConfigError("в bases.yaml раздел bases должен быть словарём «имя базы: настройки»")
@@ -177,7 +193,10 @@ def _load_bases(
         try:
             resolved = apply_role(role, raw)
         except ConfigError as exc:
-            raise ConfigError(f"база «{name}»: {exc}", code=exc.code, hint=exc.hint) from exc
+            # `from None` ради единообразия с соседними `raise`: в цепочке здесь отказ неизвестной
+            # роли (`ConfigError` без значений полей), а не валидатор с `input_value`; текст отказа
+            # уже переписан в новое исключение, второй раз его трассировка печатать не должна.
+            raise ConfigError(f"база «{name}»: {exc}", code=exc.code, hint=exc.hint) from None
         try:
             bases[name] = BaseConfig(name=name, **resolved)
         except pydantic.ValidationError as exc:
@@ -189,8 +208,8 @@ def _load_bases(
             raise ConfigError(
                 f"bases.yaml: база «{name}» описана неверно: {текст_ошибки}",
                 hint=f"проверьте запись базы в файле {path}",
-            ) from exc
-        if bases[name].password == "keyring":
+            ) from None  # `__cause__` с `input_value` (пароль) в трассировку не попадает
+        if resolve_keyring and bases[name].password == "keyring":
             bases[name] = bases[name].model_copy(update={"password": _из_keyring(name)})
 
     default = data.get("default")
@@ -215,7 +234,8 @@ def _load_daemon(home: pathlib.Path, warnings: list[str]) -> DaemonConfig:
     try:
         daemon = DaemonConfig(**data)
     except pydantic.ValidationError as exc:
-        raise ConfigError(f"daemon.yaml описан неверно: {format_validation_error(exc)}") from exc
+        # `from None`: `input_value` в `__cause__` — значение поля, в том числе секрет гейта.
+        raise ConfigError(f"daemon.yaml описан неверно: {format_validation_error(exc)}") from None
     if not daemon.gate_secret:
         raise ConfigError(
             "секрет гейта (gate_secret) не найден в daemon.yaml",

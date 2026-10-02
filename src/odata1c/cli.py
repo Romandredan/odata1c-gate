@@ -1,19 +1,22 @@
 """Командная строка odata1c (SPEC §3.5).
 
-В этой задаче реализованы init, base list, base test, daemon и daemon stop; остальные команды
-добавляются следующими задачами и планами.
+В этой задаче реализованы init, base list, base test, base set, daemon и daemon stop; остальные
+команды добавляются следующими задачами и планами.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import difflib
 import getpass
 import importlib.resources
 import pathlib
+import re
 import sys
 import time
+import unicodedata
 
 import httpx2
 import pydantic
@@ -23,6 +26,7 @@ from odata1c import doctor
 from odata1c.__about__ import __version__
 from odata1c.client1c.client import Client1C
 from odata1c.client1c.errors import OdataError
+from odata1c.config.base_edit import ПО_РОЛИ, set_base_fields
 from odata1c.config.home import base_dir, ensure_home, resolve_home
 from odata1c.config.importer import parse_env
 from odata1c.config.loader import ConfigError, format_validation_error, load_config
@@ -88,7 +92,15 @@ _ОШИБКИ_ЗАПУСКА_MCP = (ConfigError, MCPError, httpx2.HTTPError, OSE
 ОЖИДАНИЕ_ГОТОВНОСТИ_S = 15
 
 
+def _подпарсер(действие, имя: str, **параметры) -> argparse.ArgumentParser:
+    """`add_parser` с выключенными сокращениями ключей. Хук плагина (правило 4, ADR-0017) сверяет
+    ключи `base set` по точному написанию; argparse по умолчанию принимает `--gat off` как
+    `--gate off`, и такая команда прошла бы мимо `ask`."""
+    return действие.add_parser(имя, allow_abbrev=False, **параметры)
+
+
 def main(argv: list[str] | None = None) -> int:
+    _вывод_в_utf8()
     # --home общий для всех команд, в любой позиции: до подкоманды, между уровнями подкоманд
     # или после них. Наивное решение — добавить --home через parents=[...] на каждый уровень —
     # не работает: argparse разбирает хвост, доставшийся подпарсеру, в отдельное пространство
@@ -108,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        prog="odata1c", description="Шлюз к OData 1С с гейтом", parents=[домашний]
+        prog="odata1c",
+        description="Шлюз к OData 1С с гейтом",
+        parents=[домашний],
+        allow_abbrev=False,
     )
     # Ruling 64: версия пакета — одна на весь инструмент, источник — __about__.py (SPEC design
     # §2). action="version" печатает и завершает разбор ДО проверки required=True у подпарсеров
@@ -116,16 +131,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"odata1c-gate {__version__}")
     команды = parser.add_subparsers(dest="команда", required=True)
 
-    команды.add_parser(
-        "init", help="создать домашний каталог и шаблоны настроек", parents=[домашний]
+    _подпарсер(
+        команды, "init", help="создать домашний каталог и шаблоны настроек", parents=[домашний]
     )
 
-    base = команды.add_parser("base", help="работа с базами", parents=[домашний])
+    base = _подпарсер(команды, "base", help="работа с базами", parents=[домашний])
     подкоманды = base.add_subparsers(dest="подкоманда", required=True)
-    подкоманды.add_parser("list", help="список описанных баз", parents=[домашний])
-    test = подкоманды.add_parser("test", help="проверить соединение с базой", parents=[домашний])
+    _подпарсер(подкоманды, "list", help="список описанных баз", parents=[домашний])
+    test = _подпарсер(подкоманды, "test", help="проверить соединение с базой", parents=[домашний])
     test.add_argument("name", help="имя базы из bases.yaml")
-    add = подкоманды.add_parser("add", help="добавить базу", parents=[домашний])
+    add = _подпарсер(подкоманды, "add", help="добавить базу", parents=[домашний])
     add.add_argument("name", help="имя базы: строчные латинские буквы, цифры, подчёркивание")
     add.add_argument("--role", choices=("prod", "test", "dev"), default="prod")
     add.add_argument(
@@ -139,60 +154,112 @@ def main(argv: list[str] | None = None) -> int:
         choices=("ut", "bp", "zup"),
         help="скопировать шаблон рецептов для типовой конфигурации",
     )
-    импорт = подкоманды.add_parser(
-        "import", help="перенести базы из env-файла прежнего сервера", parents=[домашний]
+    set_ = _подпарсер(
+        подкоманды,
+        "set",
+        help="изменить настройки базы: уровень гейта, запись, подпись, роль, разрешения",
+        parents=[домашний],
+    )
+    set_.add_argument("name", help="имя базы")
+    set_.add_argument(
+        "--gate",
+        choices=("off", "identifiers", "identifiers+names", "default"),
+        help="уровень гейта этой базы; default — по роли",
+    )
+    set_.add_argument(
+        "--write", choices=("on", "off", "default"), help="пишущие тулы; default — по роли"
+    )
+    set_.add_argument("--label", help="подпись базы для модели")
+    set_.add_argument(
+        "--role",
+        choices=("prod", "test", "dev"),
+        help="роль: умолчания гейта, записи и разрешений; явно заданные поля остаются",
+    )
+    set_.add_argument(
+        "--post-documents",
+        dest="post_documents",
+        choices=("on", "off", "default"),
+        help="проведение и отмена проведения (Post/Unpost)",
+    )
+    set_.add_argument(
+        "--mark-deletion",
+        dest="mark_deletion",
+        choices=("on", "off", "default"),
+        help="пометка удаления объектов",
+    )
+    set_.add_argument(
+        "--register-delete",
+        dest="register_delete",
+        choices=("on", "off", "default"),
+        help="удаление записей независимых регистров сведений "
+        "(permissions.independent_register_delete)",
+    )
+    set_.add_argument(
+        "--commit-limit",
+        dest="commit_limit",
+        type=_лимит_коммитов,
+        help="коммитов за 10 минут на сессию: число, 0 — без лимита, default — по роли",
+    )
+    импорт = _подпарсер(
+        подкоманды,
+        "import",
+        help="перенести базы из env-файла прежнего сервера",
+        parents=[домашний],
     )
     импорт.add_argument("path", help="путь к 1c-odata.env")
 
-    reindex_parser = команды.add_parser(
-        "reindex", help="обновить индекс метаданных базы", parents=[домашний]
+    reindex_parser = _подпарсер(
+        команды, "reindex", help="обновить индекс метаданных базы", parents=[домашний]
     )
     reindex_parser.add_argument("name", help="имя базы")
     reindex_parser.add_argument(
         "--force", action="store_true", help="перестроить, даже если $metadata не менялся"
     )
 
-    policy = команды.add_parser("policy", help="политика гейта", parents=[домашний])
+    policy = _подпарсер(команды, "policy", help="политика гейта", parents=[домашний])
     policy_sub = policy.add_subparsers(dest="подкоманда", required=True)
-    show = policy_sub.add_parser("show", help="показать политику базы", parents=[домашний])
+    show = _подпарсер(policy_sub, "show", help="показать политику базы", parents=[домашний])
     show.add_argument("name", help="имя базы")
-    check = policy_sub.add_parser(
-        "check", help="проверить файл владельца по индексу", parents=[домашний]
+    check = _подпарсер(
+        policy_sub, "check", help="проверить файл владельца по индексу", parents=[домашний]
     )
     check.add_argument("name", help="имя базы")
-    hide = policy_sub.add_parser(
-        "hide", help="скрыть сущность целиком (с дочерними)", parents=[домашний]
+    hide = _подпарсер(
+        policy_sub, "hide", help="скрыть сущность целиком (с дочерними)", parents=[домашний]
     )
     hide.add_argument("name", help="имя базы")
     hide.add_argument("entity", help="имя сущности индекса")
     hide.add_argument(
         "--yes", action="store_true", help="не спрашивать подтверждение (для скриптов)"
     )
-    policy_open = policy_sub.add_parser(
-        "open", help="открыть поле (класс keep)", parents=[домашний]
+    policy_open = _подпарсер(
+        policy_sub, "open", help="открыть поле (класс keep)", parents=[домашний]
     )
     policy_open.add_argument("name", help="имя базы")
     policy_open.add_argument("field", help="Сущность.Поле")
-    policy_set = policy_sub.add_parser("set", help="назначить полю класс", parents=[домашний])
+    policy_set = _подпарсер(policy_sub, "set", help="назначить полю класс", parents=[домашний])
     policy_set.add_argument("name", help="имя базы")
     policy_set.add_argument("field", help="Сущность.Поле")
     policy_set.add_argument(
         "cls", metavar="класс", help="CLASSES (gate/tokens.py) | scan | custom:<имя>"
     )
 
-    recipe = команды.add_parser("recipe", help="библиотека рецептов", parents=[домашний])
+    recipe = _подпарсер(команды, "recipe", help="библиотека рецептов", parents=[домашний])
     recipe_sub = recipe.add_subparsers(dest="подкоманда", required=True)
-    recipe_check = recipe_sub.add_parser(
-        "check", help="проверить библиотеку рецептов конфигурации", parents=[домашний]
+    recipe_check = _подпарсер(
+        recipe_sub, "check", help="проверить библиотеку рецептов конфигурации", parents=[домашний]
     )
     recipe_check.add_argument("config", help="имя конфигурации (каталог recipes/<config>/)")
-    recipe_list = recipe_sub.add_parser(
-        "list", help="список рецептов базы (шаблон, библиотека, файл базы)", parents=[домашний]
+    recipe_list = _подпарсер(
+        recipe_sub,
+        "list",
+        help="список рецептов базы (шаблон, библиотека, файл базы)",
+        parents=[домашний],
     )
     recipe_list.add_argument("name", help="имя базы")
 
-    daemon_parser = команды.add_parser(
-        "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
+    daemon_parser = _подпарсер(
+        команды, "daemon", help="запустить MCP-демон (Streamable HTTP)", parents=[домашний]
     )
     daemon_parser.add_argument(
         "--foreground",
@@ -200,9 +267,10 @@ def main(argv: list[str] | None = None) -> int:
         help="работать в текущем процессе (без этого — порождает фоновый процесс и ждёт порт)",
     )
     daemon_подкоманды = daemon_parser.add_subparsers(dest="действие")
-    daemon_подкоманды.add_parser("stop", help="остановить демон по daemon.pid", parents=[домашний])
+    _подпарсер(daemon_подкоманды, "stop", help="остановить демон по daemon.pid", parents=[домашний])
 
-    mcp_parser = команды.add_parser(
+    mcp_parser = _подпарсер(
+        команды,
         "mcp",
         help="лаунчер: stdio-прокси демону (подключение к Claude Code)",
         parents=[домашний],
@@ -215,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         "--url", help="адрес демона явно (иначе daemon_url из порта daemon.yaml)"
     )
 
-    doctor_parser = команды.add_parser(
+    doctor_parser = _подпарсер(
+        команды,
         "doctor",
         help="проверка окружения: uv, дом, базы, индекс, политика, демон, Claude Code",
         parents=[домашний],
@@ -226,8 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         help="дополнительно проверить соединение с 1С каждой видимой базы (как base test)",
     )
 
-    reveal = команды.add_parser(
-        "reveal", help="реальное значение токена (только для пользователя)", parents=[домашний]
+    reveal = _подпарсер(
+        команды,
+        "reveal",
+        help="реальное значение токена (только для пользователя)",
+        parents=[домашний],
     )
     reveal.add_argument("token", help="токен вида [[inn:M4T2Q9XZ7K]]")
     reveal.add_argument(
@@ -249,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_base_test(home, args.name)
         if args.команда == "base" and args.подкоманда == "add":
             return cmd_base_add(home, args.name, args.role, args.recipes, args.gate)
+        if args.команда == "base" and args.подкоманда == "set":
+            return cmd_base_set(home, args.name, _изменения_base_set(args))
         if args.команда == "base" and args.подкоманда == "import":
             return cmd_base_import(home, pathlib.Path(args.path))
         if args.команда == "reindex":
@@ -956,6 +1030,149 @@ def cmd_reveal(
         print(f"[token_unknown] токен {token} не найден в словаре")
         return 1
     print(значение)
+    return 0
+
+
+def _вывод_в_utf8() -> None:
+    """Команды CLI теперь читает и модель через канал инструмента Bash (навыки `odata1c-base`,
+    `odata1c-policy`, ADR-0017), а на Windows поток Python в канале кодируется кодовой страницей
+    (`cp1251`) — кириллица дошла бы искажённой. В настоящей консоли Windows поток и так UTF-8.
+    Тот же приём, что у хука плагина (`pretooluse.py::main`). Вызывается первой строкой `main`:
+    справка `--help` и отказы argparse печатаются внутри `parse_args`. Команда `mcp` не
+    исключена: SDK `stdio_server` забирает дескриптор 1 в двоичном режиме, и текстовая обёртка
+    канал JSON-RPC не затрагивает. Режим ошибок потока сохраняется: сброс в `strict` уронил бы
+    печать отказа на суррогате из `argv`."""
+    for поток in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            поток.reconfigure(encoding="utf-8", errors=поток.errors)
+
+
+def _лимит_коммитов(значение: str) -> int | str:
+    # Не-ASCII цифры (`²`) отклоняются здесь же: `int("²")` дал бы `ValueError`, и argparse
+    # напечатал бы вместо подсказки «invalid _лимит_коммитов value» с именем функции.
+    if значение == "default":
+        return значение
+    if re.fullmatch(r"[0-9]+", значение):
+        return int(значение)
+    raise argparse.ArgumentTypeError("целое число (0 — без лимита) или default")
+
+
+# Ключ командной строки → поле записи базы (`config/base_edit.py::ПОЛЯ`); порядок — как в `ПОЛЯ`
+# и в файле: так строки таблицы «было → стало» идут в порядке записи.
+_КЛЮЧИ_BASE_SET = (
+    ("label", "label"),
+    ("role", "role"),
+    ("write", "write"),
+    ("gate", "gate.mode"),
+    ("post_documents", "permissions.post_documents"),
+    ("mark_deletion", "permissions.mark_deletion"),
+    ("register_delete", "permissions.independent_register_delete"),
+    ("commit_limit", "permissions.commit_limit"),
+)
+_ПОДСКАЗКА_BASE_SET = (
+    "укажите хотя бы одно поле: --gate, --write, --label, --role, --post-documents, "
+    "--mark-deletion, --register-delete, --commit-limit"
+)
+
+
+def _изменения_base_set(args: argparse.Namespace) -> dict[str, object]:
+    изменения: dict[str, object] = {}
+    for атрибут, поле in _КЛЮЧИ_BASE_SET:
+        значение = getattr(args, атрибут, None)
+        if значение is None:
+            continue
+        if поле == "label":
+            # Подпись — произвольная строка: `default`, `on`, `off` здесь обычные слова, а не
+            # значения-переключатели. Края обрезаются, как у `base add`.
+            изменения[поле] = значение.strip()
+        elif значение == "default":
+            изменения[поле] = ПО_РОЛИ
+        elif значение == "on":
+            изменения[поле] = True
+        elif значение == "off" and поле != "gate.mode":
+            изменения[поле] = False
+        else:
+            изменения[поле] = значение
+    return изменения
+
+
+def _да_нет(значение: bool) -> str:
+    return "да" if значение else "нет"
+
+
+def _показать_значение(поле: str, значение: object) -> str:
+    if поле == "permissions.commit_limit":
+        return "без лимита" if значение == 0 else str(значение)
+    if isinstance(значение, bool):
+        return _да_нет(значение)
+    return str(значение)
+
+
+def _с_источником(поле: str, значение: object, источник: str) -> str:
+    текст = _показать_значение(поле, значение)
+    return f"{текст} ({источник})" if источник else текст
+
+
+def cmd_base_set(home: pathlib.Path, name: str, изменения: dict[str, object]) -> int:
+    """`odata1c base set <база> [--gate] [--write] [--label] [--role] [--post-documents]
+    [--mark-deletion] [--register-delete] [--commit-limit]` (ADR-0017, проект 2026-10-01 §3.1).
+
+    Печатает только изменённые поля «было → стало» с источником и действующее состояние базы.
+    Адрес, пользователь и пароль не печатаются ни в одной ветке: команду теперь запускает модель
+    (навык `odata1c-base`), и её вывод — тот же канал наружу, что и ответ тула. Правку делает
+    `set_base_fields`: он сам проверяет файл той же моделью, что читает демон (тот же
+    `config_invalid` с путём и строкой), и отвечает `base_unknown` с перечнем баз. `load_config`
+    здесь не вызывается: он разрешает `password: keyring` и без пакета или секрета отказал бы,
+    хотя пароль команде не нужен."""
+    if not изменения:
+        print(_ПОДСКАЗКА_BASE_SET)
+        return 1
+    if "label" in изменения:
+        подпись = str(изменения["label"])
+        if not подпись.strip():
+            raise ConfigError("подпись базы не может быть пустой")
+        # Перевод строки в подписи писатель положил бы многострочным скаляром, и правило «одно
+        # поле — одна строка» сломалось бы при следующей правке файла. Неразрывный пробел и
+        # прочие пробелы допустимы: отклоняются только управляющие символы и разделители строк.
+        if any(unicodedata.category(символ) in ("Cc", "Zl", "Zp") for символ in подпись):
+            raise ConfigError("подпись базы должна быть одной строкой без управляющих символов")
+    результат = set_base_fields(home / "bases.yaml", name, изменения)
+    print(f"база {name} ({результат.label})")
+    if not результат.изменено:
+        print("изменений нет")
+        return 0
+    строки = [
+        (
+            и.поле,
+            _с_источником(и.поле, и.было, и.было_источник),
+            _с_источником(и.поле, и.стало, и.стало_источник),
+        )
+        for и in результат.изменения
+        if и.есть
+    ]
+    # Ширина колонок — по данным: «identifiers+names (по роли prod)» длиннее любой фиксированной
+    # ширины, и значения слиплись бы.
+    ширина_поля = max(len(поле) for поле, _, _ in [("поле", "", ""), *строки]) + 2
+    ширина_было = max(len(было) for _, было, _ in [("", "было", ""), *строки]) + 2
+    print(f"{'поле':<{ширина_поля}}{'было':<{ширина_было}}стало")
+    for поле, было, стало in строки:
+        print(f"{поле:<{ширина_поля}}{было:<{ширина_было}}{стало}")
+    if результат.явные_поля and any(и.поле == "role" and и.есть for и in результат.изменения):
+        print(f"задано явно, роль не влияет: {', '.join(результат.явные_поля)}")
+    д = результат.действует
+    р = д["permissions"]
+    print(
+        f"действует: роль {д['role']}; гейт {д['gate']}; "
+        f"запись {_да_нет(д['write'])}; "
+        f"проведение {_да_нет(р['post_documents'])}; "
+        f"пометка удаления {_да_нет(р['mark_deletion'])}; "
+        f"удаление записей регистров {_да_нет(р['independent_register_delete'])}; "
+        f"лимит коммитов {_показать_значение('permissions.commit_limit', р['commit_limit'])}"
+    )
+    print(
+        "демон перечитает файл перед следующим вызовом тула; "
+        "смена уровня гейта придёт модели строкой warnings"
+    )
     return 0
 
 
