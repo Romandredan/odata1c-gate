@@ -1108,6 +1108,39 @@ def test_заголовок_роли_закомментированной_сос
     assert _данные(путь, "ut")["role"] == "test"
 
 
+def test_сосед_с_именем_из_цифры_обрывает_поиск_образцов_и_заголовков(tmp_path):
+    """Имя базы вида `1c_ut` начинается с цифры (`ИМЯ_БАЗЫ`): закомментированная запись
+    `  # 1c_ut:` — такая же граница, как `  # ut2:`; её образцы и заголовок не трогаются."""
+    путь = tmp_path / "bases.yaml"
+    путь.write_text(
+        "bases:\n"
+        "  ut:\n"
+        "    label: УТ\n"
+        "    url: https://server/ut\n"
+        "    user: u\n"
+        "    password: p\n"
+        "    role: dev\n"
+        "    # --- запись этой базы (умолчание роли dev) ---\n"
+        "  # 1c_ut:\n"
+        "    # --- запись этой базы (умолчание роли dev) ---\n"
+        "    # write: true\n"
+        "    # role: dev\n",
+        encoding="utf-8",
+    )
+
+    set_base_fields(путь, "ut", {"role": "test", "write": False})
+
+    строки = _строки(путь)
+    assert "    # write: true" in строки
+    assert строки.count("    # --- запись этой базы (умолчание роли dev) ---") == 1
+    assert строки.index("  # 1c_ut:") < строки.index(
+        "    # --- запись этой базы (умолчание роли dev) ---"
+    )
+    данные = _данные(путь, "ut")
+    assert данные["role"] == "test"
+    assert данные["write"] is False
+
+
 @pytest.mark.parametrize(
     ("прежняя", "новая"),
     [("prod", "test"), ("test", "dev"), ("dev", "prod"), ("test", "prod"), ("dev", "test")],

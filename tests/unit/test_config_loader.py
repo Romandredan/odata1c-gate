@@ -359,7 +359,7 @@ def test_parse_bases_отказ_валидатора_не_несёт_значе�
         parse_bases(данные, tmp_path / "bases.yaml", [], resolve_keyring=False)
 
     assert ошибка.value.__cause__ is None
-    # без `from None` трассировка печатала бы неявный `__context__` (с `input_value`) вместо цепочки
+    # без `from None` трассировка печатала бы неявный `__context__` (отказ роли) вторым блоком
     assert ошибка.value.__suppress_context__ is True
 
 
