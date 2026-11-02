@@ -3,6 +3,20 @@
 Формат — по [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), нумерация —
 [семантическая](https://semver.org/lang/ru/). Даты в формате ГГГГ-ММ-ДД.
 
+## Не выпущено
+
+### Added
+
+- **Плагин для OpenCode 2.x** (ишью #2): четыре навыка, агент-следователь, MCP-сервер гейта
+  с закреплённой версией и защита каталога шлюза теми же правилами, что у плагина Claude Code
+  (`PreToolUse`), — файлы навыков, агента и MCP-конфигурации те же, отдельной копии нет.
+  Точка входа — `opencode/plugin/odata1c.js`, ядро правил — `opencode/plugin/guard-core.mjs`,
+  тесты — `tests/opencode-odata1c.test.mjs` (перенос всех сценариев `test_plugin_hook.py`,
+  шаг в CI). Подтверждение записи — нативный permission-аск на `odata1c_commit`;
+  подключение и отличия — `docs/OPENCODE.md`.
+- `tools/bump_version.py` пишет версию и в `package.json` (пятое место поставки, npm-семвер
+  `X.Y.Z-devN`); сверка — `test_versions_agree.py`.
+
 ## 0.3.0 — 2026-09-29
 
 Гейт и рецепты для Бухгалтерии предприятия (разведка `docs/probes/BP-recon.md`, ADR-0016) и для
