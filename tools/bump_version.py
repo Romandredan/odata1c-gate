@@ -1,4 +1,4 @@
-"""Переписать версию проекта одновременно в четырёх местах поставки.
+"""Переписать версию проекта одновременно в пяти местах поставки.
 
 Единственный источник версии — `src/odata1c/__about__.py`; в манифестах плагина и
 маркетплейса она только повторяется (`tests/unit/test_versions_agree.py` проверяет равенство).
@@ -45,7 +45,24 @@ def bump(root: pathlib.Path, версия: str) -> list[pathlib.Path]:
     marketplace["plugins"][0]["version"] = версия
     _записать_json(marketplace_путь, marketplace)
 
-    return [about_путь, plugin_json_путь, mcp_json_путь, marketplace_путь]
+    # Пятое место — package.json плагина OpenCode (ишью #2): npm-семвер читает
+    # только формат `0.3.1-dev0`/`0.3.1-rc1`, поэтому PEP 440-версия переводится
+    # в npm-нормализацию (`.dev` → `-dev`, `.rc` → `-rc`); осмысление версии —
+    # единственное различие файлов поставки, `tests/unit/test_versions_agree.py`
+    # проверяет соответствие явно.
+    npm_версия = версия.replace(".dev", "-dev").replace(".rc", "-rc")
+    пакет_json_путь = root / "package.json"
+    пакет_json = json.loads(пакет_json_путь.read_text("utf-8"))
+    пакет_json["version"] = npm_версия
+    _записать_json(пакет_json_путь, пакет_json)
+
+    return [
+        about_путь,
+        plugin_json_путь,
+        mcp_json_путь,
+        marketplace_путь,
+        пакет_json_путь,
+    ]
 
 
 def main() -> None:
