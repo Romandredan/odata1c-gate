@@ -3,7 +3,7 @@
 Формат — по [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), нумерация —
 [семантическая](https://semver.org/lang/ru/). Даты в формате ГГГГ-ММ-ДД.
 
-## Не выпущено
+## 0.4.0 — 2026-11-03
 
 ### Added
 
