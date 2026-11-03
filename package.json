@@ -1,6 +1,6 @@
 {
   "name": "odata1c-gate",
-  "version": "0.4.0",
+  "version": "0.4.1-dev0",
   "description": "Локальный MCP-шлюз между агентами и OData-интерфейсом 1С:Предприятие 8.3: реквизиты и названия подменяются токенами до того, как их увидит модель. Плагин OpenCode 2.x: точка входа в opencode/plugin/odata1c.js.",
   "type": "module",
   "main": "opencode/plugin/odata1c.js",
