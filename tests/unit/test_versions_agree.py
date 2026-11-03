@@ -27,6 +27,22 @@ def test_marketplace_version_равна_версии_пакета():
     assert плагин["version"] == __version__
 
 
+def _npm_версия(версия: str) -> str:
+    """npm-семвер читает только `0.3.1-dev0`/`0.3.1-rc1` — тот же перевод, что и
+    в `bump_version.py` (`.dev` → `-dev`, `.rc` → `-rc`)."""
+    return версия.replace(".dev", "-dev").replace(".rc", "-rc")
+
+
+def test_package_json_плагина_opencode_совпадает_с_версией_пакета():
+    пакет = json.loads((КОРЕНЬ / "package.json").read_text("utf-8"))
+    assert пакет["name"] == "odata1c-gate"
+    assert пакет["version"] == _npm_версия(__version__)
+    # Плагин OpenCode — ES-модуль без зависимостей; main — точка входа setup(ctx).
+    assert пакет["type"] == "module"
+    assert пакет.get("dependencies") is None
+    assert пакет["main"] == "opencode/plugin/odata1c.js"
+
+
 def test_pyproject_называет_дистрибутив_odata1c_gate():
     текст = (КОРЕНЬ / "pyproject.toml").read_text("utf-8")
     assert 'name = "odata1c-gate"' in текст

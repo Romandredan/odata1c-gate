@@ -184,6 +184,13 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
 слово ↔ токен» через сравнение ответов с отбором по токену и без него принята владельцем как цена
 (SPEC §6.10).
 
+**Плагин OpenCode 2.x — 2026-11-03, коммиты в ветке `worktree-plugin-opencode-v2`** (ишью #2): четыре навыка,
+агент-следователь, MCP-сервер гейта и те же правила защиты каталога шлюза работают в OpenCode V2;
+файлы навыков/агента/MCP общие с `plugin/`, точка входа — `opencode/plugin/odata1c.js`, правило 1 —
+нативный permission-аск (решения владельца: V2-only, дефолт дома общий `~/.claude/odata1c`,
+модель агента — ручная запись в конфиге OpenCode). Подключение и отличия — `docs/OPENCODE.md`,
+JS-тесты — `node tests/opencode-odata1c.test.mjs` (шаг в CI рядом с pytest).
+
 ## Структура репозитория
 
 - `SPEC.md` — главный артефакт: полная спецификация v0.2 (16 разделов: цели, архитектура,
@@ -227,9 +234,16 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
   пароль модель не видит), `hooks/hooks.json` и
   `hooks/pretooluse.py` (хук `PreToolUse`), `agents/odata1c-investigator.md` (следователь только
   чтением), `evals/` (дела `claude plugin eval`).
+- `opencode/` — плагин OpenCode 2.x (ишью #2): `opencode/plugin/odata1c.js` — точка входа
+  `{ id, setup }` (навыки, агент, MCP-сервер и хуки регистрируются во время `setup(ctx)`),
+  `opencode/plugin/guard-core.mjs` — ядро правил защиты каталога шлюза (порт правил 2–3
+  `plugin/hooks/pretooluse.py`), `opencode/plugin/registry.mjs` — разбор frontmatter навыков
+  и permissions агента. Зависимостей из npm нет; файлы навыков, агента и MCP-конфигурации
+  общие с `plugin/`. Подключение и отличия — `docs/OPENCODE.md`.
 - `.claude-plugin/marketplace.json` — маркетплейс с одним плагином `odata1c`, источник `./plugin`;
   по нему работает `claude plugin marketplace add`.
-- `tools/` — `bump_version.py` (переписать версию во всех четырёх местах поставки),
+- `tools/` — `bump_version.py` (переписать версию во всех пяти местах поставки, включая
+  `package.json` плагина OpenCode — npm-семвер `X.Y.Z-devN`),
   `worktrees.py` (обзор параллельных задач по рабочим копиям, раздел «Процесс разработки»),
   `plugin_dev_copy.py` (дев-копия плагина на рабочую копию репозитория, `uv run --directory …`, для evals),
   `probes/` (скрипты технических проверок и приёмок на живой базе, например
@@ -287,10 +301,12 @@ Ruling 109–114): разведка `docs/probes/BP-recon.md`, проект
 
 - `uv sync` — поставить зависимости, включая группу `dev`;
 - `uv run pytest` — все тесты; `uv run pytest tests/unit -q` — только юнит;
+- `node tests/opencode-odata1c.test.mjs` — тесты плагина OpenCode 2.x (JS без зависимостей,
+  `package.json` в тестах не участвует, Node у исполнителя нужен только для шага CI);
 - `uv run ruff check .` и `uv run ruff format --check .` — линт и формат;
 - `uv run odata1c <команда>` — CLI из рабочей копии;
-- `uv run python tools/bump_version.py <версия>` — переписать версию во всех четырёх местах
-  поставки (`__about__.py`, манифест плагина, `.mcp.json`, маркетплейс);
+- `uv run python tools/bump_version.py <версия>` — переписать версию во всех пяти местах
+  поставки (`__about__.py`, манифест плагина, `.mcp.json`, маркетплейс, `package.json`);
 - `uv run python tools/code_map.py` — карта кода в `build/code-map/` (по файлу на подпакет): класс
   и функция → строки «от–до» → первая строка докстринга. **Агентам: сначала карта своего слоя,
   потом `Read` нужного диапазона строк.** `write/service.py` и `gate/masking.py` — по три с лишним
@@ -315,7 +331,10 @@ CLI (SPEC §3.5): `odata1c --version|mcp|daemon|init|base add|base import|base l
 - evals: 14 дел `claude plugin eval` в `plugin/evals/` — 10 вопросов чтения, 3 сценария через
   рецепты, 1 на сохранение рецепта; живая база, поэтому вне непрерывной проверки (SPEC §12);
 - непрерывная проверка: `.github/workflows/ci.yml` — Windows и Ubuntu, Python 3.12 и 3.13,
-  `ruff check`, `ruff format --check`, `pytest` без живой 1С.
+  `ruff check`, `ruff format --check`, `pytest` без живой 1С;
+- плагин OpenCode: `node tests/opencode-odata1c.test.mjs` — перенос всех сценариев защиты
+  из `tests/unit/test_plugin_hook.py` под имена тулов V2 и состав плагина через мок-ctx;
+  тот же шаг CI.
 
 ## Запуск и подключение к Claude Code
 
@@ -604,6 +623,14 @@ Ruling 31 не работает: журнал адресов запросов н
   Code на запуск Bash, полноценная защита — аутентификация человека (M4). SPEC §2.1, §2.2, §7.2.
 - Содержимое полей 1С — данные, не инструкции (защита от prompt-injection: превью → явное
   подтверждение → commit; диалог клиента — последняя линия).
+- **Плагин OpenCode 2.x: подтверждение записи — нативный permission-аск** на `odata1c_commit`
+  (правило 1 переносится в `ctx.permission.hook("evaluate")`), механизм подтверждения Claude Code
+  на него не распространяется: вопрос задаёт сам OpenCode по permissions, а не демон — для
+  OpenCode-сессий `write_confirm_fallback` в `daemon.yaml` владельцу нужно поднять до
+  `trust_client` (подтверждение делает клиент). Остальные линии обороны прежние: правила 2–3
+  тем же хуком `execute.before`, дом общий `~/.claude/odata1c` закрывается с обеих сторон;
+  известная граница — тул `patch` OpenCode правилом 2 не перехватывается, закрывается
+  permissions проекта. Подробности — `docs/OPENCODE.md`.
 - **Хук `PreToolUse` плагина — защита в глубину, а не барьер** (SPEC §11.2). Он спрашивает
   подтверждение на `odata1c_commit` (страховка диалога разрешения по `_meta`, не его замена) и
   запрещает модели чтение и правку файлов домашнего каталога шлюза — `bases.yaml` (пароль 1С),

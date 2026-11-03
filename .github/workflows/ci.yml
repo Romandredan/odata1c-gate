@@ -45,3 +45,7 @@ jobs:
       - run: uv run pytest -q -p no:cacheprovider
         env:
           PYTHONUTF8: "1"
+      # Плагин OpenCode 2.x — JS-часть: ядро защиты, реестр и точка входа не тянут
+      # зависимостей из npm, поэтому шаг — только сам прогон текстом; Node у
+      # исполнителей есть.
+      - run: node tests/opencode-odata1c.test.mjs

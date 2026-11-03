@@ -14,10 +14,11 @@ from tools.plugin_dev_copy import dev_copy
     pathlib.Path("plugin/.claude-plugin/plugin.json"),
     pathlib.Path("plugin/.mcp.json"),
     pathlib.Path(".claude-plugin/marketplace.json"),
+    pathlib.Path("package.json"),
 )
 
 
-def _скопировать_четыре_файла(root: pathlib.Path) -> pathlib.Path:
+def _скопировать_пять_файлов(root: pathlib.Path) -> pathlib.Path:
     for относительный in ОТНОСИТЕЛЬНЫЕ_ПУТИ_ВЕРСИИ:
         назначение = root / относительный
         назначение.parent.mkdir(parents=True, exist_ok=True)
@@ -25,12 +26,12 @@ def _скопировать_четыре_файла(root: pathlib.Path) -> pathl
     return root
 
 
-def test_bump_переписывает_версию_в_четырёх_местах(tmp_path):
-    root = _скопировать_четыре_файла(tmp_path)
+def test_bump_переписывает_версию_в_пяти_местах(tmp_path):
+    root = _скопировать_пять_файлов(tmp_path)
 
     результат = bump(root, "0.1.0")
 
-    assert len(результат) == 4
+    assert len(результат) == 5
 
     about_текст = (root / "src/odata1c/__about__.py").read_text("utf-8")
     assert about_текст == '__version__ = "0.1.0"\n'
@@ -45,8 +46,21 @@ def test_bump_переписывает_версию_в_четырёх_места
     assert marketplace["plugins"][0]["version"] == "0.1.0"
 
 
+def test_bump_переписывает_package_json_npm_нормализацией(tmp_path):
+    """Пятое место — package.json плагина OpenCode: npm-семвер читает только
+    `X.Y.Z-devN`/`X.Y.Z-rcN`, поэтому PEP 440-версия переводится тем же переводом,
+    что и в `bump_version.bump` (`.dev` → `-dev`, `.rc` → `-rc`); ровный релиз
+    остаётся без суффикса."""
+    root = _скопировать_пять_файлов(tmp_path)
+
+    bump(root, "0.1.0.dev0")
+
+    пакет = json.loads((root / "package.json").read_text("utf-8"))
+    assert пакет["version"] == "0.1.0-dev0"
+
+
 def test_bump_отклоняет_версию_неверного_формата(tmp_path):
-    root = _скопировать_четыре_файла(tmp_path)
+    root = _скопировать_пять_файлов(tmp_path)
 
     with pytest.raises(SystemExit) as ошибка:
         bump(root, "1.0")
