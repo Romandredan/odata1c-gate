@@ -546,7 +546,9 @@ top: 200
 - **Проверен шлюз только с Claude Code.** Другие клиенты MCP по stdio (Cursor, VS Code, Claude
   Desktop) подключаются и читают; там, где нет диалога разрешения Claude Code или elicitation,
   запись по умолчанию выключена (`write_confirm_fallback: deny`). Навыки, хук и агент — часть
-  плагина Claude Code, в других клиентах их нет. Cowork запускает MCP-серверы в изолированной
+  плагина Claude Code; в OpenCode и ZCode они работают из тех же файлов плагина
+  ([docs/OPENCODE.md](https://github.com/Romandredan/odata1c-gate/blob/main/docs/OPENCODE.md),
+  [docs/ZCODE.md](https://github.com/Romandredan/odata1c-gate/blob/main/docs/ZCODE.md)). Cowork запускает MCP-серверы в изолированной
   среде без доступа к демону на `127.0.0.1` — с ним шлюз не работает.
 
 ## Документы
@@ -554,6 +556,8 @@ top: 200
 | Файл | Что внутри |
 |---|---|
 | [docs/install.md](https://github.com/Romandredan/odata1c-gate/blob/main/docs/install.md) | установка на Windows и Linux, обновление, `doctor`, типовые сбои |
+| [docs/OPENCODE.md](https://github.com/Romandredan/odata1c-gate/blob/main/docs/OPENCODE.md) | плагин в OpenCode: подключение, подтверждение записи, ручной шаг — модель агента |
+| [docs/ZCODE.md](https://github.com/Romandredan/odata1c-gate/blob/main/docs/ZCODE.md) | плагин в ZCode: подключение через менеджер плагинов, ручной шаг — модель агента |
 | [CHANGELOG.md](https://github.com/Romandredan/odata1c-gate/blob/main/CHANGELOG.md) | что вошло в выпуск |
 | [CONTRIBUTING.md](https://github.com/Romandredan/odata1c-gate/blob/main/CONTRIBUTING.md) | для тех, кто хочет разрабатывать шлюз |
 | [SECURITY.md](https://github.com/Romandredan/odata1c-gate/blob/main/SECURITY.md) | как сообщить об уязвимости |
